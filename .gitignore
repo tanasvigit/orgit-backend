@@ -1,0 +1,11 @@
+node_modules/
+.env
+*.log
+.DS_Store
+<<<<<<< HEAD
+/dist
+config/firebase-service-account.json
+=======
+/dist
+>>>>>>> 6af5649fbe3213a5ef3ff2b95005b547f3bb3ceb
+config/firebase-service-account.json 
