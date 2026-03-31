@@ -209,6 +209,18 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     const rowsWithStatus = result.rows.map((row: any) => {
       const assignees = Array.isArray(row.assignees) ? row.assignees : [];
       const computed = computeTaskAndMemberStatuses(row, assignees, userId);
+      const totalAssignees =
+        row.total_assignees != null
+          ? Number(row.total_assignees)
+          : Array.isArray(assignees)
+          ? assignees.length
+          : 0;
+      const hideUserStatus =
+        !row.start_date &&
+        !row.target_date &&
+        !row.due_date &&
+        Number.isFinite(totalAssignees) &&
+        totalAssignees === 0;
       // Optional helper flag so clients can easily hide lifecycle status
       // before the configured start_date of the task.
       let isBeforeStartDate: boolean | null = null;
@@ -229,6 +241,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         member_statuses: computed.memberStatuses,
         current_user_member_status: computed.currentUserMemberStatus,
         is_before_start_date: isBeforeStartDate,
+        hide_user_status: hideUserStatus,
       };
     });
 
@@ -369,8 +382,15 @@ export const getTask = async (req: AuthRequest, res: Response) => {
 
     const assignees = Array.isArray(task.assignees) ? task.assignees : [];
     const computed = computeTaskAndMemberStatuses(task, assignees, userId);
+    const hideUserStatus =
+      !task.start_date &&
+      !task.target_date &&
+      !task.due_date &&
+      Array.isArray(assignees) &&
+      assignees.length === 0;
     task.task_status = computed.taskStatus;
     task.member_statuses = computed.memberStatuses;
+    (task as any).hide_user_status = hideUserStatus;
     if (computed.currentUserMemberStatus) {
       (task as any).current_user_member_status = computed.currentUserMemberStatus;
     }
@@ -431,9 +451,18 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Title is required' });
     }
 
-    // For recurring monthly tasks, allow deriving due_date from recurrence_day_of_month (no start_date used)
+    // Determine actual task owner/creator
+    const taskCreatorId: string = (creator_id && typeof creator_id === 'string' ? creator_id : userId) as string;
+    const isDifferentOwner = taskCreatorId !== userId;
+    const rawAssigneeIds = Array.isArray(assignee_ids) ? assignee_ids : [];
+    const isCreatorOnlyNoAssignees = !isDifferentOwner && rawAssigneeIds.length === 0;
+    const hasNoDates = !start_date && !target_date && !due_date;
+    const allowOptionalDates = isCreatorOnlyNoAssignees && hasNoDates;
+
+    // For recurring monthly tasks, allow deriving due_date from recurrence_day_of_month (no start_date used).
+    // Skip derivation when optional-date creator-only flow is used.
     let finalDueDate: string | null = due_date || null;
-    if (!finalDueDate && task_type === 'recurring' && recurrence_type === 'monthly' && recurrence_day_of_month) {
+    if (!allowOptionalDates && !finalDueDate && task_type === 'recurring' && recurrence_type === 'monthly' && recurrence_day_of_month) {
       const day = Math.max(1, Math.min(31, Number(recurrence_day_of_month)));
       const base = target_date ? new Date(target_date) : new Date();
       const year = base.getFullYear();
@@ -452,13 +481,19 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       finalDueDate = candidate.toISOString();
     }
 
-    if (!finalDueDate) {
+    if (!allowOptionalDates && !finalDueDate) {
       return res.status(400).json({ error: 'Due date is required' });
     }
 
-    // Determine actual task owner/creator
-    const taskCreatorId: string = (creator_id && typeof creator_id === 'string' ? creator_id : userId) as string;
-    const isDifferentOwner = taskCreatorId !== userId;
+    if (
+      allowOptionalDates &&
+      task_type === 'recurring' &&
+      (task_rollout_type !== 'cycle_start' || !recurrence_type)
+    ) {
+      return res.status(400).json({
+        error: 'Recurring tasks without dates require recurrence_type and task_rollout_type = cycle_start',
+      });
+    }
 
     // If the task is being created on behalf of another user, store metadata in escalation_rules.
     // This is used later to prevent the original requester from joining the task group conversation.
@@ -626,7 +661,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         ? normalizedSpecificWeekday
         : null;
     const nextRecurrenceDate =
-      task_type === 'recurring' && frequency
+      task_type === 'recurring' && frequency && finalDueDate
         ? calculateNextRecurrenceDateLocal(
             frequency,
             specificWeekdayValue,
@@ -636,7 +671,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     // Determine initial task.status for recurring tasks at creation time so the first cycle behaves like later recurrences.
     let initialStatusForInsert: string | null = null;
-    if (task_type === 'recurring') {
+    if (task_type === 'recurring' && finalDueDate) {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const due = new Date(finalDueDate);
@@ -709,7 +744,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     
     // Add remaining columns
     insertColumns.push('start_date', 'target_date', 'due_date');
-    insertValues.push(start_date || null, target_date || null, finalDueDate);
+    insertValues.push(start_date || null, target_date || null, finalDueDate || null);
 
     if (hasFrequency) {
       insertColumns.push('frequency');
@@ -814,7 +849,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     // IMPORTANT: If no assignee_ids are provided, we keep the task unassigned (no task_assignees rows).
     // The creator can still see it via tasks.created_by / tasks.creator_id.
     let hasAssignees = false;
-    const rawIds = Array.isArray(assignee_ids) ? assignee_ids : [];
+    const rawIds = rawAssigneeIds;
     const hasExplicitAssignees = rawIds.length > 0;
     const allAssigneeIds = new Set<string>(
       rawIds.map((id: any) => (id != null ? String(id) : '').trim()).filter(Boolean)
@@ -859,14 +894,18 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       }
       // Keep task as 'pending' when assignees are added; task moves to 'in_progress' only after assignee(s) accept.
     } else {
-      // No assignees: add creator as sole assignee so they get todo/scheduled status and task appears in Self
-      hasAssignees = true;
-      await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'creator')
-         ON CONFLICT (task_id, user_id) DO NOTHING`,
-        [task.id, taskCreatorId, assigneeStatus]
-      );
+      // New optional-date creator-only flow: keep task completely unassigned.
+      // This enables "no user status" rendering for no-date tasks created by owner without assignees.
+      if (!(allowOptionalDates && isCreatorOnlyNoAssignees)) {
+        // Existing behavior for all other no-assignee creates: add creator as sole assignee.
+        hasAssignees = true;
+        await client.query(
+          `INSERT INTO task_assignees (task_id, user_id, status, role)
+           VALUES ($1, $2, $3, 'creator')
+           ON CONFLICT (task_id, user_id) DO NOTHING`,
+          [task.id, taskCreatorId, assigneeStatus]
+        );
+      }
     }
 
     // Create task activity log
