@@ -2,7 +2,26 @@ import { query } from '../config/database';
 
 export interface NotificationData {
   userId: string;
-  type: 'message' | 'task_assigned' | 'task_accepted' | 'task_rejected' | 'task_updated' | 'task_overdue' | 'task_escalated' | 'group_member_added' | 'document_shared';
+  type:
+    | 'message'
+    | 'task_assigned'
+    | 'task_accepted'
+    | 'task_rejected'
+    | 'task_updated'
+    | 'task_overdue'
+    | 'task_escalated'
+    | 'group_member_added'
+    | 'document_shared'
+    | 'TASK_STATUS_CHANGED'
+    | 'TASK_COMPLETE_PENDING'
+    | 'TASK_VERIFIED'
+    | 'TASK_COMPLETION_REJECTED'
+    | 'TASK_DELETED'
+    | 'EXIT_REQUEST_RECEIVED'
+    | 'EXIT_APPROVED'
+    | 'EXIT_REJECTED'
+    | 'DELETE_REQUEST_RECEIVED'
+    | 'MEMBER_ADDED';
   title: string;
   body?: string;
   conversationId?: string;
@@ -131,4 +150,41 @@ export const markAllNotificationsAsRead = async (userId: string): Promise<void> 
      WHERE user_id = $1 AND is_read = false`,
     [userId]
   );
+};
+
+export const getUserNotifications = async (
+  userId: string,
+  limit: number = 50,
+  unreadOnly: boolean = false
+) => {
+  const result = await query(
+    `SELECT *
+     FROM notifications
+     WHERE user_id = $1
+       AND ($2::boolean = false OR is_read = false)
+     ORDER BY created_at DESC
+     LIMIT $3`,
+    [userId, unreadOnly, limit]
+  );
+  return result.rows;
+};
+
+export const deleteNotification = async (
+  notificationId: string,
+  userId: string
+): Promise<void> => {
+  await query(`DELETE FROM notifications WHERE id = $1 AND user_id = $2`, [
+    notificationId,
+    userId,
+  ]);
+};
+
+export const getUnreadNotificationCount = async (userId: string): Promise<number> => {
+  const result = await query(
+    `SELECT COUNT(*)::int AS unread
+     FROM notifications
+     WHERE user_id = $1 AND is_read = false`,
+    [userId]
+  );
+  return result.rows[0]?.unread ?? 0;
 };

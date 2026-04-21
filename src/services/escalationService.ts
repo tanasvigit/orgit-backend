@@ -2,6 +2,7 @@ import { query } from '../config/database';
 import { createMessage } from './messageService';
 import { getTaskAssignments } from './taskService';
 import { getAutoEscalationConfig } from './platformSettingsService';
+import { dispatchNotification } from './notification-bus.service';
 
 /**
  * Check and escalate tasks that are not accepted
@@ -107,15 +108,15 @@ export const escalateTask = async (
   // Create notifications for all assignees
   const assignments = await getTaskAssignments(taskId);
   for (const assignment of assignments) {
-    await query(
-      `INSERT INTO notifications (
-        id, user_id, title, description, type, related_entity_type, related_entity_id
-      )
-      VALUES (
-        gen_random_uuid(), $1, 'Task Escalated', $2, 'task_escalated', 'task', $3
-      )`,
-      [assignment.assignedToUserId, reason, taskId]
-    );
+    await dispatchNotification({
+      type: 'TASK_ESCALATED',
+      recipientIds: [assignment.assignedToUserId],
+      title: 'Task Escalated',
+      body: reason,
+      refType: 'task',
+      refId: taskId,
+      channels: ['in_app'],
+    });
   }
 };
 
@@ -129,18 +130,26 @@ export const escalateMissedRecurrence = async (): Promise<void> => {
     return;
   }
 
-  const result = await query(
-    `SELECT * FROM tasks
-     WHERE task_type = 'recurring'
-     AND next_recurrence_date IS NOT NULL
-     AND next_recurrence_date < CURRENT_DATE
-     AND status != 'completed'
-     AND escalation_status = 'none'`,
-    []
-  );
+  let result;
+  try {
+    result = await query(
+      `SELECT id, task_id
+       FROM task_recurrence_templates
+       WHERE status = 'active'
+         AND next_recurrence_date IS NOT NULL
+         AND next_recurrence_date < CURRENT_DATE`,
+      []
+    );
+  } catch (error: any) {
+    if (String(error?.message || '').toLowerCase().includes('task_recurrence_templates')) {
+      return;
+    }
+    throw error;
+  }
 
   for (const row of result.rows) {
-    await escalateTask(row.id, 'Recurring task missed its scheduled date');
+    if (!row.task_id) continue;
+    await escalateTask(row.task_id, 'Recurring template missed generation schedule');
   }
 };
 

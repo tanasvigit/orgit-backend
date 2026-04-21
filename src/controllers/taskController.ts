@@ -4,6 +4,122 @@ import { query, getClient } from '../config/database';
 import { getReminderConfig } from '../services/platformSettingsService';
 import { computeTaskAndMemberStatuses } from '../services/taskStatusEngine';
 import { logTaskActivity } from '../services/taskActivityLogger';
+import {
+  getComputedStatus,
+  isValidTransition,
+} from '../services/task-status-engine.service';
+import { dispatchNotification } from '../services/notification-bus.service';
+
+let tasksDeletedAtColumnExists: boolean | null = null;
+
+const getTasksDeletedAtFilter = async (): Promise<string> => {
+  if (tasksDeletedAtColumnExists === null) {
+    const columnExistsResult = await query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_name = 'tasks'
+           AND column_name = 'deleted_at'
+       ) AS exists`
+    );
+    tasksDeletedAtColumnExists = Boolean(columnExistsResult.rows[0]?.exists);
+  }
+
+  return tasksDeletedAtColumnExists ? 'AND t.deleted_at IS NULL' : '';
+};
+
+/** Append to `FROM tasks WHERE id = $1` when `tasks.deleted_at` exists (same cache as getTasksDeletedAtFilter). */
+const getTasksActiveByIdClause = async (): Promise<string> => {
+  await getTasksDeletedAtFilter();
+  return tasksDeletedAtColumnExists ? ' AND deleted_at IS NULL' : '';
+};
+
+let taskDeleteRequestsTableExists: boolean | null = null;
+
+const getTaskDeleteRequestsTableExists = async (): Promise<boolean> => {
+  if (taskDeleteRequestsTableExists === null) {
+    const r = await query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.tables
+         WHERE table_name = 'task_delete_requests'
+       ) AS exists`
+    );
+    taskDeleteRequestsTableExists = Boolean(r.rows[0]?.exists);
+  }
+  return taskDeleteRequestsTableExists;
+};
+
+let messagesMetadataColumnExists: boolean | null = null;
+
+const getMessagesMetadataColumnExists = async (): Promise<boolean> => {
+  if (messagesMetadataColumnExists === null) {
+    const r = await query(
+      `SELECT EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'messages' AND column_name = 'metadata'
+       ) AS exists`
+    );
+    messagesMetadataColumnExists = Boolean(r.rows[0]?.exists);
+  }
+  return messagesMetadataColumnExists;
+};
+
+/** System message for task group chat; older DBs may lack messages.metadata. */
+const insertSystemMessageOptionalMetadata = async (
+  client: { query: (text: string, values?: any[]) => Promise<any> },
+  params: {
+    conversationId: string;
+    senderId: string;
+    content: string;
+    metadata: Record<string, unknown> | null;
+  }
+) => {
+  const hasMeta = await getMessagesMetadataColumnExists();
+  if (hasMeta) {
+    await client.query(
+      `INSERT INTO messages (conversation_id, sender_id, content, message_type, metadata)
+       VALUES ($1, $2, $3, 'system', $4::jsonb)`,
+      [params.conversationId, params.senderId, params.content, JSON.stringify(params.metadata)]
+    );
+  } else {
+    await client.query(
+      `INSERT INTO messages (conversation_id, sender_id, content, message_type)
+       VALUES ($1, $2, $3, 'system')`,
+      [params.conversationId, params.senderId, params.content]
+    );
+  }
+};
+
+const resolveSystemRequestActionChips = async (
+  client: { query: (text: string, values?: any[]) => Promise<any> },
+  params: {
+    conversationId: string;
+    requestType: 'task_exit' | 'task_delete';
+    requestId?: string | null;
+    decision: 'approved' | 'rejected' | 'denied';
+  }
+) => {
+  const hasMeta = await getMessagesMetadataColumnExists();
+  if (!hasMeta || !params.requestId) return;
+
+  await client.query(
+    `UPDATE messages
+     SET metadata = jsonb_set(
+       jsonb_set(COALESCE(metadata, '{}'::jsonb), '{actionChips}', '[]'::jsonb, true),
+       '{decision}',
+       to_jsonb($4::text),
+       true
+     )
+     WHERE conversation_id = $1
+       AND message_type = 'system'
+       AND metadata->>'requestType' = $2
+       AND metadata->>'requestId' = $3
+       AND jsonb_typeof(metadata->'actionChips') = 'array'
+       AND jsonb_array_length(metadata->'actionChips') > 0`,
+    [params.conversationId, params.requestType, String(params.requestId), params.decision]
+  );
+};
 
 const addMonthsClamped = (date: Date, monthsToAdd: number): Date => {
   const year = date.getFullYear();
@@ -49,6 +165,22 @@ const calculateNextRecurrenceDateLocal = (
   }
 };
 
+const buildTaskWithDerivedStatus = (task: any) => {
+  const computedStatus = getComputedStatus({
+    id: String(task.id),
+    status: task.status,
+    start_date: task.start_date,
+    due_date: task.due_date,
+    deleted_at: task.deleted_at,
+  });
+
+  return {
+    ...task,
+    status: computedStatus.status,
+    derived_status: computedStatus.derivedStatus,
+  };
+};
+
 /**
  * Get all tasks for the authenticated user - matching message-backend
  */
@@ -61,6 +193,8 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+
+    const deletedAtFilter = await getTasksDeletedAtFilter();
 
     let querySQL = `
       SELECT 
@@ -138,20 +272,28 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         )
         OR COALESCE(t.created_by, t.creator_id) = $1
       )
+      ${deletedAtFilter}
     `;
 
     const params: any[] = [userId];
     const conditions: string[] = [];
 
-    // Filter by task type (one_time vs recurring)
+    // Exclude template controllers from normal task lists unless explicitly requested.
+    if (type !== 'recurring_template') {
+      conditions.push(`(COALESCE(t.is_recurring_template, false) = false AND COALESCE(t.task_type, 'one_time') != 'recurring_template')`);
+    }
+
+    // Filter by task type
     // Priority: task_type field takes precedence
     // - If task_type = 'one_time': always show in one_time (regardless of recurrence_type)
-    // - If task_type = 'recurring': always show in recurring
+    // - If task_type = 'recurring_instance': always show in recurring bucket
     // - If task_type IS NULL: use recurrence_type to determine
     if (type === 'recurring') {
-      // Show recurring tasks: explicitly marked as recurring OR (no type set AND has recurrence_type)
-      conditions.push(`(t.task_type = $${params.length + 1} OR (t.task_type IS NULL AND t.recurrence_type IS NOT NULL))`);
-      params.push('recurring');
+      // Show recurring tasks: new recurring instances OR legacy recurring rows.
+      conditions.push(
+        `(t.task_type = $${params.length + 1} OR t.task_type = $${params.length + 2} OR (t.task_type IS NULL AND t.recurrence_type IS NOT NULL))`
+      );
+      params.push('recurring_instance', 'recurring');
 
       // Recurring visibility: show only tasks within the due-soon window (today..today+dueSoonDays),
       // unless explicitly requested to include all. Default 3 days from reminder settings.
@@ -159,7 +301,9 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         const reminderConfig = await getReminderConfig();
         const dueSoonDays = Number(reminderConfig?.dueSoonDays ?? 3);
         const safeDueSoonDays = Number.isFinite(dueSoonDays) ? Math.max(0, Math.min(60, dueSoonDays)) : 3;
-        conditions.push(`t.due_date >= CURRENT_DATE AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval`);
+        conditions.push(
+          `(t.due_date IS NULL OR (t.due_date >= CURRENT_DATE AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval))`
+        );
         params.push(safeDueSoonDays);
       }
     } else if (type === 'one_time') {
@@ -172,11 +316,14 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         const dueSoonDays = Number(reminderConfig?.dueSoonDays ?? 3);
         const safeDueSoonDays = Number.isFinite(dueSoonDays) ? Math.max(0, Math.min(60, dueSoonDays)) : 3;
         conditions.push(
-          `(t.due_date IS NOT NULL AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval` +
+          `(t.due_date IS NULL OR (t.due_date IS NOT NULL AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval)` +
           ` OR t.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days')`
         );
         params.push(safeDueSoonDays);
       }
+    } else if (type === 'recurring_instance' || type === 'recurring_template') {
+      conditions.push(`t.task_type = $${params.length + 1}`);
+      params.push(type);
     }
 
     if (status) {
@@ -236,7 +383,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         }
       }
       return {
-        ...row,
+        ...buildTaskWithDerivedStatus(row),
         task_status: computed.taskStatus,
         member_statuses: computed.memberStatuses,
         current_user_member_status: computed.currentUserMemberStatus,
@@ -264,11 +411,14 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const deletedAtFilter = await getTasksDeletedAtFilter();
+
     // First check if task exists and user has access
     const accessCheck = await query(
       `SELECT t.id 
        FROM tasks t
        WHERE t.id = $1 
+         ${deletedAtFilter}
          AND (
            COALESCE(t.created_by, t.creator_id) = $2 
            OR EXISTS(
@@ -352,6 +502,7 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       LEFT JOIN users reporting_member ON t.reporting_member_id = reporting_member.id
       LEFT JOIN client_entities ce ON t.client_entity_id = ce.id
       WHERE t.id = $1
+        ${deletedAtFilter}
       GROUP BY t.id, c.id, c.name, creator.name, creator.profile_photo_url, t.reporting_member_id, reporting_member.id, reporting_member.name, reporting_member.profile_photo_url`,
       [id, userId]
     );
@@ -388,14 +539,15 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       !task.due_date &&
       Array.isArray(assignees) &&
       assignees.length === 0;
-    task.task_status = computed.taskStatus;
-    task.member_statuses = computed.memberStatuses;
-    (task as any).hide_user_status = hideUserStatus;
+    const taskWithDerived = buildTaskWithDerivedStatus(task);
+    taskWithDerived.task_status = computed.taskStatus;
+    (taskWithDerived as any).member_statuses = computed.memberStatuses;
+    (taskWithDerived as any).hide_user_status = hideUserStatus;
     if (computed.currentUserMemberStatus) {
-      (task as any).current_user_member_status = computed.currentUserMemberStatus;
+      (taskWithDerived as any).current_user_member_status = computed.currentUserMemberStatus;
     }
 
-    res.json({ task });
+    res.json({ task: taskWithDerived });
   } catch (error: any) {
     console.error('Get task error:', error);
     res.status(500).json({ error: 'Failed to fetch task' });
@@ -454,10 +606,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     // Determine actual task owner/creator
     const taskCreatorId: string = (creator_id && typeof creator_id === 'string' ? creator_id : userId) as string;
     const isDifferentOwner = taskCreatorId !== userId;
+    const normalizedTaskTypeInput = task_type === 'recurring' ? 'recurring' : (task_type || 'one_time');
+    const createRecurringTemplate = normalizedTaskTypeInput === 'recurring';
+    const taskTypeForInsert = createRecurringTemplate ? 'recurring_instance' : normalizedTaskTypeInput;
     const rawAssigneeIds = Array.isArray(assignee_ids) ? assignee_ids : [];
-    const isCreatorOnlyNoAssignees = !isDifferentOwner && rawAssigneeIds.length === 0;
     const hasNoDates = !start_date && !target_date && !due_date;
-    const allowOptionalDates = isCreatorOnlyNoAssignees && hasNoDates;
+    const allowOptionalDates = hasNoDates;
 
     // For recurring monthly tasks, allow deriving due_date from recurrence_day_of_month (no start_date used).
     // Skip derivation when optional-date creator-only flow is used.
@@ -487,7 +641,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     if (
       allowOptionalDates &&
-      task_type === 'recurring' &&
+      createRecurringTemplate &&
       (task_rollout_type !== 'cycle_start' || !recurrence_type)
     ) {
       return res.status(400).json({
@@ -661,7 +815,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         ? normalizedSpecificWeekday
         : null;
     const nextRecurrenceDate =
-      task_type === 'recurring' && frequency && finalDueDate
+      createRecurringTemplate && frequency && finalDueDate
         ? calculateNextRecurrenceDateLocal(
             frequency,
             specificWeekdayValue,
@@ -671,7 +825,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     // Determine initial task.status for recurring tasks at creation time so the first cycle behaves like later recurrences.
     let initialStatusForInsert: string | null = null;
-    if (task_type === 'recurring' && finalDueDate) {
+    if (createRecurringTemplate && finalDueDate) {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const due = new Date(finalDueDate);
@@ -690,7 +844,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     
     // Build INSERT statement with both columns if they exist
     let insertColumns = ['title', 'description', 'task_type'];
-    let insertValues = [title, description, task_type || 'one_time'];
+    let insertValues = [title, description, taskTypeForInsert];
     let paramIndex = 4;
 
     // If tasks table has a status column, set initial status for recurring tasks
@@ -832,6 +986,25 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertColumns.push('end_date');
       insertValues.push(end_date);
     }
+
+    // Recurring instances should keep explicit linkage fields when available.
+    const hasParentTaskId = columnCheck.rows.some((r: any) => r.column_name === 'parent_task_id');
+    const hasRecurrenceTemplateId = columnCheck.rows.some((r: any) => r.column_name === 'recurrence_template_id');
+    const hasRecurrenceInstanceNo = columnCheck.rows.some((r: any) => r.column_name === 'recurrence_instance_no');
+    if (createRecurringTemplate) {
+      if (hasParentTaskId) {
+        insertColumns.push('parent_task_id');
+        insertValues.push(null);
+      }
+      if (hasRecurrenceTemplateId) {
+        insertColumns.push('recurrence_template_id');
+        insertValues.push(null);
+      }
+      if (hasRecurrenceInstanceNo) {
+        insertColumns.push('recurrence_instance_no');
+        insertValues.push(1);
+      }
+    }
     
     // Build parameterized query
     const placeholders = insertValues.map((_, i) => `$${i + 1}`).join(', ');
@@ -894,17 +1067,110 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       }
       // Keep task as 'pending' when assignees are added; task moves to 'in_progress' only after assignee(s) accept.
     } else {
-      // New optional-date creator-only flow: keep task completely unassigned.
-      // This enables "no user status" rendering for no-date tasks created by owner without assignees.
-      if (!(allowOptionalDates && isCreatorOnlyNoAssignees)) {
-        // Existing behavior for all other no-assignee creates: add creator as sole assignee.
-        hasAssignees = true;
-        await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, 'creator')
-           ON CONFLICT (task_id, user_id) DO NOTHING`,
-          [task.id, taskCreatorId, assigneeStatus]
+      // Keep creator as assignee for no-assignee creates too.
+      hasAssignees = true;
+      await client.query(
+        `INSERT INTO task_assignees (task_id, user_id, status, role)
+         VALUES ($1, $2, $3, 'creator')
+         ON CONFLICT (task_id, user_id) DO NOTHING`,
+        [task.id, taskCreatorId, assigneeStatus]
+      );
+    }
+
+    // Recurring templates: persist immutable schedule controller and link this row as first instance.
+    if (createRecurringTemplate) {
+      const templatesTableCheck = await client.query(
+        `SELECT to_regclass('public.task_recurrence_templates') AS exists`
+      );
+      const templateAssigneesTableCheck = await client.query(
+        `SELECT to_regclass('public.task_template_assignees') AS exists`
+      );
+      const templatesTableExists = !!templatesTableCheck.rows[0]?.exists;
+      const templateAssigneesTableExists = !!templateAssigneesTableCheck.rows[0]?.exists;
+
+      if (templatesTableExists) {
+        const recurrenceDate = task.start_date || task.created_at || new Date().toISOString();
+        const baseDueOffset =
+          task.start_date && task.due_date
+            ? `(${new Date(task.due_date).getTime()} milliseconds)` // fallback when interval casting is unavailable
+            : null;
+        const templateResult = await client.query(
+          `INSERT INTO task_recurrence_templates (
+            task_id,
+            organization_id,
+            title,
+            description,
+            category,
+            creator_id,
+            reporting_member_id,
+            recurrence_type,
+            recurrence_interval,
+            recurrence_day_of_month,
+            specific_weekday,
+            base_start_date,
+            base_due_offset,
+            last_generated_at,
+            next_recurrence_date,
+            status
+          ) VALUES (
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,NOW(),$14,'active'
+          )
+          RETURNING id`,
+          [
+            task.id,
+            organizationId || null,
+            title,
+            description || null,
+            category || null,
+            taskCreatorId,
+            reporting_member_id || null,
+            recurrence_type || null,
+            recurrence_interval || 1,
+            recurrence_day_of_month || null,
+            specificWeekdayValue || null,
+            recurrenceDate,
+            baseDueOffset || '0 milliseconds',
+            nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
+          ]
         );
+        const templateId = templateResult.rows[0]?.id;
+        if (templateId) {
+          if (hasParentTaskId || hasRecurrenceTemplateId) {
+            const updates: string[] = [];
+            const updateValues: any[] = [];
+            let pIdx = 1;
+            if (hasParentTaskId) {
+              updates.push(`parent_task_id = $${pIdx++}`);
+              updateValues.push(templateId);
+            }
+            if (hasRecurrenceTemplateId) {
+              updates.push(`recurrence_template_id = $${pIdx++}`);
+              updateValues.push(templateId);
+            }
+            updateValues.push(task.id);
+            await client.query(
+              `UPDATE tasks SET ${updates.join(', ')} WHERE id = $${pIdx}`,
+              updateValues
+            );
+          }
+
+          if (templateAssigneesTableExists) {
+            for (const assigneeId of allAssigneeIds.size > 0 ? allAssigneeIds : new Set<string>([String(taskCreatorId)])) {
+              const role =
+                String(assigneeId) === String(taskCreatorId)
+                  ? 'creator'
+                  : reporting_member_id && String(assigneeId) === String(reporting_member_id)
+                  ? 'reporting_member'
+                  : 'member';
+              await client.query(
+                `INSERT INTO task_template_assignees (template_id, user_id, role)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (template_id, user_id) DO NOTHING`,
+                [templateId, assigneeId, role]
+              );
+            }
+          }
+        }
       }
     }
 
@@ -1233,19 +1499,21 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Status is required' });
     }
 
-    if (!['pending', 'in_progress', 'completed', 'rejected'].includes(status)) {
-      return res.status(400).json({ error: `Invalid status. Must be one of: pending, in_progress, completed, rejected. Received: ${status}` });
+    if (!['todo', 'active', 'in_progress', 'pending_verification', 'completed', 'rejected', 'deleted', 'pending'].includes(status)) {
+      return res.status(400).json({ error: `Invalid status: ${status}` });
     }
 
     // First check if task exists
+    const activeById = await getTasksActiveByIdClause();
     const taskCheck = await query(
       `SELECT 
         id,
         COALESCE(created_by, creator_id) as creator_id,
+        status,
         EXISTS (SELECT 1 FROM task_assignees WHERE task_id = $1 AND user_id = $2) as is_assignee,
         EXISTS (SELECT 1 FROM task_assignees WHERE task_id = $1 AND user_id = $2 AND role = 'creator') as is_creator_role
        FROM tasks 
-       WHERE id = $1`,
+       WHERE id = $1${activeById}`,
       [id, userId]
     );
 
@@ -1260,6 +1528,12 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
     if (!isCreator && !isAssignee) {
       return res.status(403).json({ 
         error: 'You do not have permission to update this task. You must be the creator or an assignee.' 
+      });
+    }
+
+    if (!isValidTransition(task.status, status)) {
+      return res.status(422).json({
+        error: `Invalid status transition from ${task.status} to ${status}`,
       });
     }
 
@@ -1300,7 +1574,27 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
       // Continue even if activity logging fails
     }
 
-    res.json({ task: result.rows[0] });
+    const io = (req.app as any).get('io');
+    io?.to(`task_${id}`).emit('task:status_changed', {
+      taskId: id,
+      fromStatus: task.status,
+      toStatus: status,
+      computedAt: new Date().toISOString(),
+    });
+
+    const taskAssignees = await query(`SELECT user_id FROM task_assignees WHERE task_id = $1`, [id]);
+    await dispatchNotification({
+      type: 'TASK_STATUS_CHANGED',
+      recipientIds: taskAssignees.rows.map((r: any) => r.user_id),
+      title: 'Task status updated',
+      body: `Task moved to ${status}`,
+      refId: id,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+
+    res.json({ task: buildTaskWithDerivedStatus(result.rows[0]) });
   } catch (error: any) {
     console.error('Update task status error:', error);
     console.error('Error details:', {
@@ -1420,15 +1714,884 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // Delete task (cascades to task_assignees, task_activities, etc. per schema)
-    await client.query(`DELETE FROM tasks WHERE id = $1`, [id]);
+    // Soft delete task (omit deleted_at/deleted_by when column not migrated)
+    await getTasksDeletedAtFilter();
+    if (tasksDeletedAtColumnExists) {
+      await client.query(
+        `UPDATE tasks
+         SET status = 'deleted',
+             deleted_at = CURRENT_TIMESTAMP,
+             deleted_by = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [id, userId]
+      );
+    } else {
+      await client.query(
+        `UPDATE tasks
+         SET status = 'deleted',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [id]
+      );
+    }
+
+    await logTaskActivity(client, {
+      taskId: id,
+      userId,
+      activityType: 'task_deleted',
+      message: `Task "${task.title}" deleted`,
+    });
+
+    const assigneesResult = await client.query(
+      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+      [id]
+    );
 
     await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'TASK_DELETED',
+      recipientIds: assigneesResult.rows.map((r: any) => r.user_id),
+      title: 'Task deleted',
+      body: `Task "${task.title}" was deleted.`,
+      refId: id,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
     res.json({ success: true, message: 'Task deleted' });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('Delete task error:', error);
     res.status(500).json({ error: 'Failed to delete task' });
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Mark member task as complete (user marks their own completion)
+ */
+export const completeTaskForVerification = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id, status
+       FROM tasks
+       WHERE id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+
+    const task = taskResult.rows[0];
+    const assigneeCheck = await client.query(
+      `SELECT 1 FROM task_assignees WHERE task_id = $1 AND user_id = $2`,
+      [taskId, userId]
+    );
+    if (assigneeCheck.rows.length === 0) return res.status(403).json({ error: 'You are not assigned to this task' });
+
+    if (!isValidTransition(task.status, 'pending_verification')) {
+      return res.status(422).json({ error: `Invalid status transition from ${task.status} to pending_verification` });
+    }
+
+    const updateTask = await client.query(
+      `UPDATE tasks
+       SET status = 'pending_verification',
+           verification_status = 'pending',
+           completed_by_assignee_at = CURRENT_TIMESTAMP,
+           verified_by_owner_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [taskId]
+    );
+
+    await client.query(
+      `UPDATE task_assignees
+       SET completed_at = CURRENT_TIMESTAMP,
+           verified_at = NULL,
+           status = 'completed'
+       WHERE task_id = $1 AND user_id = $2`,
+      [taskId, userId]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'completion_pending',
+      message: 'Task marked complete and moved to pending verification',
+    });
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'TASK_COMPLETE_PENDING',
+      recipientIds: [task.owner_id],
+      title: 'Task awaiting verification',
+      body: `${task.title} was marked complete and needs your verification.`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+    io?.to(`task_${taskId}`).emit('task:status_changed', {
+      taskId,
+      fromStatus: task.status,
+      toStatus: 'pending_verification',
+      computedAt: new Date().toISOString(),
+    });
+
+    res.json({ task: buildTaskWithDerivedStatus(updateTask.rows[0]), notification_sent: true });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to mark task complete' });
+  } finally {
+    client.release();
+  }
+};
+
+export const verifyTaskCompletion = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, status, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only task owner can verify completion' });
+    }
+    if (!isValidTransition(task.status, 'completed')) {
+      return res.status(422).json({ error: `Invalid status transition from ${task.status} to completed` });
+    }
+
+    const updatedTask = await client.query(
+      `UPDATE tasks
+       SET status = 'completed',
+           verification_status = 'verified',
+           verified_by_owner_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [taskId]
+    );
+
+    await client.query(
+      `UPDATE task_assignees
+       SET verified_at = CURRENT_TIMESTAMP,
+           status = 'completed'
+       WHERE task_id = $1 AND completed_at IS NOT NULL`,
+      [taskId]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'completion_verified',
+      message: 'Owner verified task completion',
+    });
+
+    const recipientsResult = await client.query(
+      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+      [taskId]
+    );
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'TASK_VERIFIED',
+      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
+      title: 'Task verified',
+      body: `${task.title} was verified by the owner.`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+
+    io?.to(`task_${taskId}`).emit('task:status_changed', {
+      taskId,
+      fromStatus: task.status,
+      toStatus: 'completed',
+      computedAt: new Date().toISOString(),
+    });
+
+    res.json({ task: buildTaskWithDerivedStatus(updatedTask.rows[0]) });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Verify task completion error:', error);
+    res.status(500).json({ error: 'Failed to verify task completion' });
+  } finally {
+    client.release();
+  }
+};
+
+export const rejectTaskCompletion = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    const reason = String(req.body?.reason || '').trim();
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    if (reason.length < 10) {
+      return res.status(400).json({ error: 'Reason is required and must be at least 10 characters' });
+    }
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, status, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only task owner can reject completion' });
+    }
+    if (!isValidTransition(task.status, 'in_progress')) {
+      return res.status(422).json({ error: `Invalid status transition from ${task.status} to in_progress` });
+    }
+
+    const updatedTask = await client.query(
+      `UPDATE tasks
+       SET status = 'in_progress',
+           verification_status = 'rejected',
+           completed_by_assignee_at = NULL,
+           verified_by_owner_at = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [taskId]
+    );
+
+    await client.query(
+      `UPDATE task_assignees
+       SET completed_at = NULL,
+           verified_at = NULL,
+           status = 'inprogress'
+       WHERE task_id = $1`,
+      [taskId]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'task_reassigned',
+      message: `Completion rejected: ${reason}`,
+    });
+
+    const recipientsResult = await client.query(
+      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+      [taskId]
+    );
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'TASK_COMPLETION_REJECTED',
+      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
+      title: 'Completion rejected',
+      body: reason,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+
+    io?.to(`task_${taskId}`).emit('task:status_changed', {
+      taskId,
+      fromStatus: task.status,
+      toStatus: 'in_progress',
+      computedAt: new Date().toISOString(),
+    });
+
+    res.json({ task: buildTaskWithDerivedStatus(updatedTask.rows[0]) });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Reject task completion error:', error);
+    res.status(500).json({ error: 'Failed to reject completion' });
+  } finally {
+    client.release();
+  }
+};
+
+export const requestTaskDelete = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    const reason = String(req.body?.reason || '').trim();
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    if (!reason) return res.status(400).json({ error: 'Reason is required' });
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+
+    if (String(task.owner_id) === String(userId)) {
+      return res.status(400).json({ error: 'Owner can delete directly; request is not required' });
+    }
+
+    const deleteRequestsTable = await getTaskDeleteRequestsTableExists();
+    let persistedRequest: any = null;
+    if (deleteRequestsTable) {
+      const requestResult = await client.query(
+        `INSERT INTO task_delete_requests (task_id, requested_by, reason, status)
+         VALUES ($1, $2, $3, 'pending')
+         RETURNING *`,
+        [taskId, userId, reason]
+      );
+      persistedRequest = requestResult.rows[0];
+    }
+
+    const conversationResult = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (conversationResult.rows.length > 0) {
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: conversationResult.rows[0].id,
+        senderId: userId,
+        content: `A member asked to delete this task: ${reason}`,
+        metadata: {
+          requestType: 'task_delete',
+          requestId: persistedRequest?.id ?? null,
+          actionChips: ['approve', 'reject'],
+        },
+      });
+    }
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'delete_request_created',
+      message: `Delete requested: ${reason}`,
+    });
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'DELETE_REQUEST_RECEIVED',
+      recipientIds: [task.owner_id],
+      title: 'Task delete request',
+      body: `${reason}`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+    res.json({
+      success: true,
+      request: persistedRequest,
+      deleteRequestsPersisted: deleteRequestsTable,
+    });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Request task delete error:', error);
+    res.status(500).json({ error: 'Failed to request delete' });
+  } finally {
+    client.release();
+  }
+};
+
+export const approveTaskDeleteRequest = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only owner can approve delete requests' });
+    }
+
+    const deleteRequestsTable = await getTaskDeleteRequestsTableExists();
+    let request: { id: string; requested_by?: string } | null = null;
+    if (deleteRequestsTable) {
+      const reqResult = await client.query(
+        `SELECT * FROM task_delete_requests
+         WHERE task_id = $1 AND status = 'pending'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [taskId]
+      );
+      if (reqResult.rows.length === 0) return res.status(404).json({ error: 'No pending delete request found' });
+      request = reqResult.rows[0];
+
+      await client.query(
+        `UPDATE task_delete_requests
+         SET status = 'approved', decided_by = $2, decided_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [request.id, userId]
+      );
+    }
+
+    await getTasksDeletedAtFilter();
+    if (tasksDeletedAtColumnExists) {
+      await client.query(
+        `UPDATE tasks
+         SET status = 'deleted',
+             deleted_at = CURRENT_TIMESTAMP,
+             deleted_by = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [taskId, userId]
+      );
+    } else {
+      await client.query(
+        `UPDATE tasks
+         SET status = 'deleted',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [taskId]
+      );
+    }
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'task_deleted',
+      message: 'Delete request approved and task soft-deleted',
+    });
+
+    const convApprove = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (convApprove.rows.length > 0) {
+      await resolveSystemRequestActionChips(client, {
+        conversationId: convApprove.rows[0].id,
+        requestType: 'task_delete',
+        requestId: request?.id || null,
+        decision: 'approved',
+      });
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: convApprove.rows[0].id,
+        senderId: userId,
+        content: 'The task owner approved deleting this task. The task has been removed.',
+        metadata: { requestType: 'task_delete_decision', decision: 'approved' },
+      });
+    }
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    const notifyRequester = request?.requested_by ? [request.requested_by] : [];
+    if (notifyRequester.length > 0) {
+      await dispatchNotification({
+        type: 'TASK_DELETED',
+        recipientIds: notifyRequester,
+        title: 'Delete request approved',
+        body: `${task.title} has been deleted.`,
+        refId: taskId,
+        refType: 'task',
+        channels: ['in_app'],
+        io,
+      });
+    }
+    res.json({ success: true, deleteRequestsPersisted: deleteRequestsTable });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Approve task delete request error:', error);
+    res.status(500).json({ error: 'Failed to approve delete request' });
+  } finally {
+    client.release();
+  }
+};
+
+export const denyTaskDeleteRequest = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeByIdDeny = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeByIdDeny}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only owner can deny delete requests' });
+    }
+
+    const deleteRequestsTableDeny = await getTaskDeleteRequestsTableExists();
+    let request: { id: string; requested_by?: string } | null = null;
+    if (deleteRequestsTableDeny) {
+      const reqResult = await client.query(
+        `SELECT * FROM task_delete_requests
+         WHERE task_id = $1 AND status = 'pending'
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [taskId]
+      );
+      if (reqResult.rows.length === 0) return res.status(404).json({ error: 'No pending delete request found' });
+      request = reqResult.rows[0];
+
+      await client.query(
+        `UPDATE task_delete_requests
+         SET status = 'denied', decided_by = $2, decided_at = CURRENT_TIMESTAMP
+         WHERE id = $1`,
+        [request.id, userId]
+      );
+    }
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'delete_request_denied',
+      message: 'Delete request denied',
+    });
+
+    const convDeny = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (convDeny.rows.length > 0) {
+      await resolveSystemRequestActionChips(client, {
+        conversationId: convDeny.rows[0].id,
+        requestType: 'task_delete',
+        requestId: request?.id || null,
+        decision: 'denied',
+      });
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: convDeny.rows[0].id,
+        senderId: userId,
+        content: 'The task owner declined the request to delete this task.',
+        metadata: { requestType: 'task_delete_decision', decision: 'denied' },
+      });
+    }
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    if (request?.requested_by) {
+      await dispatchNotification({
+        type: 'DELETE_REQUEST_RECEIVED',
+        recipientIds: [request.requested_by],
+        title: 'Delete request denied',
+        body: `${task.title} delete request was denied.`,
+        refId: taskId,
+        refType: 'task',
+        channels: ['in_app'],
+        io,
+      });
+    }
+    res.json({ success: true, deleteRequestsPersisted: deleteRequestsTableDeny });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Deny task delete request error:', error);
+    res.status(500).json({ error: 'Failed to deny delete request' });
+  } finally {
+    client.release();
+  }
+};
+
+export const createExitRequest = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+    const comment = String(req.body?.comment || '').trim();
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    if (!comment) return res.status(400).json({ error: 'Comment is required' });
+
+    const activeByIdExit = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeByIdExit}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+
+    const assigneeCheck = await client.query(
+      `SELECT 1 FROM task_assignees WHERE task_id = $1 AND user_id = $2`,
+      [taskId, userId]
+    );
+    if (assigneeCheck.rows.length === 0) return res.status(403).json({ error: 'Only assignees can request exit' });
+
+    const requestResult = await client.query(
+      `INSERT INTO task_exit_requests (task_id, assignee_id, comment, status)
+       VALUES ($1, $2, $3, 'pending')
+       RETURNING *`,
+      [taskId, userId, comment]
+    );
+
+    const requesterResult = await client.query(
+      `SELECT name FROM users WHERE id = $1`,
+      [userId]
+    );
+    const requesterName = requesterResult.rows[0]?.name || 'User';
+
+    const conversationResult = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (conversationResult.rows.length > 0) {
+      const taskConversationId = conversationResult.rows[0].id;
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: taskConversationId,
+        senderId: userId,
+        content: `${requesterName} requested task exit`,
+        metadata: {
+          requestType: 'task_exit',
+          requestId: requestResult.rows[0].id,
+          actionChips: ['approve', 'reject'],
+        },
+      });
+
+      // Keep user's comment as a regular chat bubble below the centered system request.
+      await client.query(
+        `INSERT INTO messages (conversation_id, sender_id, content, message_type)
+         VALUES ($1, $2, $3, 'text')`,
+        [taskConversationId, userId, comment]
+      );
+    }
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'exit_requested',
+      message: `Exit requested: ${comment}`,
+    });
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'EXIT_REQUEST_RECEIVED',
+      recipientIds: [task.owner_id],
+      title: 'Task exit request',
+      body: comment,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+    res.json({ success: true, request: requestResult.rows[0] });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Create exit request error:', error);
+    res.status(500).json({ error: 'Failed to request exit' });
+  } finally {
+    client.release();
+  }
+};
+
+export const approveExitRequest = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId, requestId } = req.params;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeByIdApproveExit = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeByIdApproveExit}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only owner can approve exit request' });
+    }
+
+    const reqResult = await client.query(
+      `SELECT * FROM task_exit_requests
+       WHERE id = $1 AND task_id = $2 AND status = 'pending'`,
+      [requestId, taskId]
+    );
+    if (reqResult.rows.length === 0) return res.status(404).json({ error: 'Exit request not found' });
+    const request = reqResult.rows[0];
+
+    await client.query(
+      `UPDATE task_exit_requests
+       SET status = 'approved', decided_by = $2, decided_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [requestId, userId]
+    );
+    // Some environments still enforce older task_assignees status constraints
+    // that do not include 'exited'. Remove assignee row to mark task exit.
+    await client.query(
+      `DELETE FROM task_assignees
+       WHERE task_id = $1 AND user_id = $2`,
+      [taskId, request.assignee_id]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'exit_approved',
+      message: 'Exit request approved',
+    });
+
+    const assigneeResult = await client.query(
+      `SELECT name FROM users WHERE id = $1`,
+      [request.assignee_id]
+    );
+    const assigneeName = assigneeResult.rows[0]?.name || 'Member';
+    const convApproveExit = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (convApproveExit.rows.length > 0) {
+      await resolveSystemRequestActionChips(client, {
+        conversationId: convApproveExit.rows[0].id,
+        requestType: 'task_exit',
+        requestId,
+        decision: 'approved',
+      });
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: convApproveExit.rows[0].id,
+        senderId: userId,
+        content: `${assigneeName} exited this task group.`,
+        metadata: { requestType: 'task_exit_decision', requestId, decision: 'approved' },
+      });
+    }
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'EXIT_APPROVED',
+      recipientIds: [request.assignee_id],
+      title: 'Exit approved',
+      body: `You have been released from ${task.title}.`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+    res.json({ success: true });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Approve exit request error:', error);
+    res.status(500).json({ error: 'Failed to approve exit request' });
+  } finally {
+    client.release();
+  }
+};
+
+export const rejectExitRequest = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userId = req.user?.userId;
+    const { id: taskId, requestId } = req.params;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const activeByIdRejectExit = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT id, title, COALESCE(created_by, creator_id) as owner_id
+       FROM tasks WHERE id = $1${activeByIdRejectExit}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    const task = taskResult.rows[0];
+    if (String(task.owner_id) !== String(userId)) {
+      return res.status(403).json({ error: 'Only owner can reject exit request' });
+    }
+
+    const reqResult = await client.query(
+      `SELECT * FROM task_exit_requests
+       WHERE id = $1 AND task_id = $2 AND status = 'pending'`,
+      [requestId, taskId]
+    );
+    if (reqResult.rows.length === 0) return res.status(404).json({ error: 'Exit request not found' });
+    const request = reqResult.rows[0];
+
+    await client.query(
+      `UPDATE task_exit_requests
+       SET status = 'rejected', decided_by = $2, decided_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [requestId, userId]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'exit_rejected',
+      message: 'Exit request rejected',
+    });
+
+    const assigneeResult = await client.query(
+      `SELECT name FROM users WHERE id = $1`,
+      [request.assignee_id]
+    );
+    const assigneeName = assigneeResult.rows[0]?.name || 'Member';
+    const convRejectExit = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [taskId]
+    );
+    if (convRejectExit.rows.length > 0) {
+      await resolveSystemRequestActionChips(client, {
+        conversationId: convRejectExit.rows[0].id,
+        requestType: 'task_exit',
+        requestId,
+        decision: 'rejected',
+      });
+      await insertSystemMessageOptionalMetadata(client, {
+        conversationId: convRejectExit.rows[0].id,
+        senderId: userId,
+        content: `Exit request from ${assigneeName} was rejected.`,
+        metadata: { requestType: 'task_exit_decision', requestId, decision: 'rejected' },
+      });
+    }
+
+    await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'EXIT_REJECTED',
+      recipientIds: [request.assignee_id],
+      title: 'Exit rejected',
+      body: `Exit request for ${task.title} was rejected.`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+    res.json({ success: true });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Reject exit request error:', error);
+    res.status(500).json({ error: 'Failed to reject exit request' });
   } finally {
     client.release();
   }

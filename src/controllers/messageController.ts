@@ -555,6 +555,7 @@ export const getMessagesByConversationId = async (req: Request, res: Response) =
         m.is_live_location,
         m.visibility_mode,
         m.sender_organization_id,
+        m.metadata,
         CASE
           -- If current user is the sender (for task groups / groups)
           WHEN m.sender_id = $2 AND ($5 = true OR $6 = true) THEN

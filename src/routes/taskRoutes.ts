@@ -13,6 +13,15 @@ import {
   markMemberComplete,
   verifyMemberCompletion,
   reassignMember,
+  completeTaskForVerification,
+  verifyTaskCompletion,
+  rejectTaskCompletion,
+  requestTaskDelete,
+  approveTaskDeleteRequest,
+  denyTaskDeleteRequest,
+  createExitRequest,
+  approveExitRequest,
+  rejectExitRequest,
 } from '../controllers/taskController';
 import {
   linkComplianceToTask,
@@ -31,8 +40,8 @@ router.use(authenticate);
 router.get(
   '/',
   [
-    queryValidator('type').optional().isIn(['one_time', 'recurring']),
-    queryValidator('status').optional().isIn(['pending', 'in_progress', 'completed', 'rejected']),
+    queryValidator('type').optional().isIn(['one_time', 'recurring', 'recurring_instance', 'recurring_template']),
+    queryValidator('status').optional().isIn(['pending', 'todo', 'active', 'in_progress', 'pending_verification', 'completed', 'rejected', 'deleted']),
     queryValidator('priority').optional().isIn(['high', 'medium', 'low']),
   ],
   getTasks
@@ -46,7 +55,7 @@ router.post(
     body('due_date').optional(),
     body('client_entity_id').optional().isUUID(),
     body('end_date').optional(),
-    body('task_type').optional().isIn(['one_time', 'recurring']),
+    body('task_type').optional().isIn(['one_time', 'recurring', 'recurring_instance', 'recurring_template']),
     body('priority').optional().isIn(['high', 'medium', 'low']),
     body('assignee_ids').optional().isArray(),
     body('recurrence_day_of_month').optional().isInt({ min: 1, max: 31 }),
@@ -69,7 +78,7 @@ router.post(
 router.patch(
   '/:id/status',
   [
-    body('status').isIn(['pending', 'in_progress', 'completed', 'rejected']),
+    body('status').isIn(['pending', 'todo', 'active', 'in_progress', 'pending_verification', 'completed', 'rejected', 'deleted']),
   ],
   updateTaskStatus
 );
@@ -79,6 +88,9 @@ router.patch('/:id', updateTask);
 
 // Delete task
 router.delete('/:id', deleteTask);
+router.post('/:id/request-delete', [body('reason').trim().isLength({ min: 1 })], requestTaskDelete);
+router.post('/:id/approve-delete-request', approveTaskDeleteRequest);
+router.post('/:id/deny-delete-request', denyTaskDeleteRequest);
 
 // Get task assignees - get all members/assignees for a task (must come before /:id)
 router.get('/:id/assignees', getTaskAssignees);
@@ -98,6 +110,16 @@ router.post('/:id/members/:userId/verify', verifyMemberCompletion);
 
 // Reassign member work (send back from completed to in-progress)
 router.post('/:id/members/:userId/reassign', reassignMember);
+router.post('/:id/complete', completeTaskForVerification);
+router.post('/:id/verify', verifyTaskCompletion);
+router.post(
+  '/:id/reject-completion',
+  [body('reason').trim().isLength({ min: 10 })],
+  rejectTaskCompletion
+);
+router.post('/:id/exit-request', [body('comment').trim().isLength({ min: 1 })], createExitRequest);
+router.post('/:id/exit-request/:requestId/approve', approveExitRequest);
+router.post('/:id/exit-request/:requestId/reject', rejectExitRequest);
 
 // Compliance linking routes
 router.post('/:taskId/compliance', linkComplianceToTask);

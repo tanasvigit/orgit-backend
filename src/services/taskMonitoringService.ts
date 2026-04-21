@@ -28,12 +28,13 @@ export async function getTaskAnalytics(filters: {
   startDate?: string;
   endDate?: string;
 } = {}): Promise<TaskMonitoringStats> {
-  let whereClause = '';
+  let whereClause = `WHERE COALESCE(t.is_recurring_template, false) = false
+    AND COALESCE(t.task_type, 'one_time') != 'recurring_template'`;
   const params: any[] = [];
   let paramIndex = 1;
 
   if (filters.organizationId) {
-    whereClause += `WHERE t.organization_id = $${paramIndex}`;
+    whereClause += ` AND t.organization_id = $${paramIndex}`;
     params.push(filters.organizationId);
     paramIndex++;
   }
@@ -127,7 +128,9 @@ export async function getOverdueTasks(filters: {
   const { organizationId, page = 1, limit = 20 } = filters;
   const offset = (page - 1) * limit;
 
-  let whereClause = "WHERE t.status = 'overdue'";
+  let whereClause = `WHERE t.status = 'overdue'
+    AND COALESCE(t.is_recurring_template, false) = false
+    AND COALESCE(t.task_type, 'one_time') != 'recurring_template'`;
   const params: any[] = [];
   let paramIndex = 1;
 
@@ -199,6 +202,8 @@ export async function getPlatformTaskStatistics(): Promise<{
       COUNT(t.id) FILTER (WHERE t.status = 'overdue') as overdue_tasks
     FROM organizations o
     LEFT JOIN tasks t ON o.id = t.organization_id
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
     GROUP BY o.id, o.name
     ORDER BY total_tasks DESC`,
     []

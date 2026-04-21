@@ -4,6 +4,7 @@ import {
   markNotificationAsRead,
   markAllNotificationsAsRead,
   deleteNotification,
+  getUnreadNotificationCount,
 } from '../services/notificationService';
 
 /**
@@ -95,6 +96,17 @@ export const deleteNotificationHandler = async (req: Request, res: Response) => 
       success: false,
       error: error.message || 'Failed to delete notification',
     });
+  }
+};
+
+export const getNotificationCountHandler = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.userId;
+    const unread = await getUnreadNotificationCount(userId);
+    res.json({ unread });
+  } catch (error: any) {
+    console.error('Get notification count error:', error);
+    res.status(500).json({ error: 'Failed to fetch notification count' });
   }
 };
 

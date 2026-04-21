@@ -4,6 +4,7 @@ import {
   markAsReadHandler,
   markAllAsReadHandler,
   deleteNotificationHandler,
+  getNotificationCountHandler,
 } from '../controllers/notificationController';
 import { authenticate } from '../middleware/authMiddleware';
 import { query as queryValidator } from 'express-validator';
@@ -21,6 +22,7 @@ router.get(
   ],
   getNotifications
 );
+router.get('/count', getNotificationCountHandler);
 
 router.post('/:notificationId/read', markAsReadHandler);
 

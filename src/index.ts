@@ -302,7 +302,7 @@ httpServer.listen(PORT, () => {
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 
   // Setup scheduled jobs
-  setupTaskJobs();
+  setupTaskJobs(io);
 });
 
 export { io };

@@ -1,12 +1,15 @@
 /**
  * Run database/schema.sql first, then all SQL migration files in migrations/ in alphabetical order.
  * Migrations assume the base schema (e.g. messages, users) already exists.
- * Uses .env for DB connection. Stops on first failure (that step is rolled back).
+ * Uses .env for DB connection (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD). Stops on first failure.
  *
- * Usage (from orgit-api folder):
+ * From orgit-backend root (recommended):
+ *   npm run migrate:all
+ *   npm run migrate:all -- --dry-run           # list steps only
+ *   npm run migrate:all -- --migrations-only     # skip schema.sql; run only migrations/*.sql
+ *
+ * Or:
  *   node scripts/run-all-migrations.js
- *   node scripts/run-all-migrations.js --dry-run   # list files only, do not run
- *   node scripts/run-all-migrations.js --migrations-only   # skip schema.sql, run only migrations/
  */
 
 const fs = require('fs');

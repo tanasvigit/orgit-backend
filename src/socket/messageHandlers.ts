@@ -4,6 +4,7 @@ import { verifyToken } from '../utils/jwt';
 import { query, getClient } from '../config/database';
 import { getFileUrl } from '../services/mediaUploadService';
 import { getValidatedDeviceTimestamp } from '../utils/deviceTime';
+import { dispatchNotification } from '../services/notification-bus.service';
 
 // Use existing Node firebaseAdmin helper for FCM push notifications
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -790,17 +791,16 @@ export const setupMessageHandlers = (io: Server) => {
 
             const notificationTitle = `New message from ${senderName}`;
 
-            await query(
-              `INSERT INTO notifications (user_id, type, title, description, related_entity_type, related_entity_id)
-               VALUES ($1, 'message_received', $2, $3, $4, $5)`,
-              [
-                member.user_id,
-                notificationTitle,
-                notificationBody,
-                'conversation',
-                actualConversationId || message.id,
-              ]
-            );
+            await dispatchNotification({
+              type: 'MESSAGE_RECEIVED',
+              recipientIds: [member.user_id],
+              title: notificationTitle,
+              body: notificationBody,
+              refType: 'conversation',
+              refId: actualConversationId || message.id,
+              channels: ['in_app'],
+              io,
+            });
 
             // Fire-and-forget FCM push (same pattern as legacy JS socket)
             if (sendPushToTokens) {

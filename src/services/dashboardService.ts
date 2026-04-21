@@ -65,6 +65,7 @@ const categorizeTask = (
   task: DashboardTask,
   dueSoonDays: number = 3
 ): 'scheduled' | 'todo' | 'overdue' | 'dueSoon' | 'inProgress' | 'completed' => {
+  const hasNoDates = !task.start_date && !task.due_date;
   // 0. Before start_date (date+time): task is scheduled; display in todo only when current date-time >= start_date
   if (task.start_date) {
     const now = new Date();
@@ -82,6 +83,18 @@ const categorizeTask = (
   if (task.status === 'completed') {
     if ((task as any).is_creator) return 'inProgress';
     return 'completed';
+  }
+
+  // No-date tasks must never go to overdue/dueSoon buckets.
+  if (hasNoDates) {
+    const isSelfTask = (task as any).isSelfTask === true;
+    const currentUserAcceptedAt = (task as any).current_user_accepted_at;
+    const acceptedAssigneeCount = (task as any).accepted_assignee_count;
+    const noOneAccepted =
+      isSelfTask
+        ? currentUserAcceptedAt == null
+        : (acceptedAssigneeCount == null || Number(acceptedAssigneeCount) === 0);
+    return noOneAccepted ? 'todo' : 'inProgress';
   }
 
   // 2. Overdue: by date
@@ -172,6 +185,8 @@ export const getDashboardData = async (
      FROM tasks t
      INNER JOIN task_assignees ta ON t.id = ta.task_id
      WHERE ta.user_id = $1
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
        AND (ta.status IS NULL OR ta.status != 'scheduled')
        AND (
           -- Non-creator roles are always Self
@@ -209,6 +224,8 @@ export const getDashboardData = async (
       jsonb_build_object('has_accepted', false, 'has_rejected', false, 'assignee_status', NULL) as current_user_status
      FROM tasks t
      WHERE COALESCE(t.created_by, t.creator_id) = $1
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
        AND NOT EXISTS (SELECT 1 FROM task_assignees ta_any WHERE ta_any.task_id = t.id)
      ORDER BY t.created_at DESC`,
     [userId]
@@ -242,6 +259,8 @@ export const getDashboardData = async (
      FROM tasks t
      INNER JOIN task_assignees ta_me ON t.id = ta_me.task_id
      WHERE ta_me.user_id = $1
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
        AND (ta_me.status IS NULL OR ta_me.status != 'scheduled')
        AND COALESCE(ta_me.role, 'member') = 'creator'
        AND EXISTS (
@@ -407,7 +426,7 @@ export const getTaskStatistics = async (userId: string): Promise<{
     `SELECT 
       COUNT(DISTINCT t.id) as total,
       COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'pending' AND ta.accepted_at IS NULL) as todo,
-      COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'overdue' OR (t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE AND t.status != 'completed')) as overdue,
+      COUNT(DISTINCT t.id) FILTER (WHERE t.due_date IS NOT NULL AND (t.status = 'overdue' OR (t.due_date < CURRENT_DATE AND t.status != 'completed'))) as overdue,
       COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'completed' OR (ta.completed_at IS NOT NULL AND ta.verified_at IS NOT NULL)) as completed,
       COUNT(DISTINCT t.id) FILTER (WHERE t.status != 'completed' AND (t.status = 'in_progress' OR (t.status = 'pending' AND ta.accepted_at IS NOT NULL))) as in_progress,
       COUNT(DISTINCT t.id) FILTER (
@@ -419,6 +438,8 @@ export const getTaskStatistics = async (userId: string): Promise<{
      FROM tasks t
      INNER JOIN task_assignees ta ON t.id = ta.task_id
      WHERE ta.user_id = $1
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
        AND (ta.status IS NULL OR ta.status != 'scheduled')
        AND (
          COALESCE(ta.role, 'member') <> 'creator'
@@ -441,7 +462,7 @@ export const getTaskStatistics = async (userId: string): Promise<{
     `SELECT 
       COUNT(*) as total,
       COUNT(*) FILTER (WHERE t.status = 'pending' AND (SELECT COUNT(*) FROM task_assignees ta_t WHERE ta_t.task_id = t.id AND ta_t.accepted_at IS NOT NULL) = 0) as todo,
-      COUNT(*) FILTER (WHERE t.status = 'overdue' OR (t.due_date IS NOT NULL AND t.due_date < CURRENT_DATE AND t.status != 'completed')) as overdue,
+      COUNT(*) FILTER (WHERE t.due_date IS NOT NULL AND (t.status = 'overdue' OR (t.due_date < CURRENT_DATE AND t.status != 'completed'))) as overdue,
       COUNT(*) FILTER (WHERE t.status = 'completed') as completed,
       COUNT(*) FILTER (WHERE t.status != 'completed' AND (t.status = 'in_progress' OR (t.status = 'pending' AND (SELECT COUNT(*) FROM task_assignees ta_i WHERE ta_i.task_id = t.id AND ta_i.accepted_at IS NOT NULL) > 0))) as in_progress,
       COUNT(*) FILTER (
@@ -453,6 +474,8 @@ export const getTaskStatistics = async (userId: string): Promise<{
      FROM tasks t
      INNER JOIN task_assignees ta_me ON t.id = ta_me.task_id
      WHERE ta_me.user_id = $1
+      AND COALESCE(t.is_recurring_template, false) = false
+      AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
        AND (ta_me.status IS NULL OR ta_me.status != 'scheduled')
        AND COALESCE(ta_me.role, 'member') = 'creator'
        AND EXISTS (
