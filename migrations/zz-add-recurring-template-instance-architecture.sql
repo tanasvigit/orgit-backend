@@ -26,7 +26,8 @@ ALTER TABLE tasks
   ADD COLUMN IF NOT EXISTS is_recurring_template BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS parent_task_id UUID NULL,
   ADD COLUMN IF NOT EXISTS recurrence_template_id UUID NULL,
-  ADD COLUMN IF NOT EXISTS recurrence_instance_no INTEGER NULL;
+  ADD COLUMN IF NOT EXISTS recurrence_instance_no INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS recurrence_day_of_month INTEGER NULL;
 
 -- 3) Recurrence template table.
 CREATE TABLE IF NOT EXISTS task_recurrence_templates (
@@ -50,6 +51,31 @@ CREATE TABLE IF NOT EXISTS task_recurrence_templates (
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_name = 'tasks'
+      AND constraint_name = 'tasks_recurrence_template_fk'
+  ) THEN
+    ALTER TABLE tasks
+      ADD CONSTRAINT tasks_recurrence_template_fk
+      FOREIGN KEY (recurrence_template_id) REFERENCES task_recurrence_templates(id) ON DELETE SET NULL;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.table_constraints
+    WHERE table_name = 'tasks'
+      AND constraint_name = 'tasks_parent_task_template_fk'
+  ) THEN
+    ALTER TABLE tasks
+      ADD CONSTRAINT tasks_parent_task_template_fk
+      FOREIGN KEY (parent_task_id) REFERENCES task_recurrence_templates(id) ON DELETE SET NULL;
+  END IF;
+END $$;
 
 -- 4) Template assignee blueprint table.
 CREATE TABLE IF NOT EXISTS task_template_assignees (

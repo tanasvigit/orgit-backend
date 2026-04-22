@@ -22,24 +22,22 @@ const formatRecurringTitle = (title: string, date: Date): string => {
  * Generate next occurrence for recurring tasks
  */
 export const generateNextRecurrence = async (): Promise<void> => {
-  let result;
-  try {
-    result = await query(
-      `SELECT *
-       FROM task_recurrence_templates
-       WHERE status = 'active'
-         AND next_recurrence_date IS NOT NULL
-         AND next_recurrence_date <= NOW()
-       ORDER BY next_recurrence_date ASC`,
-      []
-    );
-  } catch (error: any) {
-    if (String(error?.message || '').toLowerCase().includes('task_recurrence_templates')) {
-      // Migration not applied yet in this environment.
-      return;
-    }
-    throw error;
+  const tableCheck = await query(
+    `SELECT to_regclass('public.task_recurrence_templates') AS table_name`,
+    []
+  );
+  if (!tableCheck.rows[0]?.table_name) {
+    return;
   }
+  const result = await query(
+    `SELECT *
+     FROM task_recurrence_templates
+     WHERE status = 'active'
+       AND next_recurrence_date IS NOT NULL
+       AND next_recurrence_date <= NOW()
+     ORDER BY next_recurrence_date ASC`,
+    []
+  );
 
   for (const template of result.rows) {
     const recurrenceDate = new Date(template.next_recurrence_date);

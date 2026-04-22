@@ -19,6 +19,7 @@
     "migrate:document-instance-id": "node scripts/run-document-instance-id-migration.js",
     "migrate:user-documents": "node scripts/run-user-documents-migration.js",
     "migrate:all": "node scripts/run-all-migrations.js",
+    "test:recurrence-flow": "tsx scripts/test-recurring-flow.ts",
     "reset-password": "node scripts/reset-user-password.js",
     "db:bootstrap": "node scripts/bootstrap-db.js",
     "db:all-in-one": "node scripts/bootstrap-db.js",

@@ -130,22 +130,21 @@ export const escalateMissedRecurrence = async (): Promise<void> => {
     return;
   }
 
-  let result;
-  try {
-    result = await query(
-      `SELECT id, task_id
-       FROM task_recurrence_templates
-       WHERE status = 'active'
-         AND next_recurrence_date IS NOT NULL
-         AND next_recurrence_date < CURRENT_DATE`,
-      []
-    );
-  } catch (error: any) {
-    if (String(error?.message || '').toLowerCase().includes('task_recurrence_templates')) {
-      return;
-    }
-    throw error;
+  const tableCheck = await query(
+    `SELECT to_regclass('public.task_recurrence_templates') AS table_name`,
+    []
+  );
+  if (!tableCheck.rows[0]?.table_name) {
+    return;
   }
+  const result = await query(
+    `SELECT id, task_id
+     FROM task_recurrence_templates
+     WHERE status = 'active'
+       AND next_recurrence_date IS NOT NULL
+       AND next_recurrence_date < CURRENT_DATE`,
+    []
+  );
 
   for (const row of result.rows) {
     if (!row.task_id) continue;

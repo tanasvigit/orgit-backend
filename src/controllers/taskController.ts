@@ -165,6 +165,18 @@ const calculateNextRecurrenceDateLocal = (
   }
 };
 
+const buildIntervalLiteralFromDates = (
+  startInput?: string | Date | null,
+  dueInput?: string | Date | null
+): string => {
+  if (!startInput || !dueInput) return '0 seconds';
+  const start = new Date(startInput);
+  const due = new Date(dueInput);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(due.getTime())) return '0 seconds';
+  const diffMs = Math.max(0, due.getTime() - start.getTime());
+  return `${Math.floor(diffMs / 1000)} seconds`;
+};
+
 const buildTaskWithDerivedStatus = (task: any) => {
   const computedStatus = getComputedStatus({
     id: String(task.id),
@@ -1090,10 +1102,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
       if (templatesTableExists) {
         const recurrenceDate = task.start_date || task.created_at || new Date().toISOString();
-        const baseDueOffset =
-          task.start_date && task.due_date
-            ? `(${new Date(task.due_date).getTime()} milliseconds)` // fallback when interval casting is unavailable
-            : null;
+        const baseDueOffset = buildIntervalLiteralFromDates(task.start_date, task.due_date);
         const templateResult = await client.query(
           `INSERT INTO task_recurrence_templates (
             task_id,
@@ -1129,7 +1138,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             recurrence_day_of_month || null,
             specificWeekdayValue || null,
             recurrenceDate,
-            baseDueOffset || '0 milliseconds',
+            baseDueOffset,
             nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
           ]
         );
