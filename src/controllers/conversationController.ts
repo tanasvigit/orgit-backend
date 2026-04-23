@@ -13,7 +13,11 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    console.log(`[getConversations] Loading conversations for user: ${userId}`);
+    const rawScope = String(req.query.scope || 'all').toLowerCase();
+    const scope: 'all' | 'chat' | 'task' =
+      rawScope === 'chat' || rawScope === 'task' ? (rawScope as 'chat' | 'task') : 'all';
+
+    console.log(`[getConversations] Loading conversations for user: ${userId} (scope: ${scope})`);
 
     // First, check if user has any conversation memberships
     const membershipCheck = await query(
@@ -116,11 +120,16 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
             )
           )
         )
+        AND (
+          $2 = 'all'
+          OR ($2 = 'chat' AND COALESCE(c.is_task_group, FALSE) = FALSE)
+          OR ($2 = 'task' AND COALESCE(c.is_task_group, FALSE) = TRUE)
+        )
         GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.group_photo, c.created_at, cm.is_pinned, cm.role
         ORDER BY 
           COALESCE(cm.is_pinned, FALSE) DESC, 
           sort_time DESC NULLS LAST`,
-        [userId]
+        [userId, scope]
       );
     } catch (queryError: any) {
       console.error('[getConversations] Main query failed:', queryError.message);
@@ -160,9 +169,14 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
             )
           )
         )
+        AND (
+          $2 = 'all'
+          OR ($2 = 'chat' AND COALESCE(c.is_task_group, FALSE) = FALSE)
+          OR ($2 = 'task' AND COALESCE(c.is_task_group, FALSE) = TRUE)
+        )
         GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.group_photo, c.created_at, cm.is_pinned, cm.role
         ORDER BY COALESCE(cm.is_pinned, FALSE) DESC, sort_time DESC`,
-          [userId]
+          [userId, scope]
         );
         console.log(`[getConversations] Fallback query found ${result.rows.length} conversations`);
       } catch (fallbackError: any) {
