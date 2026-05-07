@@ -15,6 +15,7 @@ import {
   reassignMember,
   completeTaskForVerification,
   verifyTaskCompletion,
+  ownerCompleteTask,
   rejectTaskCompletion,
   requestTaskDelete,
   approveTaskDeleteRequest,
@@ -112,6 +113,7 @@ router.post('/:id/members/:userId/verify', verifyMemberCompletion);
 router.post('/:id/members/:userId/reassign', reassignMember);
 router.post('/:id/complete', completeTaskForVerification);
 router.post('/:id/verify', verifyTaskCompletion);
+router.post('/:id/owner-complete', ownerCompleteTask);
 router.post(
   '/:id/reject-completion',
   [body('reason').trim().isLength({ min: 10 })],

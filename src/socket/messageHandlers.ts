@@ -681,6 +681,8 @@ export const setupMessageHandlers = (io: Server) => {
           sender_photo: senderPhoto,
           reply_to: replyTo || undefined,
           status: 'sent', // Initial status (matching message-backend)
+          is_task_group: !!isTaskGroup,
+          isTaskGroup: !!isTaskGroup,
         };
 
         // Get conversation members first (matching message-backend)

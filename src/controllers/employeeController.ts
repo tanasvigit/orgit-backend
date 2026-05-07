@@ -42,18 +42,31 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
     let employeeUserId: string;
 
     if (existingUser.rows.length > 0) {
-      // User exists, check if they're already in this organization
+      // User exists, enforce single-organization membership.
       employeeUserId = existingUser.rows[0].id;
-      
-      const existingOrgCheck = await query(
-        'SELECT id FROM user_organizations WHERE user_id = $1 AND organization_id = $2',
-        [employeeUserId, organizationId]
+
+      const existingMemberships = await query(
+        `SELECT organization_id
+         FROM user_organizations
+         WHERE user_id = $1`,
+        [employeeUserId]
       );
 
-      if (existingOrgCheck.rows.length > 0) {
+      if (existingMemberships.rows.length > 0) {
+        const alreadyInCurrentOrg = existingMemberships.rows.some(
+          (row: any) => row.organization_id === organizationId
+        );
+
+        if (alreadyInCurrentOrg) {
+          return res.status(400).json({
+            success: false,
+            error: 'User is already a member of this organization',
+          });
+        }
+
         return res.status(400).json({
           success: false,
-          error: 'User is already a member of this organization',
+          error: 'User is already a member of another organization',
         });
       }
 
@@ -318,7 +331,7 @@ export const resetEmployeePassword = async (req: AuthRequest, res: Response) => 
 };
 
 /**
- * Remove employee from organization (deactivate)
+ * Remove employee from organization (membership only)
  */
 export const removeEmployee = async (req: AuthRequest, res: Response) => {
   try {
@@ -346,23 +359,23 @@ export const removeEmployee = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // Deactivate user
+    // Remove dependent reporting links first inside this organization.
     await query(
-      'UPDATE users SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      ['inactive', id]
+      `UPDATE user_organizations
+       SET reporting_to = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE organization_id = $1 AND reporting_to = $2`,
+      [organizationId, id]
     );
 
-    // Optionally remove from organization (or just deactivate)
-    // For now, we'll just deactivate the user
-    // Uncomment below to remove from organization completely:
-    // await query(
-    //   'DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2',
-    //   [id, organizationId]
-    // );
+    // Remove only organization membership (do not deactivate/delete user).
+    await query(
+      'DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2',
+      [id, organizationId]
+    );
 
     res.json({
       success: true,
-      message: 'Employee deactivated successfully',
+      message: 'Employee removed from organization successfully',
     });
   } catch (error: any) {
     console.error('Error removing employee:', error);

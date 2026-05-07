@@ -1,21 +1,142 @@
 import { query } from '../config/database';
-import { createTaskGroup } from './groupService';
 import { calculateNextRecurrenceDate } from './taskService';
 import { logTaskActivity } from './taskActivityLogger';
 
-const normalizeTemplateFrequency = (recurrenceType: string | null): any => {
+const MONTH_ABBREVS = new Set([
+  'jan',
+  'feb',
+  'mar',
+  'apr',
+  'may',
+  'jun',
+  'jul',
+  'aug',
+  'sep',
+  'oct',
+  'nov',
+  'dec',
+]);
+
+/** Strip trailing month suffix so template title stays a stable base (e.g. "abcd apr" / legacy "abcd - Apr" → "abcd"). */
+export const extractBaseTitle = (title: string): string => {
+  const t = (title || '').trim();
+  if (!t) return t;
+  const dashMonth = t.match(/^(.*)\s+[-–—]\s+([a-z]{3})\s*$/i);
+  if (dashMonth) {
+    const maybeMon = dashMonth[2].toLowerCase();
+    if (MONTH_ABBREVS.has(maybeMon)) {
+      return dashMonth[1].trim() || t;
+    }
+  }
+  const parts = t.split(/\s+/);
+  if (parts.length >= 2) {
+    const last = parts[parts.length - 1].toLowerCase().replace(/\.$/, '');
+    if (last.length === 3 && MONTH_ABBREVS.has(last)) {
+      return parts.slice(0, -1).join(' ').trim() || t;
+    }
+  }
+  return t;
+};
+
+const MONTHS_SHORT = [
+  'jan',
+  'feb',
+  'mar',
+  'apr',
+  'may',
+  'jun',
+  'jul',
+  'aug',
+  'sep',
+  'oct',
+  'nov',
+  'dec',
+] as const;
+
+/** Title for one cycle: "{base} {mon}" using UTC month of cycle start (e.g. abcd apr). */
+export const formatRecurringTitle = (title: string, cycleStartDate: Date): string => {
+  const base = extractBaseTitle(title);
+  const mon = MONTHS_SHORT[cycleStartDate.getUTCMonth()] || 'jan';
+  return `${base} ${mon}`;
+};
+
+export const parsePgIntervalToMs = (value: unknown): number => {
+  if (value == null) return 0;
+  if (typeof value === 'object') {
+    const raw = value as Record<string, any>;
+    const days = Number(raw.days ?? raw.day ?? 0);
+    const hours = Number(raw.hours ?? raw.hour ?? 0);
+    const minutes = Number(raw.minutes ?? raw.minute ?? 0);
+    const seconds = Number(raw.seconds ?? raw.second ?? 0);
+    const milliseconds = Number(raw.milliseconds ?? raw.millisecond ?? 0);
+    if ([days, hours, minutes, seconds, milliseconds].some((n) => !Number.isNaN(n))) {
+      return (
+        (Number.isNaN(days) ? 0 : days) * 24 * 60 * 60 * 1000 +
+        (Number.isNaN(hours) ? 0 : hours) * 60 * 60 * 1000 +
+        (Number.isNaN(minutes) ? 0 : minutes) * 60 * 1000 +
+        (Number.isNaN(seconds) ? 0 : seconds) * 1000 +
+        (Number.isNaN(milliseconds) ? 0 : milliseconds)
+      );
+    }
+  }
+  const asString = String(value);
+  const dayMatch = asString.match(/(-?\d+)\s+day/);
+  const hourMatch = asString.match(/(-?\d+):(\d+):(\d+)/);
+  let ms = 0;
+  if (dayMatch) ms += Number(dayMatch[1]) * 24 * 60 * 60 * 1000;
+  if (hourMatch) {
+    ms += Number(hourMatch[1]) * 60 * 60 * 1000;
+    ms += Number(hourMatch[2]) * 60 * 1000;
+    ms += Number(hourMatch[3]) * 1000;
+  }
+  if (!dayMatch && !hourMatch && asString.includes('sec')) {
+    const secMatch = asString.match(/(-?\d+(?:\.\d+)?)\s*sec/);
+    if (secMatch) ms += Number(secMatch[1]) * 1000;
+  }
+  return ms;
+};
+
+const normalizeTemplateFrequency = (
+  recurrenceType: string | null,
+  specificWeekday: number | null
+): any => {
   const normalized = String(recurrenceType || '').toLowerCase().trim();
   if (normalized === 'daily') return 'weekly';
-  if (normalized === 'weekly') return 'specific_weekday';
+  if (normalized === 'weekly') {
+    // Legacy weekly templates may not carry specific_weekday.
+    // Falling back to weekly prevents endless regeneration every scheduler run.
+    return specificWeekday === null || specificWeekday === undefined ? 'weekly' : 'specific_weekday';
+  }
   if (normalized === 'monthly') return 'monthly';
   if (normalized === 'quarterly') return 'quarterly';
   if (normalized === 'annually' || normalized === 'yearly') return 'yearly';
   return 'monthly';
 };
 
-const formatRecurringTitle = (title: string, date: Date): string => {
-  const month = date.toLocaleString('en-US', { month: 'short' });
-  return `${title} - ${month}`;
+const advanceCursorToFuture = (
+  frequency: any,
+  specificWeekday: number | null,
+  baseDate: Date,
+  now: Date
+): Date => {
+  let cursor = new Date(baseDate);
+  let next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
+  let guard = 0;
+
+  // Skip historical windows so one stale template does not create one task every scheduler run.
+  while (next.getTime() <= now.getTime() && guard < 500) {
+    // Defensive escape for malformed frequency/weekday combinations.
+    if (next.getTime() <= cursor.getTime()) {
+      cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
+      next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
+    } else {
+      cursor = next;
+      next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
+    }
+    guard += 1;
+  }
+
+  return next;
 };
 
 /**
@@ -41,26 +162,17 @@ export const generateNextRecurrence = async (): Promise<void> => {
 
   for (const template of result.rows) {
     const recurrenceDate = new Date(template.next_recurrence_date);
-    const offsetMs = (() => {
-      if (!template.base_due_offset) return 0;
-      // base_due_offset arrives from PG interval as string in many drivers (e.g. "5 days")
-      const asString = String(template.base_due_offset);
-      const dayMatch = asString.match(/(-?\d+)\s+day/);
-      const hourMatch = asString.match(/(-?\d+):(\d+):(\d+)/);
-      let ms = 0;
-      if (dayMatch) ms += Number(dayMatch[1]) * 24 * 60 * 60 * 1000;
-      if (hourMatch) {
-        ms += Number(hourMatch[1]) * 60 * 60 * 1000;
-        ms += Number(hourMatch[2]) * 60 * 1000;
-        ms += Number(hourMatch[3]) * 1000;
-      }
-      return ms;
-    })();
+    const targetOffsetMs = parsePgIntervalToMs(template.base_target_offset);
+    const dueOffsetMs = parsePgIntervalToMs(template.base_due_offset);
 
     const startDate = recurrenceDate;
-    const dueDate = new Date(startDate.getTime() + offsetMs);
+    const targetDate = targetOffsetMs > 0 ? new Date(startDate.getTime() + targetOffsetMs) : null;
+    const dueDate = new Date(startDate.getTime() + dueOffsetMs);
     const now = new Date();
-    const initialStatus = startDate.getTime() > now.getTime() ? 'pending' : 'in_progress';
+    const initialStatus = 'pending';
+    // Recurring instances must start in todo for all assignees/owner.
+    // Progress to in_progress should happen only through user action.
+    const assigneeStatus = 'todo';
 
     const assigneesResult = await query(
       `SELECT user_id, role FROM task_template_assignees WHERE template_id = $1`,
@@ -74,6 +186,20 @@ export const generateNextRecurrence = async (): Promise<void> => {
     const creatorId =
       assignees.find((a) => a.role === 'creator')?.userId || template.creator_id;
 
+    const normalizedFrequency = normalizeTemplateFrequency(
+      template.recurrence_type,
+      template.specific_weekday
+    );
+
+    const existingInstanceResult = await query(
+      `SELECT id
+       FROM tasks
+       WHERE recurrence_template_id = $1
+         AND start_date = $2
+       LIMIT 1`,
+      [template.id, startDate]
+    );
+
     const lastCountResult = await query(
       `SELECT COALESCE(MAX(recurrence_instance_no), 0) AS max_no
        FROM tasks
@@ -82,54 +208,125 @@ export const generateNextRecurrence = async (): Promise<void> => {
     );
     const nextInstanceNo = Number(lastCountResult.rows[0]?.max_no || 0) + 1;
 
-    const newTaskResult = await query(
-      `INSERT INTO tasks (
-        id, title, description, task_type, creator_id, created_by, organization_id,
-        start_date, due_date, frequency, specific_weekday, recurrence_type, recurrence_interval,
-        category, status, recurrence_template_id, parent_task_id, recurrence_instance_no, reporting_member_id
-      )
-      VALUES (
-        gen_random_uuid(), $1, $2, 'recurring_instance', $3, $3, $4,
-        $5, $6, $7, $8, $9, $10,
-        $11, $12, $13, $13, $14, $15
-      )
-      RETURNING *`,
-      [
-        formatRecurringTitle(template.title, startDate),
-        template.description,
-        creatorId,
-        template.organization_id,
-        startDate,
-        dueDate,
-        normalizeTemplateFrequency(template.recurrence_type),
-        template.specific_weekday,
-        template.recurrence_type,
-        template.recurrence_interval || 1,
-        template.category || 'general',
-        initialStatus,
-        template.id,
-        nextInstanceNo,
-        template.reporting_member_id || null,
-      ]
-    );
-
-    const newTask = newTaskResult.rows[0];
-
-    for (const a of assignees) {
-      await query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at, completed_at, verified_at)
-         VALUES ($1, $2, 'todo', $3, NULL, NULL, NULL)
-         ON CONFLICT (task_id, user_id) DO NOTHING`,
-        [newTask.id, a.userId, a.role]
+    let newTask: any = null;
+    if (existingInstanceResult.rows.length === 0) {
+      const newTaskResult = await query(
+        `INSERT INTO tasks (
+          id, title, description, task_type, creator_id, created_by, organization_id,
+          start_date, target_date, due_date, frequency, specific_weekday, recurrence_type, recurrence_interval,
+          category, status, recurrence_template_id, parent_task_id, recurrence_instance_no, reporting_member_id
+        )
+        VALUES (
+          gen_random_uuid(), $1, $2, 'recurring_instance', $3, $3, $4,
+          $5, $6, $7, $8, $9, $10, $11,
+          $12, $13, $14, $14, $15, $16
+        )
+        RETURNING *`,
+        [
+          formatRecurringTitle(template.title, startDate),
+          template.description,
+          creatorId,
+          template.organization_id,
+          startDate,
+          targetDate,
+          dueDate,
+          normalizedFrequency,
+          template.specific_weekday,
+          template.recurrence_type,
+          template.recurrence_interval || 1,
+          template.category || 'general',
+          initialStatus,
+          template.id,
+          nextInstanceNo,
+          template.reporting_member_id || null,
+        ]
       );
+
+      newTask = newTaskResult.rows[0];
+
+      for (const a of assignees) {
+        await query(
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at, completed_at, verified_at)
+           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, NULL, NULL)
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+          [newTask.id, a.userId, assigneeStatus, a.role]
+        );
+      }
+
+      // Create task conversation group (same model used by manual task creation).
+      const convTypeCheck = await query(
+        `SELECT column_name
+         FROM information_schema.columns
+         WHERE table_name = 'conversations' AND column_name = 'type'`,
+        []
+      );
+      const hasConversationType = convTypeCheck.rows.length > 0;
+      const conversationResult = hasConversationType
+        ? await query(
+            `INSERT INTO conversations (id, type, name, is_group, is_task_group, task_id, created_by)
+             VALUES (gen_random_uuid(), 'group', $1, TRUE, TRUE, $2, $3)
+             RETURNING id`,
+            [`Task: ${newTask.title}`, newTask.id, creatorId]
+          )
+        : await query(
+            `INSERT INTO conversations (name, is_group, is_task_group, task_id, created_by)
+             VALUES ($1, TRUE, TRUE, $2, $3)
+             RETURNING id`,
+            [`Task: ${newTask.title}`, newTask.id, creatorId]
+          );
+
+      const conversationId = conversationResult.rows[0]?.id;
+      if (conversationId) {
+        await query(
+          `INSERT INTO conversation_members (conversation_id, user_id, role)
+           VALUES ($1, $2, 'admin')
+           ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+          [conversationId, creatorId]
+        );
+        for (const assigneeId of assigneeUserIds) {
+          if (String(assigneeId) === String(creatorId)) continue;
+          await query(
+            `INSERT INTO conversation_members (conversation_id, user_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+            [conversationId, assigneeId]
+          );
+        }
+
+        const messageColumnCheck = await query(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_name = 'messages' AND column_name = 'sender_organization_id'`,
+          []
+        );
+        const hasSenderOrgId = messageColumnCheck.rows.some(
+          (r: any) => r.column_name === 'sender_organization_id'
+        );
+        const messageColumns = ['conversation_id', 'sender_id', 'content', 'message_type'];
+        const messageValues: any[] = [
+          conversationId,
+          creatorId,
+          'Task group auto-created for recurring cycle',
+          'text',
+        ];
+        if (hasSenderOrgId && template.organization_id) {
+          messageColumns.push('sender_organization_id');
+          messageValues.push(template.organization_id);
+        }
+        const placeholders = messageValues.map((_, i) => `$${i + 1}`).join(', ');
+        await query(
+          `INSERT INTO messages (${messageColumns.join(', ')})
+           VALUES (${placeholders})`,
+          messageValues
+        );
+      }
     }
 
-    await createTaskGroup(newTask.id, creatorId, assigneeUserIds, template.organization_id);
-
-    const nextRecurrenceDate = calculateNextRecurrenceDate(
-      normalizeTemplateFrequency(template.recurrence_type),
+    const nextRecurrenceDate = advanceCursorToFuture(
+      normalizedFrequency,
       template.specific_weekday,
-      recurrenceDate
+      recurrenceDate,
+      now
     );
     await query(
       `UPDATE task_recurrence_templates
@@ -140,7 +337,7 @@ export const generateNextRecurrence = async (): Promise<void> => {
       [nextRecurrenceDate, template.id]
     );
 
-    if (creatorId) {
+    if (creatorId && newTask?.id) {
       await logTaskActivity(null, {
         taskId: newTask.id,
         userId: creatorId,

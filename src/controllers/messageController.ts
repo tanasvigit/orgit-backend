@@ -74,6 +74,11 @@ export const sendMessage = async (req: Request, res: Response) => {
         const senderRow = await query('SELECT name, profile_photo_url as profile_photo FROM users WHERE id = $1', [userId]);
         const senderName = senderRow.rows[0]?.name || 'Unknown';
         const senderPhoto = senderRow.rows[0]?.profile_photo || null;
+        const convRow = await query(
+          'SELECT COALESCE(is_task_group, false) AS is_task_group FROM conversations WHERE id::text = $1::text LIMIT 1',
+          [conversationId]
+        );
+        const isTaskGroupConv = !!convRow.rows[0]?.is_task_group;
         const payload = {
           ...message,
           conversation_id: conversationId,
@@ -82,6 +87,8 @@ export const sendMessage = async (req: Request, res: Response) => {
           sender_name: senderName,
           sender_photo: senderPhoto,
           status: 'sent',
+          is_task_group: isTaskGroupConv,
+          isTaskGroup: isTaskGroupConv,
         };
         io.to(conversationId).emit('new_message', payload);
         const members = await query('SELECT user_id FROM conversation_members WHERE conversation_id::text = $1::text', [conversationId]);

@@ -676,14 +676,15 @@ export async function createTaskFromPayload(
         : 'member';
 
     await client.query(
-      `INSERT INTO task_assignees (task_id, user_id, status, role)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (task_id, user_id) DO NOTHING`,
+      `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (task_id, user_id) DO UPDATE
+       SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
       [task.id, assigneeId, initialAssigneeStatus, role]
     );
   }
 
-  const createdSuffix = ` with assignees - Pending acceptance${idempotencyKey ? ` [bulk_key:${idempotencyKey}]` : ''}`;
+  const createdSuffix = ` with assignees${idempotencyKey ? ` [bulk_key:${idempotencyKey}]` : ''}`;
   await client.query(
     `INSERT INTO task_activities (task_id, user_id, activity_type, new_value, message)
      VALUES ($1, $2, 'created', 'pending', $3)`,
@@ -720,6 +721,15 @@ export async function createTaskFromPayload(
        ON CONFLICT (conversation_id, user_id) DO NOTHING`,
       [conversationId, taskCreatorId]
     );
+    for (const assigneeId of Array.from(effectiveAssigneeIds)) {
+      if (String(assigneeId) === String(taskCreatorId)) continue;
+      await client.query(
+        `INSERT INTO conversation_members (conversation_id, user_id, role)
+         VALUES ($1, $2, 'member')
+         ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+        [conversationId, assigneeId]
+      );
+    }
     if (isDifferentOwner) {
       await client.query(
         `DELETE FROM conversation_members WHERE conversation_id = $1 AND user_id = $2`,

@@ -8,192 +8,227 @@ const fail = (message: string): never => {
 };
 
 async function ensurePrerequisites() {
-  const templateTable = await query(`SELECT to_regclass('public.task_recurrence_templates') AS name`);
-  if (!templateTable.rows[0]?.name) {
-    fail('Missing table task_recurrence_templates. Run migrations first.');
-  }
-
-  const assigneeBlueprintTable = await query(`SELECT to_regclass('public.task_template_assignees') AS name`);
-  if (!assigneeBlueprintTable.rows[0]?.name) {
-    fail('Missing table task_template_assignees. Run migrations first.');
-  }
+  const tableChecks = await query(
+    `SELECT
+      to_regclass('public.task_recurrence_templates') AS templates,
+      to_regclass('public.task_template_assignees') AS blueprints`,
+    []
+  );
+  if (!tableChecks.rows[0]?.templates) fail('Missing task_recurrence_templates table.');
+  if (!tableChecks.rows[0]?.blueprints) fail('Missing task_template_assignees table.');
 }
 
-async function getSeedActors() {
-  // Primary path for this codebase: user_organizations maps users to orgs.
-  const membershipResult = await query(
-    `SELECT uo.organization_id AS org_id, uo.user_id
-     FROM user_organizations uo
-     INNER JOIN users u ON u.id = uo.user_id
-     ORDER BY uo.created_at ASC NULLS LAST
-     LIMIT 1`
-  );
-  if (membershipResult.rows[0]?.org_id && membershipResult.rows[0]?.user_id) {
-    return {
-      orgId: membershipResult.rows[0].org_id as string,
-      userId: membershipResult.rows[0].user_id as string,
-    };
-  }
-
-  // Fallback for older schemas with users.organization_id.
-  const hasUsersOrganizationColumn = await query(
+async function hasBaseTargetOffsetColumn() {
+  const result = await query(
     `SELECT EXISTS (
       SELECT 1
       FROM information_schema.columns
-      WHERE table_name = 'users'
-        AND column_name = 'organization_id'
-    ) AS has_column`
+      WHERE table_name = 'task_recurrence_templates'
+        AND column_name = 'base_target_offset'
+    ) AS exists`,
+    []
   );
-  if (hasUsersOrganizationColumn.rows[0]?.has_column) {
-    const row = await query(
-      `SELECT id AS user_id, organization_id AS org_id
-       FROM users
-       WHERE organization_id IS NOT NULL
-       ORDER BY created_at ASC
-       LIMIT 1`
-    );
-    if (row.rows[0]?.org_id && row.rows[0]?.user_id) {
-      return {
-        orgId: row.rows[0].org_id as string,
-        userId: row.rows[0].user_id as string,
-      };
-    }
-  }
-
-  fail('No usable user-organization mapping found (user_organizations/users.organization_id).');
+  return Boolean(result.rows[0]?.exists);
 }
 
+async function getActorsForScenario() {
+  const rows = await query(
+    `SELECT uo.organization_id, uo.user_id
+     FROM user_organizations uo
+     ORDER BY uo.created_at ASC NULLS LAST`,
+    []
+  );
+  const byOrg = new Map<string, string[]>();
+  for (const row of rows.rows) {
+    const orgId = String(row.organization_id || '');
+    const userId = String(row.user_id || '');
+    if (!orgId || !userId) continue;
+    if (!byOrg.has(orgId)) byOrg.set(orgId, []);
+    const list = byOrg.get(orgId)!;
+    if (!list.includes(userId)) list.push(userId);
+  }
+  for (const [orgId, users] of byOrg.entries()) {
+    if (users.length >= 3) {
+      return { orgId, ownerId: users[0], reportingId: users[1], assigneeId: users[2] };
+    }
+  }
+  // Fallback: use any 3 users globally and infer org from first available membership.
+  const users = await query(
+    `SELECT id FROM users ORDER BY created_at ASC NULLS LAST LIMIT 3`,
+    []
+  );
+  if (users.rows.length < 3) {
+    fail('Need at least 3 users in database for owner/reporting/assignee checks.');
+  }
+  const ownerId = String(users.rows[0].id);
+  const reportingId = String(users.rows[1].id);
+  const assigneeId = String(users.rows[2].id);
+  const ownerOrg = await query(
+    `SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1`,
+    [ownerId]
+  );
+  const anyOrg = await query(
+    `SELECT organization_id FROM user_organizations WHERE organization_id IS NOT NULL LIMIT 1`,
+    []
+  );
+  const orgId = String(ownerOrg.rows[0]?.organization_id || anyOrg.rows[0]?.organization_id || '');
+  if (!orgId) {
+    fail('Could not determine organization_id for test template.');
+  }
+  return { orgId, ownerId, reportingId, assigneeId };
+}
+
+const monthShort = (d: Date) => d.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' }).toLowerCase();
+
 async function run() {
-  console.log(`${TEST_TAG} Starting recurring flow verification...`);
+  console.log(`${TEST_TAG} Starting recurring requirements test...`);
   await ensurePrerequisites();
-  const { orgId, userId } = await getSeedActors();
+
+  const { orgId, ownerId, reportingId, assigneeId } = await getActorsForScenario();
+  const supportsBaseTargetOffset = await hasBaseTargetOffsetColumn();
 
   const now = new Date();
-  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
-  const fiveDaysAgo = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
+  const startDate = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000); // past -> todo
+  const targetOffsetDays = 4;
+  const dueOffsetDays = 7;
+  const targetDate = new Date(startDate.getTime() + targetOffsetDays * 24 * 60 * 60 * 1000);
+  const dueDate = new Date(startDate.getTime() + dueOffsetDays * 24 * 60 * 60 * 1000);
+  const baseTitle = `${TEST_TAG} abcd`;
 
-  // Create template controller with recurrence due now (so generator should create one new cycle).
-  const templateResult = await query(
-    `INSERT INTO task_recurrence_templates (
-      organization_id, title, description, category, creator_id,
-      recurrence_type, recurrence_interval, base_start_date, base_due_offset,
-      next_recurrence_date, status
-    )
-    VALUES ($1, $2, $3, 'general', $4, 'monthly', 1, $5, '5 days'::interval, $6, 'active')
-    RETURNING *`,
-    [
-      orgId,
-      `${TEST_TAG} MobileWebRecurring`,
-      'Recurring task with web/mobile-like fields',
-      userId,
-      fiveDaysAgo.toISOString(),
-      yesterday.toISOString(),
-    ]
-  );
-  const template = templateResult.rows[0];
+  const templateInsert = supportsBaseTargetOffset
+    ? await query(
+        `INSERT INTO task_recurrence_templates (
+          organization_id, title, description, category, creator_id, reporting_member_id,
+          recurrence_type, recurrence_interval, base_start_date, base_target_offset, base_due_offset,
+          next_recurrence_date, status
+        ) VALUES (
+          $1, $2, $3, 'general', $4, $5,
+          'monthly', 1, $6, $7::interval, $8::interval,
+          $9, 'active'
+        ) RETURNING id, title, next_recurrence_date`,
+        [
+          orgId,
+          baseTitle,
+          'Recurring task scenario',
+          ownerId,
+          reportingId,
+          startDate.toISOString(),
+          `${targetOffsetDays} days`,
+          `${dueOffsetDays} days`,
+          startDate.toISOString(),
+        ]
+      )
+    : await query(
+        `INSERT INTO task_recurrence_templates (
+          organization_id, title, description, category, creator_id, reporting_member_id,
+          recurrence_type, recurrence_interval, base_start_date, base_due_offset,
+          next_recurrence_date, status
+        ) VALUES (
+          $1, $2, $3, 'general', $4, $5,
+          'monthly', 1, $6, $7::interval,
+          $8, 'active'
+        ) RETURNING id, title, next_recurrence_date`,
+        [
+          orgId,
+          baseTitle,
+          'Recurring task scenario',
+          ownerId,
+          reportingId,
+          startDate.toISOString(),
+          `${dueOffsetDays} days`,
+          startDate.toISOString(),
+        ]
+      );
+  const templateId = templateInsert.rows[0].id as string;
 
-  // Seed assignee blueprint (copied into each generated instance).
   await query(
     `INSERT INTO task_template_assignees (template_id, user_id, role)
-     VALUES ($1, $2, 'creator')
+     VALUES ($1, $2, 'creator'), ($1, $3, 'reporting_member'), ($1, $4, 'member')
      ON CONFLICT (template_id, user_id) DO NOTHING`,
-    [template.id, userId]
+    [templateId, ownerId, reportingId, assigneeId]
   );
 
-  // Seed old completed instance (must remain completed).
-  const completedInstance = await query(
-    `INSERT INTO tasks (
-      title, description, task_type, creator_id, created_by, organization_id,
-      start_date, due_date, recurrence_type, recurrence_interval, category, status,
-      recurrence_template_id, parent_task_id, recurrence_instance_no, auto_escalate
-    )
-    VALUES (
-      $1, $2, 'recurring_instance', $3, $3, $4,
-      $5, $6, 'monthly', 1, 'general', 'completed',
-      $7, $7, 1, false
-    )
-    RETURNING id, status`,
-    [
-      `${TEST_TAG} PrevCompleted`,
-      'previous cycle completed',
-      userId,
-      orgId,
-      fiveDaysAgo.toISOString(),
-      twoDaysAgo.toISOString(),
-      template.id,
-    ]
-  );
-
-  // Seed old overdue-ish instance (status kept in_progress with past due; must remain unchanged).
-  const overdueInstance = await query(
-    `INSERT INTO tasks (
-      title, description, task_type, creator_id, created_by, organization_id,
-      start_date, due_date, recurrence_type, recurrence_interval, category, status,
-      recurrence_template_id, parent_task_id, recurrence_instance_no, auto_escalate
-    )
-    VALUES (
-      $1, $2, 'recurring_instance', $3, $3, $4,
-      $5, $6, 'monthly', 1, 'general', 'in_progress',
-      $7, $7, 2, false
-    )
-    RETURNING id, status`,
-    [
-      `${TEST_TAG} PrevOverdue`,
-      'previous cycle overdue candidate',
-      userId,
-      orgId,
-      twoDaysAgo.toISOString(),
-      yesterday.toISOString(),
-      template.id,
-    ]
-  );
-
-  const beforeCount = await query(
+  const before = await query(
     `SELECT COUNT(*)::int AS count FROM tasks WHERE recurrence_template_id = $1`,
-    [template.id]
+    [templateId]
   );
 
   await generateNextRecurrence();
 
-  const afterRows = await query(
-    `SELECT id, title, status, recurrence_instance_no, start_date, due_date
+  const generatedRows = await query(
+    `SELECT id, title, status, start_date, target_date, due_date, recurrence_instance_no, reporting_member_id
      FROM tasks
      WHERE recurrence_template_id = $1
-     ORDER BY recurrence_instance_no ASC`,
-    [template.id]
+     ORDER BY recurrence_instance_no DESC
+     LIMIT 1`,
+    [templateId]
   );
 
-  const afterCount = afterRows.rows.length;
-  const expected = Number(beforeCount.rows[0].count) + 1;
-  if (afterCount !== expected) {
-    fail(`Expected ${expected} instances, found ${afterCount}.`);
+  if (generatedRows.rows.length === 0) fail('No generated recurring instance found.');
+
+  const task = generatedRows.rows[0];
+  const after = await query(
+    `SELECT COUNT(*)::int AS count FROM tasks WHERE recurrence_template_id = $1`,
+    [templateId]
+  );
+
+  if (after.rows[0].count !== before.rows[0].count + 1) {
+    fail(`Expected exactly one new instance. before=${before.rows[0].count}, after=${after.rows[0].count}`);
   }
 
-  const newest = afterRows.rows[afterRows.rows.length - 1];
-  if (!String(newest.title).includes(' - ')) {
-    fail('Newest instance title is not month-formatted.');
+  const expectedTitle = `${baseTitle} ${monthShort(new Date(task.start_date))}`;
+  if (String(task.title).trim().toLowerCase() !== expectedTitle.toLowerCase()) {
+    fail(`Title mismatch. expected="${expectedTitle}" actual="${task.title}"`);
   }
 
-  const completedCheck = await query(`SELECT status FROM tasks WHERE id = $1`, [completedInstance.rows[0].id]);
-  if (completedCheck.rows[0]?.status !== 'completed') {
-    fail('Previous completed task was modified unexpectedly.');
+  if (String(task.status) !== 'pending') {
+    fail(`Task status mismatch. expected=pending actual=${task.status}`);
   }
 
-  const overdueCheck = await query(`SELECT status, due_date FROM tasks WHERE id = $1`, [overdueInstance.rows[0].id]);
-  if (overdueCheck.rows[0]?.status !== 'in_progress') {
-    fail('Previous overdue/in-progress task status was modified unexpectedly.');
+  if (String(task.reporting_member_id) !== reportingId) {
+    fail('Generated task reporting_member_id mismatch.');
   }
-  if (new Date(overdueCheck.rows[0].due_date).getTime() >= now.getTime()) {
-    fail('Previous overdue task due_date was moved forward unexpectedly.');
+
+  const startMs = new Date(task.start_date).getTime();
+  const targetMs = task.target_date ? new Date(task.target_date).getTime() : NaN;
+  const dueMs = new Date(task.due_date).getTime();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const targetDiffDays = Math.round((targetMs - startMs) / dayMs);
+  const dueDiffDays = Math.round((dueMs - startMs) / dayMs);
+
+  if (supportsBaseTargetOffset && targetDiffDays !== targetOffsetDays) {
+    fail(`Target offset mismatch. expected=${targetOffsetDays}d actual=${targetDiffDays}d`);
+  }
+  if (dueDiffDays !== dueOffsetDays) {
+    fail(`Due offset mismatch. expected=${dueOffsetDays}d actual=${dueDiffDays}d`);
+  }
+
+  const assignees = await query(
+    `SELECT user_id, role, status
+     FROM task_assignees
+     WHERE task_id = $1
+     ORDER BY role ASC`,
+    [task.id]
+  );
+
+  const roleMap = new Map(assignees.rows.map((r: any) => [String(r.user_id), { role: r.role, status: r.status }]));
+
+  if (roleMap.get(ownerId)?.role !== 'creator') fail('Owner did not remain creator in generated task.');
+  if (roleMap.get(reportingId)?.role !== 'reporting_member') fail('Reporting member role mismatch in generated task.');
+  if (roleMap.get(assigneeId)?.role !== 'member') fail('Assignee role mismatch in generated task.');
+
+  const expectedAssigneeStatus = new Date(task.start_date).getTime() > Date.now() ? 'scheduled' : 'todo';
+  for (const [uid, info] of roleMap.entries()) {
+    if (info.status !== expectedAssigneeStatus) {
+      fail(`Assignee status mismatch for ${uid}. expected=${expectedAssigneeStatus} actual=${info.status}`);
+    }
   }
 
   console.log(`${TEST_TAG} PASS`);
-  console.log(`${TEST_TAG} Template: ${template.id}`);
-  console.log(`${TEST_TAG} New instance: ${newest.id} | ${newest.title} | status=${newest.status}`);
-  console.log(
-    `${TEST_TAG} Preserved old statuses: completed=${completedCheck.rows[0].status}, overdueCandidate=${overdueCheck.rows[0].status}`
-  );
+  console.log(`${TEST_TAG} Template=${templateId}`);
+  console.log(`${TEST_TAG} Generated task=${task.id} title="${task.title}" status=${task.status}`);
+  console.log(`${TEST_TAG} Dates: start=${task.start_date} target=${task.target_date} due=${task.due_date}`);
+  console.log(`${TEST_TAG} Assignees OK (creator/reporting/member, status=${expectedAssigneeStatus})`);
 }
 
 run()
@@ -204,4 +239,3 @@ run()
   .finally(async () => {
     await pool.end();
   });
-

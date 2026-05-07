@@ -1,15 +1,15 @@
 /**
  * Server-side name validation to prevent Stored XSS and injection.
  * - Rejects HTML/script tags and event handlers
- * - Allows only alphabets (Unicode letters), spaces, hyphens, apostrophes
+ * - Allows Unicode letters, numbers, spaces, hyphens, apostrophes
  * - Enforces length 2-50 characters
  */
 
 export const NAME_MIN_LENGTH = 2;
 export const NAME_MAX_LENGTH = 50;
 
-/** Pattern: letters (any language), spaces, hyphens, apostrophes only. No digits, no <>&" */
-const VALID_NAME_REGEX = /^[\p{L}\p{M}\s\-']+$/u;
+/** Pattern: letters/numbers (any language), spaces, hyphens, apostrophes. No <>&" */
+const VALID_NAME_REGEX = /^[\p{L}\p{M}\p{N}\s\-']+$/u;
 
 /** Characters that indicate HTML/script content - reject if present */
 const HTML_SCRIPT_PATTERN = /<[^>]*>|<\/\s*script|on\w+\s*=|javascript\s*:|data\s*:/i;
@@ -68,7 +68,7 @@ export function validateName(name: unknown): NameValidationResult {
   if (!VALID_NAME_REGEX.test(trimmed)) {
     return {
       valid: false,
-      error: 'Name can only contain letters, spaces, hyphens, and apostrophes',
+      error: 'Name can only contain letters, numbers, spaces, hyphens, and apostrophes',
     };
   }
 

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getDashboard, getStatistics } from '../controllers/dashboardController';
+import { getDashboard, getStatistics, getMonthlyCalendar, getDashboardEvents, postDashboardEvent } from '../controllers/dashboardController';
 import { authenticate } from '../middleware/authMiddleware';
 import { query as queryValidator } from 'express-validator';
 
@@ -17,6 +17,9 @@ router.get(
 );
 
 router.get('/statistics', getStatistics);
+router.get('/calendar', getMonthlyCalendar);
+router.get('/events', getDashboardEvents);
+router.post('/events', postDashboardEvent);
 
 export default router;
 

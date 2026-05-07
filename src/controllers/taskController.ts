@@ -9,6 +9,7 @@ import {
   isValidTransition,
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
+import { extractBaseTitle, formatRecurringTitle } from '../services/recurringTaskService';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -35,6 +36,7 @@ const getTasksActiveByIdClause = async (): Promise<string> => {
 };
 
 let taskDeleteRequestsTableExists: boolean | null = null;
+const tableExistsCache: Record<string, boolean> = {};
 
 const getTaskDeleteRequestsTableExists = async (): Promise<boolean> => {
   if (taskDeleteRequestsTableExists === null) {
@@ -48,6 +50,72 @@ const getTaskDeleteRequestsTableExists = async (): Promise<boolean> => {
     taskDeleteRequestsTableExists = Boolean(r.rows[0]?.exists);
   }
   return taskDeleteRequestsTableExists;
+};
+
+const doesTableExist = async (tableName: string): Promise<boolean> => {
+  if (tableName in tableExistsCache) return tableExistsCache[tableName];
+  const r = await query(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.tables
+       WHERE table_name = $1
+     ) AS exists`,
+    [tableName]
+  );
+  const exists = Boolean(r.rows[0]?.exists);
+  tableExistsCache[tableName] = exists;
+  return exists;
+};
+
+const hardDeleteTaskAndRelations = async (
+  client: { query: (text: string, values?: any[]) => Promise<any> },
+  taskId: string
+) => {
+  // Remove task-group conversation payloads linked to this task first.
+  const convResult = await client.query(
+    `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE`,
+    [taskId]
+  );
+  const conversationIds = convResult.rows.map((r: any) => String(r.id));
+
+  if (conversationIds.length > 0) {
+    if (await doesTableExist('message_status')) {
+      await client.query(
+        `DELETE FROM message_status
+         WHERE message_id IN (
+           SELECT id FROM messages WHERE conversation_id = ANY($1::uuid[])
+         )`,
+        [conversationIds]
+      );
+    }
+    await client.query(`DELETE FROM messages WHERE conversation_id = ANY($1::uuid[])`, [conversationIds]);
+    await client.query(`DELETE FROM conversation_members WHERE conversation_id = ANY($1::uuid[])`, [conversationIds]);
+    await client.query(`DELETE FROM conversations WHERE id = ANY($1::uuid[])`, [conversationIds]);
+  }
+
+  // New task model tables.
+  if (await doesTableExist('task_exit_requests')) {
+    await client.query(`DELETE FROM task_exit_requests WHERE task_id = $1`, [taskId]);
+  }
+  if (await doesTableExist('task_delete_requests')) {
+    await client.query(`DELETE FROM task_delete_requests WHERE task_id = $1`, [taskId]);
+  }
+  await client.query(`DELETE FROM task_activities WHERE task_id = $1`, [taskId]);
+  await client.query(`DELETE FROM task_assignees WHERE task_id = $1`, [taskId]);
+
+  // Legacy task model tables.
+  if (await doesTableExist('task_status_logs')) {
+    await client.query(`DELETE FROM task_status_logs WHERE task_id = $1`, [taskId]);
+  }
+  if (await doesTableExist('task_assignments')) {
+    await client.query(`DELETE FROM task_assignments WHERE task_id = $1`, [taskId]);
+  }
+  if (await doesTableExist('groups')) {
+    await client.query(`DELETE FROM groups WHERE task_id = $1`, [taskId]);
+  }
+
+  // Finally remove the task row itself.
+  await client.query(`DELETE FROM tasks WHERE id = $1`, [taskId]);
 };
 
 let messagesMetadataColumnExists: boolean | null = null;
@@ -578,6 +646,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       title,
       description,
       client_name,
+      task_unit,
+      task_unit_name,
       task_type,
       priority,
       assignee_ids,
@@ -621,6 +691,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const normalizedTaskTypeInput = task_type === 'recurring' ? 'recurring' : (task_type || 'one_time');
     const createRecurringTemplate = normalizedTaskTypeInput === 'recurring';
     const taskTypeForInsert = createRecurringTemplate ? 'recurring_instance' : normalizedTaskTypeInput;
+    const recurringBaseTitle = extractBaseTitle(String(title || ''));
     const rawAssigneeIds = Array.isArray(assignee_ids) ? assignee_ids : [];
     const hasNoDates = !start_date && !target_date && !due_date;
     const allowOptionalDates = hasNoDates;
@@ -778,6 +849,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
            'document_id',
            'client_entity_id',
            'client_name',
+           'task_unit',
+           'task_unit_name',
            'end_date',
            'status'
          )`
@@ -797,6 +870,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const hasDocumentId = columnCheck.rows.some((r: any) => r.column_name === 'document_id');
     const hasClientEntityId = columnCheck.rows.some((r: any) => r.column_name === 'client_entity_id');
     const hasClientName = columnCheck.rows.some((r: any) => r.column_name === 'client_name');
+    const hasTaskUnit = columnCheck.rows.some((r: any) => r.column_name === 'task_unit');
+    const hasTaskUnitName = columnCheck.rows.some((r: any) => r.column_name === 'task_unit_name');
     const hasEndDate = columnCheck.rows.some((r: any) => r.column_name === 'end_date');
     const hasStatusColumn = columnCheck.rows.some((r: any) => r.column_name === 'status');
     const hasTaskRolloutType = columnCheck.rows.some((r: any) => r.column_name === 'task_rollout_type');
@@ -816,15 +891,27 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           ? 'yearly'
           : normalizedRecurrenceType
         : null;
-    const normalizedSpecificWeekday =
+    const normalizedSpecificWeekdayRaw =
       typeof specific_weekday === 'number'
         ? specific_weekday
         : typeof specific_weekday === 'string'
         ? Number(specific_weekday)
         : null;
+    const normalizedSpecificWeekday =
+      normalizedSpecificWeekdayRaw !== null && !Number.isNaN(normalizedSpecificWeekdayRaw)
+        ? normalizedSpecificWeekdayRaw
+        : null;
+    const fallbackSpecificWeekday =
+      finalDueDate
+        ? new Date(finalDueDate).getDay()
+        : start_date
+        ? new Date(start_date).getDay()
+        : null;
     const specificWeekdayValue =
-      frequency === 'specific_weekday' && normalizedSpecificWeekday !== null
-        ? normalizedSpecificWeekday
+      frequency === 'specific_weekday'
+        ? normalizedSpecificWeekday !== null
+          ? normalizedSpecificWeekday
+          : fallbackSpecificWeekday
         : null;
     const nextRecurrenceDate =
       createRecurringTemplate && frequency && finalDueDate
@@ -845,11 +932,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       dueMidnight.setHours(0, 0, 0, 0);
       const diffMs = dueMidnight.getTime() - today.getTime();
       const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-      // If due date is today or already passed, start in progress immediately.
+      // New tasks should always start as pending/todo for both creator and assignees.
+      // They move to in_progress only through explicit workflow actions.
       if (diffDays <= 0) {
-        initialStatusForInsert = 'in_progress';
+        initialStatusForInsert = 'pending';
       } else {
-        // Otherwise keep as 'pending' (todo) – 3-days-before/on-date job will maintain the cycle.
+        // Keep as pending (todo) for future-due tasks as well.
         initialStatusForInsert = 'pending';
       }
     }
@@ -994,6 +1082,22 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertValues.push(normalizedClientName);
     }
 
+    const normalizedTaskUnit =
+      typeof task_unit === 'string' && task_unit.trim().length > 0
+        ? task_unit.trim()
+        : typeof task_unit_name === 'string' && task_unit_name.trim().length > 0
+        ? task_unit_name.trim()
+        : null;
+    if (normalizedTaskUnit) {
+      if (hasTaskUnit) {
+        insertColumns.push('task_unit');
+        insertValues.push(normalizedTaskUnit);
+      } else if (hasTaskUnitName) {
+        insertColumns.push('task_unit_name');
+        insertValues.push(normalizedTaskUnit);
+      }
+    }
+
     if (hasEndDate && end_date) {
       insertColumns.push('end_date');
       insertValues.push(end_date);
@@ -1055,11 +1159,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    // If start_date ≤ created_at → todo (on dashboard). If start_date > created_at → scheduled (not on dashboard).
-    const startAt = task.start_date ? new Date(task.start_date).getTime() : null;
-    const createdAt = task.created_at ? new Date(task.created_at).getTime() : Date.now();
-    const assigneeStatus =
-      startAt != null && startAt > createdAt ? 'scheduled' : 'todo';
+    // Always initialize owner/assignees as todo.
+    // Move to in_progress only via explicit user action APIs.
+    const assigneeStatus = 'todo';
 
     if (hasExplicitAssignees && allAssigneeIds.size > 0) {
       hasAssignees = true;
@@ -1071,9 +1173,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             ? 'reporting_member'
             : 'member';
         await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT (task_id, user_id) DO NOTHING`,
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [task.id, assigneeId, assigneeStatus, role]
         );
       }
@@ -1082,9 +1185,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       // Keep creator as assignee for no-assignee creates too.
       hasAssignees = true;
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'creator')
-         ON CONFLICT (task_id, user_id) DO NOTHING`,
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, $3, 'creator', CURRENT_TIMESTAMP)
+         ON CONFLICT (task_id, user_id) DO UPDATE
+         SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
         [task.id, taskCreatorId, assigneeStatus]
       );
     }
@@ -1101,47 +1205,102 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       const templateAssigneesTableExists = !!templateAssigneesTableCheck.rows[0]?.exists;
 
       if (templatesTableExists) {
-        const recurrenceDate = task.start_date || task.created_at || new Date().toISOString();
-        const baseDueOffset = buildIntervalLiteralFromDates(task.start_date, task.due_date);
-        const templateResult = await client.query(
-          `INSERT INTO task_recurrence_templates (
-            task_id,
-            organization_id,
-            title,
-            description,
-            category,
-            creator_id,
-            reporting_member_id,
-            recurrence_type,
-            recurrence_interval,
-            recurrence_day_of_month,
-            specific_weekday,
-            base_start_date,
-            base_due_offset,
-            last_generated_at,
-            next_recurrence_date,
-            status
-          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,NOW(),$14,'active'
-          )
-          RETURNING id`,
-          [
-            task.id,
-            organizationId || null,
-            title,
-            description || null,
-            category || null,
-            taskCreatorId,
-            reporting_member_id || null,
-            recurrence_type || null,
-            recurrence_interval || 1,
-            recurrence_day_of_month || null,
-            specificWeekdayValue || null,
-            recurrenceDate,
-            baseDueOffset,
-            nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
-          ]
+        const templateColumnCheck = await client.query(
+          `SELECT column_name
+           FROM information_schema.columns
+           WHERE table_name = 'task_recurrence_templates'
+             AND column_name IN ('base_target_offset')`
         );
+        const hasBaseTargetOffset = templateColumnCheck.rows.some(
+          (r: any) => r.column_name === 'base_target_offset'
+        );
+        const recurrenceDate = task.start_date || task.created_at || new Date().toISOString();
+        const baseTargetOffset =
+          task.start_date && task.target_date
+            ? buildIntervalLiteralFromDates(task.start_date, task.target_date)
+            : null;
+        const baseDueOffset = buildIntervalLiteralFromDates(task.start_date, task.due_date);
+        const templateResult = hasBaseTargetOffset
+          ? await client.query(
+              `INSERT INTO task_recurrence_templates (
+                task_id,
+                organization_id,
+                title,
+                description,
+                category,
+                creator_id,
+                reporting_member_id,
+                recurrence_type,
+                recurrence_interval,
+                recurrence_day_of_month,
+                specific_weekday,
+                base_start_date,
+                base_target_offset,
+                base_due_offset,
+                last_generated_at,
+                next_recurrence_date,
+                status
+              ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,$14::interval,NOW(),$15,'active'
+              )
+              RETURNING id`,
+              [
+                task.id,
+                organizationId || null,
+                recurringBaseTitle,
+                description || null,
+                category || null,
+                taskCreatorId,
+                reporting_member_id || null,
+                recurrence_type || null,
+                recurrence_interval || 1,
+                recurrence_day_of_month || null,
+                specificWeekdayValue || null,
+                recurrenceDate,
+                baseTargetOffset,
+                baseDueOffset,
+                nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
+              ]
+            )
+          : await client.query(
+              `INSERT INTO task_recurrence_templates (
+                task_id,
+                organization_id,
+                title,
+                description,
+                category,
+                creator_id,
+                reporting_member_id,
+                recurrence_type,
+                recurrence_interval,
+                recurrence_day_of_month,
+                specific_weekday,
+                base_start_date,
+                base_due_offset,
+                last_generated_at,
+                next_recurrence_date,
+                status
+              ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,NOW(),$14,'active'
+              )
+              RETURNING id`,
+              [
+                task.id,
+                organizationId || null,
+                recurringBaseTitle,
+                description || null,
+                category || null,
+                taskCreatorId,
+                reporting_member_id || null,
+                recurrence_type || null,
+                recurrence_interval || 1,
+                recurrence_day_of_month || null,
+                specificWeekdayValue || null,
+                recurrenceDate,
+                baseDueOffset,
+                nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
+              ]
+            );
         const templateId = templateResult.rows[0]?.id;
         if (templateId) {
           if (hasParentTaskId || hasRecurrenceTemplateId) {
@@ -1186,14 +1345,14 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     // Create task activity log
     const initialStatus = 'pending';
     const createdActivitySuffix = hasAssignees
-      ? ' with assignees - Pending acceptance'
+      ? ' with assignees'
       : '';
     await logTaskActivity(client, {
       taskId: task.id,
       userId,
       activityType: 'created',
       newValue: initialStatus,
-      message: `Task "${title}" created${createdActivitySuffix}`,
+      message: `Task "${task.title}" created${createdActivitySuffix}`,
     });
 
     // Auto-create task group conversation
@@ -1201,7 +1360,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       `INSERT INTO conversations (id, type, name, is_group, is_task_group, task_id, created_by)
        VALUES (gen_random_uuid(), 'group', $1, TRUE, TRUE, $2, $3)
        RETURNING *`,
-      [`Task: ${title}`, task.id, taskCreatorId]
+      [`Task: ${task.title}`, task.id, taskCreatorId]
     );
 
     const conversation = conversationResult.rows[0];
@@ -1213,14 +1372,22 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     );
     const creatorName = creatorResult.rows[0]?.name || 'Admin';
 
-    // Add only creator (admin) to conversation initially
-    // Assignees will be added only when they accept the task
+    // Add creator and assignees to conversation immediately (no separate accept step).
     await client.query(
       `INSERT INTO conversation_members (conversation_id, user_id, role)
        VALUES ($1, $2, 'admin')
        ON CONFLICT (conversation_id, user_id) DO NOTHING`,
       [conversation.id, taskCreatorId]
     );
+    for (const assigneeId of allAssigneeIds) {
+      if (String(assigneeId) === String(taskCreatorId)) continue;
+      await client.query(
+        `INSERT INTO conversation_members (conversation_id, user_id, role)
+         VALUES ($1, $2, 'member')
+         ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+        [conversation.id, assigneeId]
+      );
+    }
 
     // EXTRA SAFETY: ensure requester isn't in the conversation if they created on behalf of someone else
     if (isDifferentOwner) {
@@ -1284,6 +1451,30 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     }
 
     await client.query('COMMIT');
+
+    // Notify task members about the auto-generated task group message on creation.
+    // Exclude the sender (task creator) from "message received" notifications.
+    try {
+      const io = (req.app as any).get('io');
+      const autoMessageRecipientIds = Array.from(allAssigneeIds)
+        .map((id) => String(id))
+        .filter((id) => id && id !== String(taskCreatorId));
+
+      if (autoMessageRecipientIds.length > 0) {
+        await dispatchNotification({
+          type: 'MESSAGE_RECEIVED',
+          recipientIds: autoMessageRecipientIds,
+          title: 'New task message',
+          body: `Task group auto-created by ${creatorName}`,
+          refId: conversation.id,
+          refType: 'conversation',
+          channels: ['in_app'],
+          io,
+        });
+      }
+    } catch (notifyError: any) {
+      console.warn('[createTask] Auto-message notification failed:', notifyError?.message || notifyError);
+    }
 
     // Fetch full task with assignees
     const fullTaskResult = await query(
@@ -1634,7 +1825,15 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     // Build dynamic update query
-    const allowedFields = ['title', 'description', 'client_name', 'start_date', 'target_date', 'due_date'];
+    const allowedFields = [
+      'title',
+      'description',
+      'client_name',
+      'task_unit',
+      'start_date',
+      'target_date',
+      'due_date',
+    ];
     const updateFields: string[] = [];
     const values: any[] = [];
     let paramIndex = 1;
@@ -1723,27 +1922,11 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // Soft delete task (omit deleted_at/deleted_by when column not migrated)
-    await getTasksDeletedAtFilter();
-    if (tasksDeletedAtColumnExists) {
-      await client.query(
-        `UPDATE tasks
-         SET status = 'deleted',
-             deleted_at = CURRENT_TIMESTAMP,
-             deleted_by = $2,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [id, userId]
-      );
-    } else {
-      await client.query(
-        `UPDATE tasks
-         SET status = 'deleted',
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [id]
-      );
-    }
+    // Collect recipients before hard delete removes assignment rows.
+    const assigneesResult = await client.query(
+      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+      [id]
+    );
 
     await logTaskActivity(client, {
       taskId: id,
@@ -1752,10 +1935,7 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       message: `Task "${task.title}" deleted`,
     });
 
-    const assigneesResult = await client.query(
-      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
-      [id]
-    );
+    await hardDeleteTaskAndRelations(client, id);
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
@@ -1947,6 +2127,137 @@ export const verifyTaskCompletion = async (req: AuthRequest, res: Response) => {
     await client.query('ROLLBACK');
     console.error('Verify task completion error:', error);
     res.status(500).json({ error: 'Failed to verify task completion' });
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Task owner marks the whole task completed: all assignees get completed + verified rows and task.status = completed.
+ * Allowed from any non-terminal task status (does not require assignees to have completed individually).
+ */
+export const ownerCompleteTask = async (req: AuthRequest, res: Response) => {
+  const client = await getClient();
+  try {
+    const userId = req.user?.userId;
+    const { id: taskId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const activeById = await getTasksActiveByIdClause();
+    const taskResult = await client.query(
+      `SELECT t.id,
+              t.title,
+              t.status,
+              COALESCE(t.created_by, t.creator_id) AS owner_id
+       FROM tasks t
+       WHERE t.id = $1${activeById}`,
+      [taskId]
+    );
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0];
+    const roleCreatorResult = await client.query(
+      `SELECT 1 FROM task_assignees
+       WHERE task_id = $1 AND user_id = $2 AND role = 'creator'
+       LIMIT 1`,
+      [taskId, userId]
+    );
+    const ownerIdMatches =
+      task.owner_id != null && String(task.owner_id) === String(userId);
+    const isOwner =
+      ownerIdMatches || roleCreatorResult.rows.length > 0;
+
+    if (!isOwner) {
+      return res.status(403).json({
+        error: 'Only the task owner can complete the task for everyone',
+      });
+    }
+
+    const statusLower = String(task.status || '').toLowerCase();
+    if (statusLower === 'completed') {
+      const fresh = await client.query(`SELECT * FROM tasks WHERE id = $1`, [taskId]);
+      return res.json({
+        task: buildTaskWithDerivedStatus(fresh.rows[0]),
+        taskCompleted: true,
+        already_completed: true,
+      });
+    }
+
+    if (statusLower === 'deleted' || statusLower === 'rejected') {
+      return res.status(422).json({
+        error: `Cannot complete task in status ${task.status}`,
+      });
+    }
+
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE task_assignees
+       SET completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+           verified_at = CURRENT_TIMESTAMP,
+           status = 'completed'
+       WHERE task_id = $1`,
+      [taskId]
+    );
+
+    const updatedTask = await client.query(
+      `UPDATE tasks
+       SET status = 'completed',
+           verification_status = 'verified',
+           verified_by_owner_at = CURRENT_TIMESTAMP,
+           completed_by_assignee_at = COALESCE(completed_by_assignee_at, CURRENT_TIMESTAMP),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING *`,
+      [taskId]
+    );
+
+    await logTaskActivity(client, {
+      taskId,
+      userId,
+      activityType: 'task_overridden',
+      message: 'Owner completed the task for all members',
+    });
+
+    const recipientsResult = await client.query(
+      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+      [taskId]
+    );
+
+    await client.query('COMMIT');
+
+    const io = (req.app as any).get('io');
+    await dispatchNotification({
+      type: 'TASK_VERIFIED',
+      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
+      title: 'Task completed',
+      body: `${task.title} was marked completed by the owner.`,
+      refId: taskId,
+      refType: 'task',
+      channels: ['in_app'],
+      io,
+    });
+
+    io?.to(`task_${taskId}`).emit('task:status_changed', {
+      taskId,
+      fromStatus: task.status,
+      toStatus: 'completed',
+      computedAt: new Date().toISOString(),
+    });
+
+    res.json({
+      task: buildTaskWithDerivedStatus(updatedTask.rows[0]),
+      taskCompleted: true,
+    });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Owner complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
   } finally {
     client.release();
   }
@@ -2168,32 +2479,13 @@ export const approveTaskDeleteRequest = async (req: AuthRequest, res: Response) 
       );
     }
 
-    await getTasksDeletedAtFilter();
-    if (tasksDeletedAtColumnExists) {
-      await client.query(
-        `UPDATE tasks
-         SET status = 'deleted',
-             deleted_at = CURRENT_TIMESTAMP,
-             deleted_by = $2,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [taskId, userId]
-      );
-    } else {
-      await client.query(
-        `UPDATE tasks
-         SET status = 'deleted',
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [taskId]
-      );
-    }
+    await hardDeleteTaskAndRelations(client, taskId);
 
     await logTaskActivity(client, {
       taskId,
       userId,
       activityType: 'task_deleted',
-      message: 'Delete request approved and task soft-deleted',
+      message: 'Delete request approved and task hard-deleted',
     });
 
     const convApprove = await client.query(
@@ -2654,13 +2946,7 @@ export const markMemberComplete = async (req: AuthRequest, res: Response) => {
 
     const isCreator = taskCheck.rows[0].is_creator_role === true || taskCheck.rows[0].creator_id === userId;
 
-    // Check if user has accepted the task (creators can skip acceptance)
-    const hasAccepted = !!assigneeCheck.rows[0].accepted_at;
-    
-    if (!isCreator && !hasAccepted) {
-      return res.status(400).json({ error: 'You must accept the task before marking it as complete' });
-    }
-    
+    // No separate acceptance step: assigned users can complete directly.
     // Check if already completed
     if (assigneeCheck.rows[0].completed_at) {
       return res.status(400).json({ error: 'You have already marked this task as complete' });
@@ -3086,15 +3372,30 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
       const startAt = task.start_date ? new Date(task.start_date).getTime() : null;
       const assigneeStatus = startAt != null && now.getTime() < startAt ? 'scheduled' : 'todo';
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'member')
-         ON CONFLICT (task_id, user_id) DO NOTHING`,
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
+         ON CONFLICT (task_id, user_id) DO UPDATE
+         SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
         [id, assigneeId, assigneeStatus]
       );
     }
 
-    // NOTE: Do not add assignees to the task group conversation here.
-    // Assignees will join the task group conversation only when they accept the task (acceptTask).
+    // Add new assignees to task group conversation immediately (no separate accept step).
+    const conversationResult = await client.query(
+      `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+      [id]
+    );
+    if (conversationResult.rows.length > 0) {
+      const conversationId = conversationResult.rows[0].id;
+      for (const assigneeId of newAssigneeIds) {
+        await client.query(
+          `INSERT INTO conversation_members (conversation_id, user_id, role)
+           VALUES ($1, $2, 'member')
+           ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+          [conversationId, assigneeId]
+        );
+      }
+    }
 
     // Log activity
     await client.query(

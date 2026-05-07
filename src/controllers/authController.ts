@@ -5,6 +5,11 @@ import { createOTPVerification, verifyOTP } from '../services/otpService';
 import { syncContacts } from '../services/contactSyncService';
 import { hashPassword, comparePassword } from '../utils/password';
 import { validateName } from '../utils/nameValidation';
+import {
+  getTaskCreationUserConfigForUser,
+  updateTaskCreationUserConfigForUser,
+  parseAndValidateTaskCreationUserConfigBody,
+} from '../services/taskCreationUserConfigService';
 
 /**
  * Request OTP for registration/login
@@ -1261,6 +1266,60 @@ export const resetPasswordWithOTP = async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       error: 'Failed to reset password. Please try again.',
+    });
+  }
+};
+
+/**
+ * GET merged task-creation defaults for the current user (stored prefs + system defaults).
+ */
+export const getTaskCreationUserConfig = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    const config = await getTaskCreationUserConfigForUser(userId);
+    return res.json({ success: true, data: config });
+  } catch (error: any) {
+    console.error('getTaskCreationUserConfig error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to load task creation preferences',
+    });
+  }
+};
+
+/**
+ * PUT persist task-creation defaults for the current user.
+ */
+export const updateTaskCreationUserConfig = async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    let parsed;
+    try {
+      parsed = parseAndValidateTaskCreationUserConfigBody(req.body);
+    } catch (e: any) {
+      return res.status(400).json({ success: false, error: e.message || 'Invalid configuration' });
+    }
+    const saved = await updateTaskCreationUserConfigForUser(userId, parsed);
+    return res.json({ success: true, data: saved });
+  } catch (error: any) {
+    console.error('updateTaskCreationUserConfig error:', error);
+    const msg = error?.message || '';
+    if (msg.includes('task_creation_user_config')) {
+      return res.status(503).json({
+        success: false,
+        error:
+          'Database migration required: run migrations/zz-add-user-task-creation-config.sql on the users table.',
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to save task creation preferences',
     });
   }
 };

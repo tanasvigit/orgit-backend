@@ -1,4 +1,4 @@
-import { query } from '../config/database';
+import { getClient, query } from '../config/database';
 import { getReminderConfig } from './platformSettingsService';
 
 /** Task row from dashboard query plus computed fields (no dependency on shared types) */
@@ -36,7 +36,33 @@ export interface DashboardData {
     documentManagement: TaskCategoryGroup;
     complianceManagement: TaskCategoryGroup;
   };
+  events: DashboardEvent[];
 }
+
+export interface DashboardEvent {
+  id: string;
+  title: string;
+  type: 'event' | 'meeting';
+  starts_at: string | Date;
+  notes?: string | null;
+  created_by: string;
+}
+
+export interface MonthlyCalendarDayCounts {
+  date: string; // YYYY-MM-DD
+  /** Tasks with this due date that are not finished (excludes completed/rejected/deleted). */
+  count: number;
+}
+
+export interface CreateDashboardEventPayload {
+  title: string;
+  type: 'event' | 'meeting';
+  startsAtIso: string;
+  participantIds: string[];
+  notes?: string;
+}
+
+type CalendarView = 'self' | 'assigned';
 
 /**
  * Calculate days until due date
@@ -381,6 +407,7 @@ export const getDashboardData = async (
 
   const selfCategorized = categorizeTasks(selfTasks);
   const assignedCategorized = categorizeTasks(assignedTasks);
+  const events = await getDashboardEventsForUser(userId, 14);
   // Scheduled status is not shown on dashboard (tasks with assignee status 'scheduled' already excluded from query)
   type CategorizedGroups = {
     general: TaskCategoryGroup;
@@ -395,7 +422,183 @@ export const getDashboardData = async (
   return {
     selfTasks: clearScheduled(selfCategorized),
     assignedTasks: clearScheduled(assignedCategorized),
+    events,
   };
+};
+
+const normalizeActivityStatus = (status: string | null | undefined): string => {
+  const s = String(status || '').toLowerCase();
+  if (!s) return 'todo';
+  if (s === 'pending' || s === 'todo') return 'todo';
+  if (s === 'in_progress' || s === 'active' || s === 'inprogress') return 'inprogress';
+  if (s === 'completed') return 'completed';
+  if (s === 'overdue') return 'overdue';
+  return 'todo';
+};
+
+const toYmd = (date: Date): string => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+
+/** Task statuses that should not appear in "open tasks due" calendar counts. */
+const isTerminalTaskStatusForCalendar = (raw: string | null | undefined): boolean => {
+  const s = String(raw || '').toLowerCase();
+  return s === 'completed' || s === 'rejected' || s === 'deleted';
+};
+
+export const getMonthlyCalendarSnapshot = async (
+  userId: string,
+  view: CalendarView,
+  year: number,
+  month: number // 1-12
+): Promise<{
+  year: number;
+  month: number;
+  view: CalendarView;
+  days: MonthlyCalendarDayCounts[];
+}> => {
+  const dayCount = new Date(year, month, 0).getDate();
+
+  const tasksResult = await query(
+    view === 'self'
+      ? `SELECT DISTINCT ON (t.id)
+          t.id,
+          t.status,
+          t.due_date
+         FROM tasks t
+         INNER JOIN task_assignees ta ON t.id = ta.task_id
+         WHERE ta.user_id = $1
+           AND COALESCE(t.is_recurring_template, false) = false
+           AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
+           AND t.due_date IS NOT NULL
+           -- If current user already completed and got verified, this is not open for them.
+           AND NOT (ta.completed_at IS NOT NULL AND ta.verified_at IS NOT NULL)
+           -- Keep self/assigned buckets disjoint: creator-with-team tasks belong to assigned.
+           AND NOT (
+             COALESCE(t.created_by, t.creator_id) = $1
+             AND EXISTS (
+               SELECT 1
+               FROM task_assignees ta_other
+               WHERE ta_other.task_id = t.id
+                 AND ta_other.user_id != $1
+             )
+           )
+         ORDER BY t.id`
+      : `SELECT DISTINCT ON (t.id)
+          t.id,
+          t.status,
+          t.due_date
+         FROM tasks t
+         INNER JOIN task_assignees ta_me ON t.id = ta_me.task_id
+         WHERE ta_me.user_id = $1
+           AND COALESCE(t.is_recurring_template, false) = false
+           AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
+           AND t.due_date IS NOT NULL
+           AND COALESCE(t.created_by, t.creator_id) = $1
+           AND EXISTS (
+             SELECT 1 FROM task_assignees ta_other
+             WHERE ta_other.task_id = t.id AND ta_other.user_id != $1
+           )
+           -- For creator-assigned view, include only tasks where at least one other assignee
+           -- is still pending verification/completion.
+           AND EXISTS (
+             SELECT 1
+             FROM task_assignees ta_other_open
+             WHERE ta_other_open.task_id = t.id
+               AND ta_other_open.user_id != $1
+               AND NOT (
+                 ta_other_open.completed_at IS NOT NULL
+                 AND ta_other_open.verified_at IS NOT NULL
+               )
+           )
+         ORDER BY t.id`,
+    [userId]
+  );
+
+  const openCountByDueYmd = new Map<string, number>();
+  for (const row of tasksResult.rows) {
+    if (isTerminalTaskStatusForCalendar(row.status)) continue;
+    const dueYmd = toYmd(new Date(row.due_date));
+    openCountByDueYmd.set(dueYmd, (openCountByDueYmd.get(dueYmd) || 0) + 1);
+  }
+
+  // Calendar snapshot is task-only counts. Events/meetings are surfaced separately via /dashboard/events.
+
+  const days: MonthlyCalendarDayCounts[] = [];
+  for (let d = 1; d <= dayCount; d += 1) {
+    const day = new Date(year, month - 1, d);
+    const ymd = toYmd(day);
+    days.push({ date: ymd, count: openCountByDueYmd.get(ymd) || 0 });
+  }
+
+  return { year, month, view, days };
+};
+
+export const getDashboardEventsForUser = async (
+  userId: string,
+  lookAheadDays = 14
+): Promise<DashboardEvent[]> => {
+  const tableCheck = await query(`SELECT to_regclass('public.dashboard_events') AS table_name`, []);
+  if (!tableCheck.rows[0]?.table_name) return [];
+  const result = await query(
+    `SELECT e.id, e.title, e.type, e.starts_at, e.notes, e.created_by
+     FROM dashboard_events e
+     INNER JOIN dashboard_event_participants ep ON ep.event_id = e.id
+     WHERE ep.user_id = $1
+       AND e.starts_at >= NOW() - INTERVAL '1 day'
+       AND e.starts_at <= NOW() + ($2::text || ' day')::interval
+     ORDER BY e.starts_at ASC`,
+    [userId, Math.max(1, lookAheadDays)]
+  );
+  return result.rows as DashboardEvent[];
+};
+
+export const createDashboardEvent = async (
+  creatorId: string,
+  payload: CreateDashboardEventPayload
+): Promise<DashboardEvent> => {
+  const tableCheck = await query(`SELECT to_regclass('public.dashboard_events') AS table_name`, []);
+  if (!tableCheck.rows[0]?.table_name) {
+    throw new Error('Dashboard events migration is not applied');
+  }
+  const startsAt = new Date(payload.startsAtIso);
+  if (Number.isNaN(startsAt.getTime())) {
+    throw new Error('Invalid startsAtIso');
+  }
+  if (!payload.title || !payload.title.trim()) {
+    throw new Error('Title is required');
+  }
+  const type = payload.type === 'meeting' ? 'meeting' : 'event';
+  const participantIds = Array.from(new Set([creatorId, ...(payload.participantIds || [])]));
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const created = await client.query(
+      `INSERT INTO dashboard_events (id, title, type, starts_at, notes, created_by)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+       RETURNING id, title, type, starts_at, notes, created_by`,
+      [payload.title.trim(), type, startsAt.toISOString(), payload.notes || null, creatorId]
+    );
+    const event = created.rows[0] as DashboardEvent;
+    for (const uid of participantIds) {
+      await client.query(
+        `INSERT INTO dashboard_event_participants (event_id, user_id)
+         VALUES ($1, $2)
+         ON CONFLICT (event_id, user_id) DO NOTHING`,
+        [event.id, uid]
+      );
+    }
+    await client.query('COMMIT');
+    return event;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 };
 
 /**

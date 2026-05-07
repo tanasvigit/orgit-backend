@@ -254,6 +254,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled', 'overdue')),
     compliance_id UUID,
     client_name VARCHAR(255),
+    task_unit VARCHAR(255),
     reporting_member_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP

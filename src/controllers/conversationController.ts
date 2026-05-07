@@ -3,6 +3,23 @@ import { AuthRequest } from '../middleware/authMiddleware';
 import { query, getClient } from '../config/database';
 import { resolveToUrl } from '../services/s3StorageService';
 
+let tasksDeletedAtColumnExists: boolean | null = null;
+
+const getTasksActiveByIdClause = async (): Promise<string> => {
+  if (tasksDeletedAtColumnExists === null) {
+    const r = await query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_name = 'tasks'
+           AND column_name = 'deleted_at'
+       ) AS exists`
+    );
+    tasksDeletedAtColumnExists = Boolean(r.rows[0]?.exists);
+  }
+  return tasksDeletedAtColumnExists ? ' AND t.deleted_at IS NULL' : '';
+};
+
 /**
  * Get all conversations (with pinned first) - matching message-backend
  */
@@ -25,6 +42,8 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
       [userId]
     );
     console.log(`[getConversations] User has ${membershipCheck.rows[0]?.count || 0} conversation memberships`);
+
+    const activeTaskByIdClause = await getTasksActiveByIdClause();
 
     // CRITICAL FIX: Get conversations from conversation_members
     // Simplified query that handles all cases - with or without messages
@@ -115,8 +134,22 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
             COALESCE(c.is_task_group, FALSE) = TRUE
             AND c.task_id IS NOT NULL
             AND (
-              EXISTS (SELECT 1 FROM tasks t WHERE t.id = c.task_id AND (t.created_by = $1 OR t.creator_id = $1))
-              OR EXISTS (SELECT 1 FROM task_assignees ta WHERE ta.task_id = c.task_id AND ta.user_id = $1 AND ta.accepted_at IS NOT NULL)
+              EXISTS (
+                SELECT 1
+                FROM tasks t
+                WHERE t.id = c.task_id
+                  AND (t.created_by = $1 OR t.creator_id = $1)
+                  AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM task_assignees ta
+                JOIN tasks t ON t.id = ta.task_id
+                WHERE ta.task_id = c.task_id
+                  AND ta.user_id = $1
+                  AND ta.accepted_at IS NOT NULL
+                  AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
+              )
             )
           )
         )
@@ -164,8 +197,22 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
             COALESCE(c.is_task_group, FALSE) = TRUE
             AND c.task_id IS NOT NULL
             AND (
-              EXISTS (SELECT 1 FROM tasks t WHERE t.id = c.task_id AND (t.created_by = $1 OR t.creator_id = $1))
-              OR EXISTS (SELECT 1 FROM task_assignees ta WHERE ta.task_id = c.task_id AND ta.user_id = $1 AND ta.accepted_at IS NOT NULL)
+              EXISTS (
+                SELECT 1
+                FROM tasks t
+                WHERE t.id = c.task_id
+                  AND (t.created_by = $1 OR t.creator_id = $1)
+                  AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
+              )
+              OR EXISTS (
+                SELECT 1
+                FROM task_assignees ta
+                JOIN tasks t ON t.id = ta.task_id
+                WHERE ta.task_id = c.task_id
+                  AND ta.user_id = $1
+                  AND ta.accepted_at IS NOT NULL
+                  AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
+              )
             )
           )
         )
@@ -552,8 +599,8 @@ export const addGroupMembersHandler = async (req: AuthRequest, res: Response) =>
       );
     }
 
-    // Task flow: when adding members to an ongoing task group, add them as task assignees (no accepted_at)
-    // so they see the task in Task Management and can Accept / Reject
+    // Task flow: when adding members to an ongoing task group, add them as task assignees
+    // and mark accepted immediately (no separate accept step).
     if (isTaskGroup && taskId) {
       // Derive initial member lifecycle status from start_date: scheduled until start_date (date+time), else todo
       let assigneeStatus: 'scheduled' | 'todo' = 'todo';
@@ -571,9 +618,10 @@ export const addGroupMembersHandler = async (req: AuthRequest, res: Response) =>
       }
       for (const memberId of memberIds) {
         await query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, 'member')
-           ON CONFLICT (task_id, user_id) DO NOTHING`,
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [taskId, memberId, assigneeStatus]
         );
       }
@@ -767,8 +815,13 @@ export const getConversation = async (req: AuthRequest, res: Response) => {
     const conv = convResult.rows[0];
     if (conv && conv.is_task_group && conv.task_id) {
       // Ensure we never return a task_id for a deleted task (task no longer exists)
+      const activeTaskByIdClause = await getTasksActiveByIdClause();
       const taskExists = await query(
-        'SELECT 1 FROM tasks WHERE id = $1 LIMIT 1',
+        `SELECT 1
+         FROM tasks t
+         WHERE t.id = $1
+           AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
+         LIMIT 1`,
         [conv.task_id]
       );
       if (taskExists.rows.length === 0) {

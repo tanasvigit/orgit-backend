@@ -34,6 +34,7 @@ describe('generateNextRecurrence', () => {
             recurrence_type: 'monthly',
             recurrence_interval: 1,
             specific_weekday: null,
+            base_target_offset: null,
             base_due_offset: '5 days',
             next_recurrence_date: '2026-05-20T00:00:00.000Z',
             reporting_member_id: null,

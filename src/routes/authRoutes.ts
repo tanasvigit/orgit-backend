@@ -14,6 +14,8 @@ import {
   deletePushToken,
   requestPasswordReset,
   resetPasswordWithOTP,
+  getTaskCreationUserConfig,
+  updateTaskCreationUserConfig,
 } from '../controllers/authController';
 import { authenticate } from '../middleware/authMiddleware';
 import { validateRequest } from '../middleware/validationMiddleware';
@@ -114,7 +116,7 @@ router.post(
   resetPasswordWithOTP
 );
 
-// Register endpoint for mobile app (name: XSS-safe, 2-50 chars, letters/spaces/hyphens/apostrophes only)
+// Register endpoint for mobile app (name: XSS-safe, 2-50 chars, letters/numbers/spaces/hyphens/apostrophes)
 router.post(
   '/register',
   [
@@ -141,6 +143,9 @@ router.post(
 
 // Protected routes
 router.get('/me', authenticate, getCurrentUser);
+
+router.get('/task-creation-user-config', authenticate, getTaskCreationUserConfig);
+router.put('/task-creation-user-config', authenticate, updateTaskCreationUserConfig);
 
 router.get(
   '/user/:userId',
