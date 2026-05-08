@@ -161,6 +161,7 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
         createdAt: status.createdAt,
         updatedAt: status.updatedAt,
         completedAt: status.completedAt,
+        ...(status.summary ? { summary: status.summary } : {}),
         ...(status.errors && status.errors.length > 0 ? { errors: status.errors } : {}),
       },
     });

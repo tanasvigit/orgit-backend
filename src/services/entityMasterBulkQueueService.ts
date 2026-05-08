@@ -21,6 +21,19 @@ export interface EntityMasterBulkUploadStatus {
   updatedAt: Date;
   completedAt: Date | null;
   errors?: Array<{ sheet?: string; row?: number; message: string }>;
+  summary?: {
+    organizations?: number;
+    cost_centres?: number;
+    branches?: number;
+    depots?: number;
+    warehouses?: number;
+    task_services?: number;
+    client_entities?: number;
+    client_entity_services?: number;
+    employees?: number;
+    tasks?: number;
+    totalErrors?: number;
+  };
 }
 
 const ROW_LEVEL_SHEET_NAMES = ['Employees', 'Service List', 'Entity List', 'Client Entities'];
@@ -145,7 +158,7 @@ export async function getUploadStatus(
   const client = await getClient();
   try {
     const result = await client.query(
-      `SELECT status, processed_count, failed_count, total_rows, upload_type, created_at, updated_at, completed_at, error_summary
+      `SELECT status, processed_count, failed_count, total_rows, upload_type, created_at, updated_at, completed_at, error_summary, metadata
        FROM entity_master_bulk_uploads
        WHERE id = $1 AND organization_id = $2`,
       [uploadId, organizationId]
@@ -175,6 +188,10 @@ export async function getUploadStatus(
       completedAt: row.completed_at,
       errors,
     };
+    const summary = row?.metadata?.summary;
+    if (summary && typeof summary === 'object') {
+      status.summary = summary;
+    }
     if (row.total_rows != null && row.total_rows > 0) {
       status.totalRows = row.total_rows;
     }

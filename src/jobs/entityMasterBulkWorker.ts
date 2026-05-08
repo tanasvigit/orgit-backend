@@ -73,15 +73,25 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
         ...(parseResult.errors || []),
         ...(taskResult.errors || []),
       ];
+      const uploadSummary = {
+        ...(parseResult.updated || {}),
+        tasks: taskResult.updated?.tasks ?? 0,
+        totalErrors: combinedErrors.length,
+      };
       const client2 = await getClient();
       try {
         await client2.query(
           `UPDATE entity_master_bulk_uploads
            SET status = 'completed', processed_count = 1, failed_count = 0,
                completed_at = NOW(), updated_at = NOW(),
-               error_summary = $1
-           WHERE id = $2`,
-          [combinedErrors.length > 0 ? JSON.stringify(combinedErrors.slice(0, 500)) : null, uploadId]
+               error_summary = $1,
+               metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('summary', $2::jsonb)
+           WHERE id = $3`,
+          [
+            combinedErrors.length > 0 ? JSON.stringify(combinedErrors.slice(0, 500)) : null,
+            JSON.stringify(uploadSummary),
+            uploadId,
+          ]
         );
       } finally {
         client2.release();

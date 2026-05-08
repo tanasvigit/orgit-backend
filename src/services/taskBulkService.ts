@@ -95,14 +95,31 @@ async function resolveUserIdByMobileOrName(
   if (looksLikeEmail) {
     return resolveUserIdByEmail(client, organizationId, trimmed);
   }
-  const r = await client.query(
-    `SELECT uo.user_id FROM user_organizations uo
+  // Normalize consecutive spaces so "Amit  Verma" and "Amit Verma" both match.
+  const normalizedName = trimmed.replace(/\s+/g, ' ');
+  const exactName = await client.query(
+    `SELECT uo.user_id
+     FROM user_organizations uo
      JOIN users u ON u.id = uo.user_id
-     WHERE uo.organization_id = $1 AND LOWER(TRIM(u.name)) = LOWER($2)
+     WHERE uo.organization_id = $1
+       AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.name, '')), '[[:space:]]+', ' ', 'g')) = LOWER($2)
      LIMIT 1`,
-    [organizationId, trimmed]
+    [organizationId, normalizedName]
   );
-  return r.rows.length > 0 ? r.rows[0].user_id : null;
+  if (exactName.rows.length > 0) return exactName.rows[0].user_id;
+
+  // Fallback: allow prefix-style matches for common imports where surname/extra tokens differ.
+  const prefixName = await client.query(
+    `SELECT uo.user_id
+     FROM user_organizations uo
+     JOIN users u ON u.id = uo.user_id
+     WHERE uo.organization_id = $1
+       AND LOWER(REGEXP_REPLACE(TRIM(COALESCE(u.name, '')), '[[:space:]]+', ' ', 'g')) LIKE LOWER($2) || '%'
+     ORDER BY LENGTH(COALESCE(u.name, '')) ASC
+     LIMIT 1`,
+    [organizationId, normalizedName]
+  );
+  return prefixName.rows.length > 0 ? prefixName.rows[0].user_id : null;
 }
 
 /** Split assignees string - handle comma, semicolon, and Excel corruption of "6300881211,8297700000" into one number */
@@ -289,9 +306,9 @@ async function upsertCostCentresFromSheet(
 
   const headers = sheet.getRow(1).values as any[];
   const orgNameIdx = colAny(headers, 'organization_name');
-  const nameIdx = colAny(headers, 'name');
-  const shortNameIdx = colAny(headers, 'short_name');
-  const displayOrderIdx = colAny(headers, 'display_order');
+  const nameIdx = colAny(headers, 'name', 'cost centre name', 'cost center name');
+  const shortNameIdx = colAny(headers, 'short_name', 'short name');
+  const displayOrderIdx = colAny(headers, 'display_order', 'display order');
 
   if (nameIdx < 0) {
     pushError({ sheet: sheet.name, message: 'Missing required column: name' });
@@ -348,10 +365,10 @@ async function upsertBranchesFromSheet(
 
   const headers = sheet.getRow(1).values as any[];
   const orgNameIdx = colAny(headers, 'organization_name');
-  const nameIdx = colAny(headers, 'name');
-  const shortNameIdx = colAny(headers, 'short_name');
+  const nameIdx = colAny(headers, 'name', 'branch name');
+  const shortNameIdx = colAny(headers, 'short_name', 'short name');
   const addressIdx = colAny(headers, 'address');
-  const gstIdx = colAny(headers, 'gst_number');
+  const gstIdx = colAny(headers, 'gst_number', 'gst number');
 
   if (nameIdx < 0) {
     pushError({ sheet: sheet.name, message: 'Missing required column: name' });
@@ -431,6 +448,18 @@ export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
     { header: 'Task Owner', key: 'task_owner', width: 18, numFmt: '@' },
     { header: 'Financial Value', key: 'financial_value', width: 16 },
     { header: 'Description', key: 'description', width: 40 },
+    { header: 'Auto Escalate', key: 'auto_escalate', width: 14 },
+    { header: 'Task Unit', key: 'task_unit', width: 18 },
+    { header: 'Tags', key: 'tags', width: 24 },
+    { header: 'Task Roll Out', key: 'task_rollout_type', width: 20 },
+    { header: 'Recurrence End Type', key: 'recurrence_end_type', width: 22 },
+    { header: 'Recurrence End Date', key: 'recurrence_end_date', width: 20 },
+    { header: 'Recurrence After Occurrences', key: 'recurrence_after_occurrences', width: 28 },
+    { header: 'Escalation Trigger', key: 'escalation_trigger', width: 20 },
+    { header: 'Escalation Days Before', key: 'escalation_days_before', width: 22 },
+    { header: 'Escalation Contacts', key: 'escalation_contact_ids', width: 26 },
+    { header: 'Compliance ID', key: 'compliance_id', width: 22 },
+    { header: 'Document Instance ID', key: 'document_instance_id', width: 24 },
   ];
   sheet.getRow(1).font = { bold: true };
 
@@ -459,6 +488,15 @@ export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
     showErrorMessage: true,
     errorTitle: 'Invalid value',
     error: 'Select Weekly, Monthly, Quarterly, or Yearly.',
+  });
+  // Auto Escalate is column M (after Description in L).
+  (sheet as any).dataValidations.add('M2:M1000', {
+    type: 'list',
+    allowBlank: true,
+    formulae: ['"Yes,No"'],
+    showErrorMessage: true,
+    errorTitle: 'Invalid value',
+    error: 'Select Yes or No.',
   });
 
   // --- New sheets (optional on upload; keeps old files compatible) ---
@@ -966,15 +1004,7 @@ export async function parseAndApply(
           pushError({ sheet: tasksSheet.name, row: r, message: `Reporting member not found: ${reportingMemberStr}` });
           continue;
         }
-      if (assigneeIds.length > 0 && !assigneeIds.includes(reportingMemberId)) {
-        pushError({
-          sheet: tasksSheet.name,
-          row: r,
-          message: 'Reporting member must be one of the assignees',
-        });
-        continue;
       }
-    }
 
     // Optional: Client Name -> resolve client_entities.id (scoped to org).
     // Backward compatible: if column is missing or blank, this stays null.

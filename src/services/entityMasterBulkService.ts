@@ -169,6 +169,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   const entityListCols = [
     { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
+    { header: 'STATUS', key: 'status', width: 14 },
     { header: 'COST CENTRE', key: 'cost_centre_name', width: 18 },
     { header: 'DEPOT', key: 'depot_name', width: 18 },
     { header: 'WAREHOUSE', key: 'warehouse_name', width: 18 },
@@ -180,7 +181,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   entityListSheet.getRow(1).font = { bold: true };
   const freqList = TASK_FREQUENCIES.join(',');
   // Dropdown only for compliance columns (after fixed entity columns).
-  for (let c = 8; c <= entityListCols.length; c++) {
+  for (let c = 9; c <= entityListCols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (entityListSheet as any).dataValidations.add(range, {
       type: 'list',
@@ -238,6 +239,19 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     { header: 'Recurrence', key: 'recurrence', width: 18 },
     { header: 'Task Owner', key: 'task_owner', width: 18, numFmt: '@' },
     { header: 'Financial Value', key: 'financial_value', width: 16 },
+    { header: 'Description', key: 'description', width: 40 },
+    { header: 'Auto Escalate', key: 'auto_escalate', width: 14 },
+    { header: 'Task Unit', key: 'task_unit', width: 18 },
+    { header: 'Tags', key: 'tags', width: 24 },
+    { header: 'Task Roll Out', key: 'task_rollout_type', width: 20 },
+    { header: 'Recurrence End Type', key: 'recurrence_end_type', width: 22 },
+    { header: 'Recurrence End Date', key: 'recurrence_end_date', width: 20 },
+    { header: 'Recurrence After Occurrences', key: 'recurrence_after_occurrences', width: 28 },
+    { header: 'Escalation Trigger', key: 'escalation_trigger', width: 20 },
+    { header: 'Escalation Days Before', key: 'escalation_days_before', width: 22 },
+    { header: 'Escalation Contacts', key: 'escalation_contact_ids', width: 26 },
+    { header: 'Compliance ID', key: 'compliance_id', width: 22 },
+    { header: 'Document Instance ID', key: 'document_instance_id', width: 24 },
   ];
   tasksSheet.getRow(1).font = { bold: true };
   // Keep assignee / reporting / owner as text to avoid Excel number corruption.
@@ -263,6 +277,14 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     errorTitle: 'Invalid value',
     error: 'Select Weekly, Monthly, Quarterly, or Yearly.',
   });
+  (tasksSheet as any).dataValidations.add('M2:M1000', {
+    type: 'list',
+    allowBlank: true,
+    formulae: ['"Yes,No"'],
+    showErrorMessage: true,
+    errorTitle: 'Invalid value',
+    error: 'Select Yes or No.',
+  });
 
   // Sheet 5: Employees – for /admin/users
   const employeesSheet = workbook.addWorksheet('Employees', {
@@ -271,6 +293,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   employeesSheet.columns = [
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
+    { header: 'DEPARTMENT', key: 'department', width: 22 },
     { header: 'DESIGNATON', key: 'designation', width: 25 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
     { header: 'LEVEL', key: 'level', width: 10 },
@@ -284,6 +307,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   ccSheet.columns = [
     { header: 'Cost Centre Name', key: 'name', width: 28 },
     { header: 'Short Name', key: 'short_name', width: 18 },
+    { header: 'Display Order', key: 'display_order', width: 14 },
   ];
   ccSheet.getRow(1).font = { bold: true };
 
@@ -306,6 +330,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   depotSheet.columns = [
     { header: 'Depot Name', key: 'name', width: 28 },
     { header: 'Short Name', key: 'short_name', width: 18 },
+    { header: 'Display Order', key: 'display_order', width: 14 },
   ];
   depotSheet.getRow(1).font = { bold: true };
 
@@ -366,7 +391,7 @@ export async function buildEntityMasterOnlyTemplate(): Promise<ExcelJS.Buffer> {
 /**
  * Build Excel template with only the Employee sheet.
  * Single sheet for use on /admin/users (Employee management) page.
- * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, DESIGNATON, REPORTING TO, LEVEL.
+ * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, DEPARTMENT, DESIGNATON, REPORTING TO, LEVEL.
  */
 export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -379,6 +404,7 @@ export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
   employeesSheet.columns = [
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
+    { header: 'DEPARTMENT', key: 'department', width: 22 },
     { header: 'DESIGNATON', key: 'designation', width: 25 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
     { header: 'LEVEL', key: 'level', width: 10 },
@@ -455,6 +481,7 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
   const cols = [
     { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
+    { header: 'STATUS', key: 'status', width: 14 },
     { header: 'COST CENTRE', key: 'cost_centre_name', width: 18 },
     { header: 'DEPOT', key: 'depot_name', width: 18 },
     { header: 'WAREHOUSE', key: 'warehouse_name', width: 18 },
@@ -467,7 +494,7 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
 
   // Dropdown for all compliance columns (after fixed entity columns)
   const freqList = TASK_FREQUENCIES.join(',');
-  for (let c = 8; c <= cols.length; c++) {
+  for (let c = 9; c <= cols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (sheet as any).dataValidations.add(range, {
       type: 'list',
@@ -1502,11 +1529,24 @@ export async function parseAndApply(
       const nameIdx = colAny(headers, 'name', 'name of the client');
       const orgNameIdx = colAny(headers, 'organization_name');
       const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
+      const statusIdx = colAny(headers, 'status');
       const costCentreNameIdx = colAny(headers, 'cost_centre_name', 'cost centre');
       const depotNameIdx = colAny(headers, 'depot_name', 'depot');
       const warehouseNameIdx = colAny(headers, 'warehouse_name', 'warehouse');
       const panIdx = colAny(headers, 'pan');
       const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
+      const clientEntityStatusColumn = await client.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'status'`
+      );
+      const hasClientEntityStatus = clientEntityStatusColumn.rows.length > 0;
+      const normalizeClientEntityStatus = (raw: string): string | null => {
+        const v = (raw || '').trim().toLowerCase();
+        if (!v) return null;
+        if (v === 'active' || v === 'inactive') return v;
+        if (v === '1' || v === 'true' || v === 'yes') return 'active';
+        if (v === '0' || v === 'false' || v === 'no') return 'inactive';
+        return null;
+      };
       // Compliance columns: header (trimmed) -> { colIndex, taskServiceTitle } from task_services (recurring) only
       const allowedTitles = await getRecurringTaskServiceTitlesForEntityList(defaultOrgId, client);
       const complianceCols: Array<{ colIndex: number; taskServiceTitle: string }> = [];
@@ -1533,6 +1573,12 @@ export async function parseAndApply(
             }
             if (!orgId) continue;
             const entity_type = entityTypeIdx >= 0 ? getCellStrMax(row, entityTypeIdx, NAME_MAX) : '';
+            const statusRaw = statusIdx >= 0 ? getCellStr(row, statusIdx) : '';
+            const status = normalizeClientEntityStatus(statusRaw);
+            if (statusRaw && !status) {
+              pushError({ sheet: clientSheet.name, row: r, message: `Invalid status: ${statusRaw}. Use Active or Inactive.` });
+              continue;
+            }
             const cost_centre_name = costCentreNameIdx >= 0 ? getCellStr(row, costCentreNameIdx) : '';
             const depot_name = depotNameIdx >= 0 ? getCellStr(row, depotNameIdx) : '';
             const warehouse_name = warehouseNameIdx >= 0 ? getCellStr(row, warehouseNameIdx) : '';
@@ -1549,15 +1595,29 @@ export async function parseAndApply(
               [orgId, name]
             );
             if (existing.rows.length > 0) {
-              await client.query(
-                "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
-                [entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
-              );
+              if (hasClientEntityStatus) {
+                await client.query(
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), cost_centre_id = $3, depot_id = $4, warehouse_id = $5, pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
+                  [entity_type || null, status, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
+                );
+              } else {
+                await client.query(
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+                  [entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
+                );
+              }
             } else {
-              await client.query(
-                "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''))",
-                [orgId, name, entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null]
-              );
+              if (hasClientEntityStatus) {
+                await client.query(
+                  "INSERT INTO client_entities (organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6, $7, NULLIF($8, ''), NULLIF($9, ''))",
+                  [orgId, name, entity_type || null, status, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null]
+                );
+              } else {
+                await client.query(
+                  "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''))",
+                  [orgId, name, entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null]
+                );
+              }
             }
             result.updated.client_entities += 1;
 
@@ -1765,6 +1825,7 @@ export interface EntityListJobPayload {
   organization_id: string;
   name: string;
   entity_type: string | null;
+  status: string | null;
   cost_centre_id: string | null;
   depot_id: string | null;
   warehouse_id: string | null;
@@ -1885,11 +1946,20 @@ export async function buildEntityListPayloadsFromSheet(
   const nameIdx = colAny(headers, 'name', 'name of the client');
   const orgNameIdx = colAny(headers, 'organization_name');
   const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
+  const statusIdx = colAny(headers, 'status');
   const costCentreNameIdx = colAny(headers, 'cost_centre_name', 'cost centre');
   const depotNameIdx = colAny(headers, 'depot_name', 'depot');
   const warehouseNameIdx = colAny(headers, 'warehouse_name', 'warehouse');
   const panIdx = colAny(headers, 'pan');
   const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
+  const normalizeClientEntityStatus = (raw: string): string | null => {
+    const v = (raw || '').trim().toLowerCase();
+    if (!v) return null;
+    if (v === 'active' || v === 'inactive') return v;
+    if (v === '1' || v === 'true' || v === 'yes') return 'active';
+    if (v === '0' || v === 'false' || v === 'no') return 'inactive';
+    return null;
+  };
   const allowedTitles = await getRecurringTaskServiceTitlesForEntityList(organizationId, client);
   const complianceCols: Array<{ colIndex: number; taskServiceTitle: string }> = [];
   for (let i = 1; i < (headers?.length ?? 0); i++) {
@@ -1913,6 +1983,8 @@ export async function buildEntityListPayloadsFromSheet(
     }
     if (!orgId) continue;
     const entity_type = entityTypeIdx >= 0 ? getCellStrMax(row, entityTypeIdx, NAME_MAX) : '';
+    const statusRaw = statusIdx >= 0 ? getCellStr(row, statusIdx) : '';
+    const status = normalizeClientEntityStatus(statusRaw);
     const cost_centre_name = costCentreNameIdx >= 0 ? getCellStr(row, costCentreNameIdx) : '';
     const depot_name = depotNameIdx >= 0 ? getCellStr(row, depotNameIdx) : '';
     const warehouse_name = warehouseNameIdx >= 0 ? getCellStr(row, warehouseNameIdx) : '';
@@ -1932,6 +2004,7 @@ export async function buildEntityListPayloadsFromSheet(
       organization_id: orgId,
       name,
       entity_type: entity_type || null,
+      status,
       cost_centre_id,
       depot_id: depot_id ?? null,
       warehouse_id: warehouse_id ?? null,
@@ -2044,12 +2117,16 @@ export async function createClientEntityFromPayload(
   payload: EntityListJobPayload,
   _organizationId: string
 ): Promise<string> {
-  const { organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile, compliance } = payload;
+  const { organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile, compliance } = payload;
   const orgId = organization_id || _organizationId;
   const nameTrim = (name || '').trim();
   if (!nameTrim) throw new Error('Client entity name is required');
   const NAME_MAX = 255;
   const nameSafe = nameTrim.slice(0, NAME_MAX);
+  const clientEntityStatusColumn = await client.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'status'`
+  );
+  const hasClientEntityStatus = clientEntityStatusColumn.rows.length > 0;
   const existing = await client.query(
     'SELECT id FROM client_entities WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
     [orgId, nameSafe]
@@ -2057,15 +2134,27 @@ export async function createClientEntityFromPayload(
   let clientEntityId: string;
   if (existing.rows.length > 0) {
     clientEntityId = existing.rows[0].id;
-    await client.query(
-      "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
-      [entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null, clientEntityId]
-    );
+    if (hasClientEntityStatus) {
+      await client.query(
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), cost_centre_id = $3, depot_id = $4, warehouse_id = $5, pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
+        [entity_type || null, status || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null, clientEntityId]
+      );
+    } else {
+      await client.query(
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+        [entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null, clientEntityId]
+      );
+    }
   } else {
-    const ins = await client.query(
-      "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
-      [orgId, nameSafe, entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null]
-    );
+    const ins = hasClientEntityStatus
+      ? await client.query(
+          "INSERT INTO client_entities (organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6, $7, NULLIF($8, ''), NULLIF($9, '')) RETURNING id",
+          [orgId, nameSafe, entity_type || null, status || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null]
+        )
+      : await client.query(
+          "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
+          [orgId, nameSafe, entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null]
+        );
     clientEntityId = ins.rows[0].id;
   }
   const freqNorm = (s: string) => {
