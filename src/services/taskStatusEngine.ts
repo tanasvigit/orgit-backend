@@ -43,11 +43,18 @@ const toMemberStatus = (assignee: AssigneeLike): MemberStatus => {
   // Prefer task_assignees.status (assignee_status) when present so API matches DB
   const raw = (assignee.assignee_status || '').toLowerCase();
   if (raw === 'completed') return 'COMPLETED';
-  if (raw === 'inprogress' || raw === 'duesoon' || raw === 'overdue') return 'IN_PROGRESS';
-  if (raw === 'todo' || raw === 'scheduled') return 'PENDING';
-  // Fallback to accepted_at/completed_at
-  if (assignee.accepted_at) {
+  if (
+    raw === 'inprogress' ||
+    raw === 'in_progress' ||
+    raw === 'pending_verification' ||
+    raw === 'under_verification' ||
+    raw === 'awaiting_creator_confirmation'
+  ) {
     return 'IN_PROGRESS';
+  }
+  if (raw === 'duesoon' || raw === 'due_soon' || raw === 'overdue') return 'PENDING';
+  if (raw === 'todo' || raw === 'scheduled' || raw === 'pending' || raw === 'active' || raw === 'accepted') {
+    return 'PENDING';
   }
   return 'PENDING';
 };

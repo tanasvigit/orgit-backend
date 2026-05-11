@@ -1,0 +1,150 @@
+export type UserLifecycleCategory =
+  | 'scheduled'
+  | 'todo'
+  | 'inprogress'
+  | 'duesoon'
+  | 'overdue'
+  | 'completed';
+
+export type AssigneeLifecycleInput = {
+  assigneeStatus?: string | null;
+  verifiedAt?: string | Date | null;
+  startDate?: string | Date | null;
+  targetDate?: string | Date | null;
+  dueDate?: string | Date | null;
+  dueSoonDays?: number;
+  now?: Date;
+};
+
+const toDayStartMs = (input?: string | Date | null): number | null => {
+  if (!input) return null;
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+};
+
+const isExplicitInProgressStatus = (status: string | null | undefined): boolean => {
+  const normalized = String(status || '').toLowerCase().trim();
+  return (
+    normalized === 'inprogress' ||
+    normalized === 'in_progress' ||
+    normalized === 'pending_verification' ||
+    normalized === 'under_verification' ||
+    normalized === 'awaiting_creator_confirmation'
+  );
+};
+
+export const normalizeAssigneeLifecycleStatus = (
+  status: string | null | undefined
+): UserLifecycleCategory | null => {
+  if (!status) return null;
+  const normalized = String(status).toLowerCase().trim();
+
+  if (normalized === 'scheduled') return 'scheduled';
+  if (normalized === 'todo' || normalized === 'pending' || normalized === 'active' || normalized === 'accepted') {
+    return 'todo';
+  }
+  if (isExplicitInProgressStatus(normalized)) {
+    return 'inprogress';
+  }
+  if (normalized === 'duesoon' || normalized === 'due_soon') return 'duesoon';
+  if (normalized === 'overdue') return 'overdue';
+  if (normalized === 'completed' || normalized === 'verified' || normalized === 'completed_verified') {
+    return 'completed';
+  }
+  if (normalized === 'rejected') return 'todo';
+
+  return null;
+};
+
+export const resolveInitialAssigneeStatus = (
+  input: Pick<AssigneeLifecycleInput, 'startDate' | 'now'>
+): 'scheduled' | 'todo' => {
+  const todayMs = toDayStartMs(input.now ?? new Date());
+  const startMs = toDayStartMs(input.startDate);
+  if (startMs != null && todayMs != null && todayMs < startMs) {
+    return 'scheduled';
+  }
+  return 'todo';
+};
+
+const isDueSoon = (
+  todayMs: number,
+  dueMs: number,
+  dueSoonDays: number
+): boolean => {
+  const diffDays = Math.ceil((dueMs - todayMs) / (1000 * 60 * 60 * 24));
+  return diffDays >= 0 && diffDays <= dueSoonDays;
+};
+
+export const resolveUserLifecycleCategory = (
+  input: AssigneeLifecycleInput
+): UserLifecycleCategory => {
+  const todayMs = toDayStartMs(input.now ?? new Date());
+  const startMs = toDayStartMs(input.startDate);
+  const dueMs = toDayStartMs(input.dueDate) ?? toDayStartMs(input.targetDate);
+  const dueSoonDays = input.dueSoonDays ?? 3;
+  const rawAssigneeStatus = input.assigneeStatus;
+
+  if (input.verifiedAt) {
+    return 'completed';
+  }
+
+  const fromStatus = normalizeAssigneeLifecycleStatus(rawAssigneeStatus);
+  if (fromStatus === 'completed') {
+    return 'completed';
+  }
+
+  if (startMs != null && todayMs != null && todayMs < startMs) {
+    return 'scheduled';
+  }
+
+  if (dueMs != null && todayMs != null && todayMs > dueMs) {
+    return 'overdue';
+  }
+
+  if (fromStatus === 'overdue') {
+    return 'overdue';
+  }
+
+  if (isExplicitInProgressStatus(rawAssigneeStatus)) {
+    return 'inprogress';
+  }
+
+  if (dueMs != null && todayMs != null && isDueSoon(todayMs, dueMs, dueSoonDays)) {
+    return 'duesoon';
+  }
+
+  if (fromStatus === 'duesoon') {
+    return 'duesoon';
+  }
+
+  if (fromStatus === 'scheduled') {
+    return 'todo';
+  }
+
+  if (fromStatus) {
+    return fromStatus;
+  }
+
+  return 'todo';
+};
+
+export const lifecycleToDashboardBucket = (
+  lifecycle: UserLifecycleCategory
+): 'scheduled' | 'todo' | 'overdue' | 'dueSoon' | 'inProgress' | 'completed' => {
+  switch (lifecycle) {
+    case 'scheduled':
+      return 'scheduled';
+    case 'todo':
+      return 'todo';
+    case 'duesoon':
+      return 'dueSoon';
+    case 'overdue':
+      return 'overdue';
+    case 'completed':
+      return 'completed';
+  }
+  return 'inProgress';
+};

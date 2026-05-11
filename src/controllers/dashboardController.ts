@@ -13,8 +13,15 @@ import {
 export const getDashboard = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.userId;
-    // dueSoonDays now comes from platform settings automatically
-    const dashboardData = await getDashboardData(userId);
+    const dueSoonDaysRaw = req.query.dueSoonDays;
+    const dueSoonDays =
+      dueSoonDaysRaw != null && String(dueSoonDaysRaw).trim() !== ''
+        ? Number(dueSoonDaysRaw)
+        : undefined;
+    const dashboardData = await getDashboardData(
+      userId,
+      Number.isFinite(dueSoonDays) ? dueSoonDays : undefined
+    );
 
     res.json({
       success: true,

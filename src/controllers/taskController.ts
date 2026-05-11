@@ -3,6 +3,10 @@ import { AuthRequest } from '../middleware/authMiddleware';
 import { query, getClient } from '../config/database';
 import { getReminderConfig } from '../services/platformSettingsService';
 import { computeTaskAndMemberStatuses } from '../services/taskStatusEngine';
+import {
+  resolveInitialAssigneeStatus,
+  resolveUserLifecycleCategory,
+} from '../services/userTaskLifecycle';
 import { logTaskActivity } from '../services/taskActivityLogger';
 import {
   getComputedStatus,
@@ -332,6 +336,8 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
             'accepted_at', ta3.accepted_at,
             'has_accepted', CASE WHEN ta3.accepted_at IS NOT NULL THEN true ELSE false END,
             'assignee_status', ta3.status,
+            'completed_at', ta3.completed_at,
+            'verified_at', ta3.verified_at,
             'role', ta3.role
           )
           FROM task_assignees ta3
@@ -429,6 +435,8 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     `;
 
     const result = await query(querySQL, params);
+    const reminderConfig = await getReminderConfig();
+    const dueSoonDays = reminderConfig.dueSoonDays;
     // Prevent caching so clients always get full body (avoid 304 with empty body breaking task list)
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
@@ -454,20 +462,31 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
       if (row.start_date) {
         try {
           const start = new Date(row.start_date as any);
-          const today = new Date();
-          start.setHours(0, 0, 0, 0);
-          today.setHours(0, 0, 0, 0);
-          isBeforeStartDate = start.getTime() > today.getTime();
+          isBeforeStartDate = !Number.isNaN(start.getTime()) && new Date() < start;
         } catch {
           isBeforeStartDate = null;
         }
       }
+      const currentUserAssignee = assignees.find((a: any) => {
+        const assigneeId = a?.id || a?.user_id || a?.userId;
+        return assigneeId != null && String(assigneeId) === String(userId);
+      });
+      const currentUserLifecycleStatus = resolveUserLifecycleCategory({
+        assigneeStatus:
+          row.current_user_status?.assignee_status ?? currentUserAssignee?.assignee_status,
+        verifiedAt: currentUserAssignee?.verified_at,
+        startDate: row.start_date,
+        targetDate: row.target_date,
+        dueDate: row.due_date,
+        dueSoonDays,
+      });
       return {
         ...buildTaskWithDerivedStatus(row),
         task_status: computed.taskStatus,
         member_statuses: computed.memberStatuses,
         current_user_member_status: computed.currentUserMemberStatus,
-        is_before_start_date: isBeforeStartDate,
+        current_user_lifecycle_status: currentUserLifecycleStatus,
+        is_before_start_date: currentUserLifecycleStatus === 'scheduled',
         hide_user_status: hideUserStatus,
       };
     });
@@ -561,6 +580,8 @@ export const getTask = async (req: AuthRequest, res: Response) => {
             'accepted_at', ta2.accepted_at,
             'has_accepted', CASE WHEN ta2.accepted_at IS NOT NULL THEN true ELSE false END,
             'assignee_status', ta2.status,
+            'completed_at', ta2.completed_at,
+            'verified_at', ta2.verified_at,
             'role', ta2.role
           )
           FROM task_assignees ta2
@@ -626,6 +647,22 @@ export const getTask = async (req: AuthRequest, res: Response) => {
     if (computed.currentUserMemberStatus) {
       (taskWithDerived as any).current_user_member_status = computed.currentUserMemberStatus;
     }
+    const currentUserAssignee = assignees.find((a: any) => {
+      const assigneeId = a?.id || a?.user_id || a?.userId;
+      return assigneeId != null && String(assigneeId) === String(userId);
+    });
+    const reminderConfig = await getReminderConfig();
+    const currentUserLifecycleStatus = resolveUserLifecycleCategory({
+      assigneeStatus:
+        task.current_user_status?.assignee_status ?? currentUserAssignee?.assignee_status,
+      verifiedAt: currentUserAssignee?.verified_at,
+      startDate: task.start_date,
+      targetDate: task.target_date,
+      dueDate: task.due_date,
+      dueSoonDays: reminderConfig.dueSoonDays,
+    });
+    (taskWithDerived as any).current_user_lifecycle_status = currentUserLifecycleStatus;
+    (taskWithDerived as any).is_before_start_date = currentUserLifecycleStatus === 'scheduled';
 
     res.json({ task: taskWithDerived });
   } catch (error: any) {
@@ -1159,9 +1196,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       }
     }
 
-    // Always initialize owner/assignees as todo.
-    // Move to in_progress only via explicit user action APIs.
-    const assigneeStatus = 'todo';
+    const assigneeStatus = resolveInitialAssigneeStatus({ startDate: task.start_date });
 
     if (hasExplicitAssignees && allAssigneeIds.size > 0) {
       hasAssignees = true;
@@ -1173,10 +1208,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             ? 'reporting_member'
             : 'member';
         await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
-           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+          `INSERT INTO task_assignees (task_id, user_id, status, role)
+           VALUES ($1, $2, $3, $4)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+           SET status = EXCLUDED.status`,
           [task.id, assigneeId, assigneeStatus, role]
         );
       }
@@ -1185,10 +1220,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       // Keep creator as assignee for no-assignee creates too.
       hasAssignees = true;
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
-         VALUES ($1, $2, $3, 'creator', CURRENT_TIMESTAMP)
+        `INSERT INTO task_assignees (task_id, user_id, status, role)
+         VALUES ($1, $2, $3, 'creator')
          ON CONFLICT (task_id, user_id) DO UPDATE
-         SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+         SET status = EXCLUDED.status`,
         [task.id, taskCreatorId, assigneeStatus]
       );
     }
@@ -3368,14 +3403,12 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
 
     // Insert new assignees
     for (const assigneeId of newAssigneeIds) {
-      const now = new Date();
-      const startAt = task.start_date ? new Date(task.start_date).getTime() : null;
-      const assigneeStatus = startAt != null && now.getTime() < startAt ? 'scheduled' : 'todo';
+      const assigneeStatus = resolveInitialAssigneeStatus({ startDate: task.start_date });
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
-         VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
+        `INSERT INTO task_assignees (task_id, user_id, status, role)
+         VALUES ($1, $2, $3, 'member')
          ON CONFLICT (task_id, user_id) DO UPDATE
-         SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+         SET status = EXCLUDED.status`,
         [id, assigneeId, assigneeStatus]
       );
     }

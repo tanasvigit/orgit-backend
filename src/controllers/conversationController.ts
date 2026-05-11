@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { query, getClient } from '../config/database';
 import { resolveToUrl } from '../services/s3StorageService';
+import { resolveInitialAssigneeStatus } from '../services/userTaskLifecycle';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -602,26 +603,20 @@ export const addGroupMembersHandler = async (req: AuthRequest, res: Response) =>
     // Task flow: when adding members to an ongoing task group, add them as task assignees
     // and mark accepted immediately (no separate accept step).
     if (isTaskGroup && taskId) {
-      // Derive initial member lifecycle status from start_date: scheduled until start_date (date+time), else todo
       let assigneeStatus: 'scheduled' | 'todo' = 'todo';
       try {
         const tRes = await query(`SELECT start_date FROM tasks WHERE id = $1`, [taskId]);
         const startRaw = tRes.rows[0]?.start_date;
-        if (startRaw) {
-          const startMs = new Date(startRaw as any).getTime();
-          if (Number.isFinite(startMs) && Date.now() < startMs) {
-            assigneeStatus = 'scheduled';
-          }
-        }
+        assigneeStatus = resolveInitialAssigneeStatus({ startDate: startRaw });
       } catch {
         assigneeStatus = 'todo';
       }
       for (const memberId of memberIds) {
         await query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
-           VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
+          `INSERT INTO task_assignees (task_id, user_id, status, role)
+           VALUES ($1, $2, $3, 'member')
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+           SET status = EXCLUDED.status`,
           [taskId, memberId, assigneeStatus]
         );
       }

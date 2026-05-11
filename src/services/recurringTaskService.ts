@@ -1,6 +1,7 @@
 import { query } from '../config/database';
 import { calculateNextRecurrenceDate } from './taskService';
 import { logTaskActivity } from './taskActivityLogger';
+import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
 
 const MONTH_ABBREVS = new Set([
   'jan',
@@ -172,7 +173,7 @@ export const generateNextRecurrence = async (): Promise<void> => {
     const initialStatus = 'pending';
     // Recurring instances must start in todo for all assignees/owner.
     // Progress to in_progress should happen only through user action.
-    const assigneeStatus = 'todo';
+    const assigneeStatus = resolveInitialAssigneeStatus({ startDate });
 
     const assigneesResult = await query(
       `SELECT user_id, role FROM task_template_assignees WHERE template_id = $1`,
@@ -246,10 +247,10 @@ export const generateNextRecurrence = async (): Promise<void> => {
 
       for (const a of assignees) {
         await query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at, completed_at, verified_at)
-           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, NULL, NULL)
+          `INSERT INTO task_assignees (task_id, user_id, status, role, completed_at, verified_at)
+           VALUES ($1, $2, $3, $4, NULL, NULL)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+           SET status = EXCLUDED.status`,
           [newTask.id, a.userId, assigneeStatus, a.role]
         );
       }

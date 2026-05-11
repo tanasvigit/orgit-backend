@@ -1,5 +1,9 @@
 import { getClient, query } from '../config/database';
 import { getReminderConfig } from './platformSettingsService';
+import {
+  lifecycleToDashboardBucket,
+  resolveUserLifecycleCategory,
+} from './userTaskLifecycle';
 
 /** Task row from dashboard query plus computed fields (no dependency on shared types) */
 export interface DashboardTask {
@@ -77,82 +81,21 @@ const calculateDaysUntilDue = (dueDate: Date | null): number | null => {
   return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 };
 
-/**
- * Categorize task by status
- *
- * Status Flow:
- * - SCHEDULED: Current date-time is before task start_date (full timestamp); show only after start_date in todo/inProgress.
- * - TODO: Task pending and not yet accepted by assignee (creator sees "assigned, waiting"; assignee sees "I need to accept")
- * - In Progress: Task accepted (or in_progress); work in progress
- * - Completed: User completed and verified
- * - Overdue / Due Soon: By due date
- */
 const categorizeTask = (
   task: DashboardTask,
-  dueSoonDays: number = 3
+  _dueSoonDays: number = 3
 ): 'scheduled' | 'todo' | 'overdue' | 'dueSoon' | 'inProgress' | 'completed' => {
-  const hasNoDates = !task.start_date && !task.due_date;
-  // 0. Before start_date (date+time): task is scheduled; display in todo only when current date-time >= start_date
-  if (task.start_date) {
-    const now = new Date();
-    const start = new Date(task.start_date as string | Date);
-    if (now < start) return 'scheduled';
-  }
-
-  // 1. Self tasks: if current user has completed_at and verified_at, show as Completed
-  const userCompletedAndVerified =
-    (task as any).current_user_completed_at != null && (task as any).current_user_verified_at != null;
-  if (userCompletedAndVerified) {
-    return 'completed';
-  }
-  // 1. Completed tasks - but for creator in Self, show In Progress until they mark complete
-  if (task.status === 'completed') {
-    if ((task as any).is_creator) return 'inProgress';
-    return 'completed';
-  }
-
-  // No-date tasks must never go to overdue/dueSoon buckets.
-  if (hasNoDates) {
-    const isSelfTask = (task as any).isSelfTask === true;
-    const currentUserAcceptedAt = (task as any).current_user_accepted_at;
-    const acceptedAssigneeCount = (task as any).accepted_assignee_count;
-    const noOneAccepted =
-      isSelfTask
-        ? currentUserAcceptedAt == null
-        : (acceptedAssigneeCount == null || Number(acceptedAssigneeCount) === 0);
-    return noOneAccepted ? 'todo' : 'inProgress';
-  }
-
-  // 2. Overdue: by date
-  const daysUntilDue = task.daysUntilDue;
-  if (daysUntilDue != null && daysUntilDue < 0) {
-    return 'overdue';
-  }
-  if (task.status === 'overdue') {
-    return 'overdue';
-  }
-
-  // 3. Due Soon: by date
-  if (daysUntilDue != null && daysUntilDue >= 0 && daysUntilDue <= dueSoonDays) {
-    return 'dueSoon';
-  }
-
-  // 4. TODO: No assignee has accepted yet (use accepted_at counts, not tasks.status)
-  // Self task: current user is assignee and has not accepted
-  // Assigned task: current user is creator; no assignee has accepted yet
-  const isSelfTask = (task as any).isSelfTask === true;
-  const currentUserAcceptedAt = (task as any).current_user_accepted_at;
-  const acceptedAssigneeCount = (task as any).accepted_assignee_count;
-  const noOneAccepted =
-    isSelfTask
-      ? currentUserAcceptedAt == null
-      : (acceptedAssigneeCount == null || Number(acceptedAssigneeCount) === 0);
-  if (noOneAccepted) {
-    return 'todo';
-  }
-
-  // 5. In Progress: at least one assignee has accepted (or task completed/overdue handled above)
-  return 'inProgress';
+  const lifecycle =
+  (task as any).current_user_lifecycle_status ||
+    resolveUserLifecycleCategory({
+      assigneeStatus: (task as any).current_user_status?.assignee_status,
+      verifiedAt: (task as any).current_user_verified_at,
+      startDate: task.start_date,
+      targetDate: (task as any).target_date,
+      dueDate: task.due_date,
+      dueSoonDays: _dueSoonDays,
+    });
+  return lifecycleToDashboardBucket(lifecycle);
 };
 
 /**
@@ -206,14 +149,20 @@ export const getDashboardData = async (
              AND ta_rm.user_id != COALESCE(t.created_by, t.creator_id))
         ELSE false
       END as all_reporting_members_verified,
-      -- Per-user status for overview: has_accepted, has_rejected, assignee_status (todo/inprogress/completed) for display
-      jsonb_build_object('has_accepted', ta.accepted_at IS NOT NULL, 'has_rejected', false, 'assignee_status', ta.status) as current_user_status
+      jsonb_build_object(
+        'has_accepted', ta.accepted_at IS NOT NULL,
+        'has_rejected', false,
+        'assignee_status', ta.status,
+        'accepted_at', ta.accepted_at,
+        'completed_at', ta.completed_at,
+        'verified_at', ta.verified_at,
+        'role', ta.role
+      ) as current_user_status
      FROM tasks t
      INNER JOIN task_assignees ta ON t.id = ta.task_id
      WHERE ta.user_id = $1
       AND COALESCE(t.is_recurring_template, false) = false
       AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
-       AND (ta.status IS NULL OR ta.status != 'scheduled')
        AND (
           -- Non-creator roles are always Self
           COALESCE(ta.role, 'member') <> 'creator'
@@ -280,14 +229,21 @@ export const getDashboardData = async (
       false as all_members_verified,
       false as all_reporting_members_verified,
       -- Per-user status for overview: has_accepted, has_rejected, assignee_status for display
-      (SELECT jsonb_build_object('has_accepted', ta_c.accepted_at IS NOT NULL, 'has_rejected', false, 'assignee_status', ta_c.status)
+      (SELECT jsonb_build_object(
+         'has_accepted', ta_c.accepted_at IS NOT NULL,
+         'has_rejected', false,
+         'assignee_status', ta_c.status,
+         'accepted_at', ta_c.accepted_at,
+         'completed_at', ta_c.completed_at,
+         'verified_at', ta_c.verified_at,
+         'role', ta_c.role
+       )
        FROM task_assignees ta_c WHERE ta_c.task_id = t.id AND ta_c.user_id = $1) as current_user_status
      FROM tasks t
      INNER JOIN task_assignees ta_me ON t.id = ta_me.task_id
      WHERE ta_me.user_id = $1
       AND COALESCE(t.is_recurring_template, false) = false
       AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
-       AND (ta_me.status IS NULL OR ta_me.status != 'scheduled')
        AND COALESCE(ta_me.role, 'member') = 'creator'
        AND EXISTS (
          SELECT 1
@@ -299,23 +255,34 @@ export const getDashboardData = async (
   );
 
   // Process self tasks (include creator-with-no-assignees in Self)
+  const enrichDashboardTask = (row: any, isSelfTask: boolean): DashboardTask => {
+    const currentUserLifecycleStatus = resolveUserLifecycleCategory({
+      assigneeStatus: row.current_user_status?.assignee_status,
+      verifiedAt: row.current_user_verified_at,
+      startDate: row.start_date,
+      targetDate: row.target_date,
+      dueDate: row.due_date,
+      dueSoonDays,
+    });
+    return {
+      ...row,
+      isSelfTask,
+      assignmentStatus: row.assignment_status,
+      daysUntilDue: calculateDaysUntilDue(row.due_date),
+      current_user_lifecycle_status: currentUserLifecycleStatus,
+      is_before_start_date: currentUserLifecycleStatus === 'scheduled',
+    };
+  };
+
   const selfTasks: DashboardTask[] = [
     ...selfTasksResult.rows,
     ...selfTasksNoAssigneesResult.rows,
-  ].map((row) => ({
-    ...row,
-    isSelfTask: true,
-    assignmentStatus: row.assignment_status,
-    daysUntilDue: calculateDaysUntilDue(row.due_date),
-  }));
+  ].map((row) => enrichDashboardTask(row, true));
 
   // Process assigned tasks
-  const assignedTasks: DashboardTask[] = assignedTasksResult.rows.map((row) => ({
-    ...row,
-    isSelfTask: false,
-    assignmentStatus: row.assignment_status,
-    daysUntilDue: calculateDaysUntilDue(row.due_date),
-  }));
+  const assignedTasks: DashboardTask[] = assignedTasksResult.rows.map((row) =>
+    enrichDashboardTask(row, false)
+  );
 
   // Debug logging (remove in production)
   if (process.env.NODE_ENV !== 'production') {
@@ -408,20 +375,9 @@ export const getDashboardData = async (
   const selfCategorized = categorizeTasks(selfTasks);
   const assignedCategorized = categorizeTasks(assignedTasks);
   const events = await getDashboardEventsForUser(userId, 14);
-  // Scheduled status is not shown on dashboard (tasks with assignee status 'scheduled' already excluded from query)
-  type CategorizedGroups = {
-    general: TaskCategoryGroup;
-    documentManagement: TaskCategoryGroup;
-    complianceManagement: TaskCategoryGroup;
-  };
-  const clearScheduled = (g: CategorizedGroups): CategorizedGroups => ({
-    general: { ...g.general, scheduled: [] },
-    documentManagement: { ...g.documentManagement, scheduled: [] },
-    complianceManagement: { ...g.complianceManagement, scheduled: [] },
-  });
   return {
-    selfTasks: clearScheduled(selfCategorized),
-    assignedTasks: clearScheduled(assignedCategorized),
+    selfTasks: selfCategorized,
+    assignedTasks: assignedCategorized,
     events,
   };
 };
@@ -474,12 +430,13 @@ export const getMonthlyCalendarSnapshot = async (
            AND COALESCE(t.is_recurring_template, false) = false
            AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
            AND t.due_date IS NOT NULL
+           AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
            -- If current user already completed and got verified, this is not open for them.
            AND NOT (ta.completed_at IS NOT NULL AND ta.verified_at IS NOT NULL)
            -- Keep self/assigned buckets disjoint: creator-with-team tasks belong to assigned.
-           AND NOT (
-             COALESCE(t.created_by, t.creator_id) = $1
-             AND EXISTS (
+           AND (
+             COALESCE(ta.role, 'member') <> 'creator'
+             OR NOT EXISTS (
                SELECT 1
                FROM task_assignees ta_other
                WHERE ta_other.task_id = t.id
@@ -497,7 +454,8 @@ export const getMonthlyCalendarSnapshot = async (
            AND COALESCE(t.is_recurring_template, false) = false
            AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
            AND t.due_date IS NOT NULL
-           AND COALESCE(t.created_by, t.creator_id) = $1
+           AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+           AND COALESCE(ta_me.role, 'member') = 'creator'
            AND EXISTS (
              SELECT 1 FROM task_assignees ta_other
              WHERE ta_other.task_id = t.id AND ta_other.user_id != $1
@@ -628,22 +586,23 @@ export const getTaskStatistics = async (userId: string): Promise<{
   const selfTasksCountResult = await query(
     `SELECT 
       COUNT(DISTINCT t.id) as total,
-      COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'pending' AND ta.accepted_at IS NULL) as todo,
-      COUNT(DISTINCT t.id) FILTER (WHERE t.due_date IS NOT NULL AND (t.status = 'overdue' OR (t.due_date < CURRENT_DATE AND t.status != 'completed'))) as overdue,
-      COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'completed' OR (ta.completed_at IS NOT NULL AND ta.verified_at IS NOT NULL)) as completed,
-      COUNT(DISTINCT t.id) FILTER (WHERE t.status != 'completed' AND (t.status = 'in_progress' OR (t.status = 'pending' AND ta.accepted_at IS NOT NULL))) as in_progress,
+      COUNT(DISTINCT t.id) FILTER (WHERE COALESCE(ta.status, 'todo') IN ('todo', 'scheduled', 'pending', 'active', 'accepted')) as todo,
+      COUNT(DISTINCT t.id) FILTER (WHERE COALESCE(ta.status, '') = 'overdue' OR (t.due_date IS NOT NULL AND t.due_date::date < CURRENT_DATE AND ta.verified_at IS NULL)) as overdue,
+      COUNT(DISTINCT t.id) FILTER (WHERE ta.verified_at IS NOT NULL OR COALESCE(ta.status, '') IN ('completed', 'verified')) as completed,
+      COUNT(DISTINCT t.id) FILTER (WHERE COALESCE(ta.status, '') IN ('inprogress', 'in_progress', 'pending_verification', 'under_verification', 'awaiting_creator_confirmation')) as in_progress,
       COUNT(DISTINCT t.id) FILTER (
-        WHERE t.status NOT IN ('completed', 'overdue') 
-        AND t.due_date IS NOT NULL 
-        AND t.due_date >= CURRENT_DATE 
-        AND t.due_date <= CURRENT_DATE + INTERVAL '1 day' * $2
+        WHERE ta.verified_at IS NULL
+        AND COALESCE(ta.status, '') NOT IN ('inprogress', 'in_progress', 'overdue', 'completed', 'verified', 'scheduled')
+        AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+        AND t.due_date IS NOT NULL
+        AND t.due_date::date >= CURRENT_DATE
+        AND t.due_date::date <= CURRENT_DATE + INTERVAL '1 day' * $2
       ) as due_soon
      FROM tasks t
      INNER JOIN task_assignees ta ON t.id = ta.task_id
      WHERE ta.user_id = $1
       AND COALESCE(t.is_recurring_template, false) = false
       AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
-       AND (ta.status IS NULL OR ta.status != 'scheduled')
        AND (
          COALESCE(ta.role, 'member') <> 'creator'
          OR (
@@ -664,22 +623,30 @@ export const getTaskStatistics = async (userId: string): Promise<{
   const assignedTasksCountResult = await query(
     `SELECT 
       COUNT(*) as total,
-      COUNT(*) FILTER (WHERE t.status = 'pending' AND (SELECT COUNT(*) FROM task_assignees ta_t WHERE ta_t.task_id = t.id AND ta_t.accepted_at IS NOT NULL) = 0) as todo,
-      COUNT(*) FILTER (WHERE t.due_date IS NOT NULL AND (t.status = 'overdue' OR (t.due_date < CURRENT_DATE AND t.status != 'completed'))) as overdue,
-      COUNT(*) FILTER (WHERE t.status = 'completed') as completed,
-      COUNT(*) FILTER (WHERE t.status != 'completed' AND (t.status = 'in_progress' OR (t.status = 'pending' AND (SELECT COUNT(*) FROM task_assignees ta_i WHERE ta_i.task_id = t.id AND ta_i.accepted_at IS NOT NULL) > 0))) as in_progress,
+      COUNT(*) FILTER (WHERE COALESCE(ta_me.status, 'todo') IN ('todo', 'scheduled', 'pending', 'active', 'accepted')) as todo,
       COUNT(*) FILTER (
-        WHERE t.status NOT IN ('completed', 'overdue') 
-        AND t.due_date IS NOT NULL 
-        AND t.due_date >= CURRENT_DATE 
-        AND t.due_date <= CURRENT_DATE + INTERVAL '1 day' * $2
+        WHERE ta_me.verified_at IS NULL
+        AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+        AND (
+          COALESCE(ta_me.status, '') = 'overdue'
+          OR (t.due_date IS NOT NULL AND t.due_date::date < CURRENT_DATE)
+        )
+      ) as overdue,
+      COUNT(*) FILTER (WHERE ta_me.verified_at IS NOT NULL OR COALESCE(ta_me.status, '') IN ('completed', 'verified')) as completed,
+      COUNT(*) FILTER (WHERE COALESCE(ta_me.status, '') IN ('inprogress', 'in_progress', 'pending_verification', 'under_verification', 'awaiting_creator_confirmation')) as in_progress,
+      COUNT(*) FILTER (
+        WHERE ta_me.verified_at IS NULL
+        AND COALESCE(ta_me.status, '') NOT IN ('inprogress', 'in_progress', 'overdue', 'completed', 'verified', 'scheduled')
+        AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+        AND t.due_date IS NOT NULL
+        AND t.due_date::date >= CURRENT_DATE
+        AND t.due_date::date <= CURRENT_DATE + INTERVAL '1 day' * $2
       ) as due_soon
      FROM tasks t
      INNER JOIN task_assignees ta_me ON t.id = ta_me.task_id
      WHERE ta_me.user_id = $1
       AND COALESCE(t.is_recurring_template, false) = false
       AND COALESCE(t.task_type, 'one_time') != 'recurring_template'
-       AND (ta_me.status IS NULL OR ta_me.status != 'scheduled')
        AND COALESCE(ta_me.role, 'member') = 'creator'
        AND EXISTS (
          SELECT 1

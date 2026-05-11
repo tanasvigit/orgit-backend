@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import { getClient } from '../config/database';
 import { createHash } from 'crypto';
+import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
 
 /** Bulk upload limits and safety */
 const MAX_ROWS_PER_SHEET = 500;
@@ -694,10 +695,7 @@ export async function createTaskFromPayload(
   );
   const task = taskResult.rows[0];
 
-  const nowMs = Date.now();
-  const startAtMs = startDate ? new Date(startDate as any).getTime() : null;
-  const initialAssigneeStatus =
-    startAtMs != null && Number.isFinite(startAtMs) && startAtMs > nowMs ? 'scheduled' : 'todo';
+  const initialAssigneeStatus = resolveInitialAssigneeStatus({ startDate });
 
   // Ensure reporting member can see task + verify others.
   // Some legacy templates/users may provide reporting_member_id but omit them from assigneeIds.
@@ -714,10 +712,10 @@ export async function createTaskFromPayload(
         : 'member';
 
     await client.query(
-      `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+      `INSERT INTO task_assignees (task_id, user_id, status, role)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (task_id, user_id) DO UPDATE
-       SET accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+       SET status = EXCLUDED.status`,
       [task.id, assigneeId, initialAssigneeStatus, role]
     );
   }
