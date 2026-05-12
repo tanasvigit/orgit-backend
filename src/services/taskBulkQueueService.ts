@@ -2,6 +2,7 @@ import ExcelJS from 'exceljs';
 import { createHash } from 'crypto';
 import { getClient } from '../config/database';
 import type { TaskBulkJobPayload } from './taskBulkService';
+import { calculateNextCycleStartDate } from './cycleStartRecurrence';
 
 const MAX_ROWS_PER_SHEET = 500;
 const MAX_ERRORS_REPORTED = 100;
@@ -410,10 +411,12 @@ export async function enqueueTaskBulkUpload(
             specificWeekday = null;
           }
           if (frequency) {
-            nextRecurrenceDate = calculateNextRecurrenceDate(
-              frequency as any,
+            const cycleAnchorDate = startDate || dueDate;
+            nextRecurrenceDate = calculateNextCycleStartDate(
+              recurrenceRaw,
+              1,
               specificWeekday,
-              dueDate
+              cycleAnchorDate
             );
           }
         }

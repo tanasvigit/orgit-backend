@@ -1,5 +1,5 @@
 import { query } from '../config/database';
-import { calculateNextRecurrenceDate } from './taskService';
+import { advanceCycleStartToFuture } from './cycleStartRecurrence';
 import { logTaskActivity } from './taskActivityLogger';
 import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
 
@@ -112,32 +112,6 @@ const normalizeTemplateFrequency = (
   if (normalized === 'quarterly') return 'quarterly';
   if (normalized === 'annually' || normalized === 'yearly') return 'yearly';
   return 'monthly';
-};
-
-const advanceCursorToFuture = (
-  frequency: any,
-  specificWeekday: number | null,
-  baseDate: Date,
-  now: Date
-): Date => {
-  let cursor = new Date(baseDate);
-  let next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
-  let guard = 0;
-
-  // Skip historical windows so one stale template does not create one task every scheduler run.
-  while (next.getTime() <= now.getTime() && guard < 500) {
-    // Defensive escape for malformed frequency/weekday combinations.
-    if (next.getTime() <= cursor.getTime()) {
-      cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
-      next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
-    } else {
-      cursor = next;
-      next = calculateNextRecurrenceDate(frequency, specificWeekday, cursor);
-    }
-    guard += 1;
-  }
-
-  return next;
 };
 
 /**
@@ -323,8 +297,9 @@ export const generateNextRecurrence = async (): Promise<void> => {
       }
     }
 
-    const nextRecurrenceDate = advanceCursorToFuture(
-      normalizedFrequency,
+    const nextRecurrenceDate = advanceCycleStartToFuture(
+      template.recurrence_type,
+      template.recurrence_interval,
       template.specific_weekday,
       recurrenceDate,
       now

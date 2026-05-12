@@ -49,6 +49,18 @@ export const updateTaskStatuses = async (io?: any): Promise<void> => {
   const { dueSoonDays } = await getReminderConfig();
   await query(
     `UPDATE task_assignees ta
+     SET status = 'todo'
+     FROM tasks t
+     WHERE ta.task_id = t.id
+       AND ta.verified_at IS NULL
+       AND ta.status = 'duesoon'
+       AND t.target_date IS NOT NULL
+       AND t.target_date::date > CURRENT_DATE`,
+    []
+  );
+
+  await query(
+    `UPDATE task_assignees ta
      SET status = 'duesoon'
      FROM tasks t
      WHERE ta.task_id = t.id
@@ -57,6 +69,10 @@ export const updateTaskStatuses = async (io?: any): Promise<void> => {
        AND t.due_date::date >= CURRENT_DATE
        AND t.due_date::date <= CURRENT_DATE + INTERVAL '1 day' * $1
        AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+       AND (
+         (t.target_date IS NOT NULL AND t.target_date::date <= CURRENT_DATE)
+         OR (t.target_date IS NULL AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE))
+       )
        AND ta.status IN ('todo', 'scheduled')`,
     [dueSoonDays]
   );

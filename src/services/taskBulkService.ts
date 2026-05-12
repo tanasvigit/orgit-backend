@@ -2,6 +2,7 @@ import ExcelJS from 'exceljs';
 import { getClient } from '../config/database';
 import { createHash } from 'crypto';
 import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
+import { calculateNextCycleStartDate } from './cycleStartRecurrence';
 
 /** Bulk upload limits and safety */
 const MAX_ROWS_PER_SHEET = 500;
@@ -425,6 +426,68 @@ async function upsertBranchesFromSheet(
     }
   }
 }
+const TASK_BULK_VALIDATION_ROW_START = 2;
+const TASK_BULK_VALIDATION_ROW_END = 1000;
+
+function getTaskBulkSheetColumnRange(sheet: ExcelJS.Worksheet, columnKey: string): string {
+  const letter = sheet.getColumn(columnKey).letter;
+  if (!letter) {
+    throw new Error(`Task bulk sheet missing column key: ${columnKey}`);
+  }
+  return `${letter}${TASK_BULK_VALIDATION_ROW_START}:${letter}${TASK_BULK_VALIDATION_ROW_END}`;
+}
+
+function addTaskBulkSheetListValidation(
+  sheet: ExcelJS.Worksheet,
+  columnKey: string,
+  values: string[],
+  errorMessage: string
+): void {
+  (sheet as any).dataValidations.add(getTaskBulkSheetColumnRange(sheet, columnKey), {
+    type: 'list',
+    allowBlank: true,
+    formulae: [`"${values.join(',')}"`],
+    showErrorMessage: true,
+    errorTitle: 'Invalid value',
+    error: errorMessage,
+  });
+}
+
+/** Excel list dropdowns for Tasks bulk upload columns that map to enum fields. */
+export function applyTaskBulkSheetValidations(sheet: ExcelJS.Worksheet): void {
+  addTaskBulkSheetListValidation(
+    sheet,
+    'task_type',
+    ['one_time', 'recurring'],
+    'Select one_time or recurring.'
+  );
+  addTaskBulkSheetListValidation(
+    sheet,
+    'recurrence',
+    ['Weekly', 'Monthly', 'Quarterly', 'Yearly'],
+    'Select Weekly, Monthly, Quarterly, or Yearly.'
+  );
+  addTaskBulkSheetListValidation(sheet, 'auto_escalate', ['Yes', 'No'], 'Select Yes or No.');
+  addTaskBulkSheetListValidation(
+    sheet,
+    'task_rollout_type',
+    ['cycle_start'],
+    'Recurring tasks use cycle_start.'
+  );
+  addTaskBulkSheetListValidation(
+    sheet,
+    'recurrence_end_type',
+    ['never', 'specific_date', 'after_occurrences'],
+    'Select never, specific_date, or after_occurrences.'
+  );
+  addTaskBulkSheetListValidation(
+    sheet,
+    'escalation_trigger',
+    ['target_date', 'due_date'],
+    'Select target_date or due_date.'
+  );
+}
+
 /** Build Excel template for Tasks bulk upload */
 export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -470,35 +533,7 @@ export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
   sheet.getColumn(4).numFmt = '@'; // Reporting Member
   sheet.getColumn(10).numFmt = '@'; // Task Owner
 
-  const taskTypeList = 'one_time,recurring';
-  const recurrenceList = 'Weekly,Monthly,Quarterly,Yearly';
-  // Task Type is now column H (after inserting Client Name).
-  (sheet as any).dataValidations.add('H2:H1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: [`"${taskTypeList}"`],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select one_time or recurring.',
-  });
-  // Recurrence is now column I.
-  (sheet as any).dataValidations.add('I2:I1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: [`"${recurrenceList}"`],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select Weekly, Monthly, Quarterly, or Yearly.',
-  });
-  // Auto Escalate is column M (after Description in L).
-  (sheet as any).dataValidations.add('M2:M1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: ['"Yes,No"'],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select Yes or No.',
-  });
+  applyTaskBulkSheetValidations(sheet);
 
   // --- New sheets (optional on upload; keeps old files compatible) ---
   // Use DB-column headers for these masters to avoid ambiguity.
@@ -1038,10 +1073,12 @@ export async function parseAndApply(
           specificWeekday = null;
         }
         if (frequency) {
-          nextRecurrenceDate = calculateNextRecurrenceDate(
-            frequency as any,
+          const cycleAnchorDate = startDate || dueDate;
+          nextRecurrenceDate = calculateNextCycleStartDate(
+            recurrenceRaw,
+            1,
             specificWeekday,
-            dueDate
+            cycleAnchorDate
           );
         }
       }

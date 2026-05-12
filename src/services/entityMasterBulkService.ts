@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { PoolClient } from 'pg';
 import { getClient, query } from '../config/database';
 import { ORG_CONSTITUTION_VALUES, ORG_CONSTITUTION_OPTIONS } from './masterDataService';
+import { applyTaskBulkSheetValidations } from './taskBulkService';
 
 const TASK_FREQUENCIES = ['Daily', 'Weekly', 'Fortnightly', 'Monthly', 'Quarterly', 'Half Yearly', 'Yearly', 'NA', 'Custom'];
 const TASK_TYPES = ['recurring', 'one_time'];
@@ -258,33 +259,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   tasksSheet.getColumn(3).numFmt = '@'; // Assigned To
   tasksSheet.getColumn(4).numFmt = '@'; // Reporting Member
   tasksSheet.getColumn(10).numFmt = '@'; // Task Owner
-  const taskTypeList = 'one_time,recurring';
-  const recurrenceList = 'Weekly,Monthly,Quarterly,Yearly';
-  // Task Type is column H; Recurrence is column I (same as task bulk template).
-  (tasksSheet as any).dataValidations.add('H2:H1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: [`"${taskTypeList}"`],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select one_time or recurring.',
-  });
-  (tasksSheet as any).dataValidations.add('I2:I1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: [`"${recurrenceList}"`],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select Weekly, Monthly, Quarterly, or Yearly.',
-  });
-  (tasksSheet as any).dataValidations.add('M2:M1000', {
-    type: 'list',
-    allowBlank: true,
-    formulae: ['"Yes,No"'],
-    showErrorMessage: true,
-    errorTitle: 'Invalid value',
-    error: 'Select Yes or No.',
-  });
+  applyTaskBulkSheetValidations(tasksSheet);
 
   // Sheet 5: Employees – for /admin/users
   const employeesSheet = workbook.addWorksheet('Employees', {

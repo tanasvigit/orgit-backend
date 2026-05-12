@@ -14,6 +14,7 @@ import {
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
 import { extractBaseTitle, formatRecurringTitle } from '../services/recurringTaskService';
+import { calculateNextCycleStartDate } from '../services/cycleStartRecurrence';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -205,36 +206,6 @@ const addMonthsClamped = (date: Date, monthsToAdd: number): Date => {
   const next = new Date(target.getFullYear(), target.getMonth(), clampedDay);
   next.setHours(date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
   return next;
-};
-
-const calculateNextRecurrenceDateLocal = (
-  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly' | 'specific_weekday',
-  specificWeekday: number | null,
-  baseDate: Date
-): Date => {
-  const base = new Date(baseDate);
-  const next = new Date(base);
-
-  switch (frequency) {
-    case 'weekly':
-      next.setDate(next.getDate() + 7);
-      return next;
-    case 'monthly':
-      return addMonthsClamped(base, 1);
-    case 'quarterly':
-      return addMonthsClamped(base, 3);
-    case 'yearly':
-      return addMonthsClamped(base, 12);
-    case 'specific_weekday': {
-      if (specificWeekday === null || specificWeekday === undefined) return next;
-      const current = next.getDay();
-      const daysUntilNext = (specificWeekday - current + 7) % 7 || 7;
-      next.setDate(next.getDate() + daysUntilNext);
-      return next;
-    }
-    default:
-      return next;
-  }
 };
 
 const buildIntervalLiteralFromDates = (
@@ -950,12 +921,17 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           ? normalizedSpecificWeekday
           : fallbackSpecificWeekday
         : null;
+    const cycleAnchorDate =
+      start_date || finalDueDate || target_date
+        ? new Date((start_date || finalDueDate || target_date) as string)
+        : null;
     const nextRecurrenceDate =
-      createRecurringTemplate && frequency && finalDueDate
-        ? calculateNextRecurrenceDateLocal(
-            frequency,
+      createRecurringTemplate && frequency && cycleAnchorDate
+        ? calculateNextCycleStartDate(
+            recurrence_type || frequency,
+            recurrence_interval || 1,
             specificWeekdayValue,
-            new Date(finalDueDate)
+            cycleAnchorDate
           )
         : null;
 
@@ -1058,13 +1034,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       finalEscalationRules ? JSON.stringify(finalEscalationRules) : null
     );
 
-    if (hasTaskRolloutType) {
+    if (hasTaskRolloutType && createRecurringTemplate) {
       insertColumns.push('task_rollout_type');
-      insertValues.push(
-        task_rollout_type === 'start_date' || task_rollout_type === 'cycle_start'
-          ? task_rollout_type
-          : 'cycle_start'
-      );
+      insertValues.push('cycle_start');
     }
 
     // Add financial fields if corresponding columns exist

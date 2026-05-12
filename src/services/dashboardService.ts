@@ -594,6 +594,10 @@ export const getTaskStatistics = async (userId: string): Promise<{
         WHERE ta.verified_at IS NULL
         AND COALESCE(ta.status, '') NOT IN ('inprogress', 'in_progress', 'overdue', 'completed', 'verified', 'scheduled')
         AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+        AND (
+          (t.target_date IS NOT NULL AND t.target_date::date <= CURRENT_DATE)
+          OR (t.target_date IS NULL AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE))
+        )
         AND t.due_date IS NOT NULL
         AND t.due_date::date >= CURRENT_DATE
         AND t.due_date::date <= CURRENT_DATE + INTERVAL '1 day' * $2
@@ -638,6 +642,10 @@ export const getTaskStatistics = async (userId: string): Promise<{
         WHERE ta_me.verified_at IS NULL
         AND COALESCE(ta_me.status, '') NOT IN ('inprogress', 'in_progress', 'overdue', 'completed', 'verified', 'scheduled')
         AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE)
+        AND (
+          (t.target_date IS NOT NULL AND t.target_date::date <= CURRENT_DATE)
+          OR (t.target_date IS NULL AND (t.start_date IS NULL OR t.start_date::date <= CURRENT_DATE))
+        )
         AND t.due_date IS NOT NULL
         AND t.due_date::date >= CURRENT_DATE
         AND t.due_date::date <= CURRENT_DATE + INTERVAL '1 day' * $2
