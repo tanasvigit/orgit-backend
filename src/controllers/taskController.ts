@@ -138,6 +138,17 @@ const getMessagesMetadataColumnExists = async (): Promise<boolean> => {
   return messagesMetadataColumnExists;
 };
 
+const normalizeTaskRecurrenceForClient = (task: any) => {
+  if (!task || task.recurrence_type !== 'annually') {
+    return task;
+  }
+
+  return {
+    ...task,
+    recurrence_type: 'yearly',
+  };
+};
+
 /** System message for task group chat; older DBs may lack messages.metadata. */
 const insertSystemMessageOptionalMetadata = async (
   client: { query: (text: string, values?: any[]) => Promise<any> },
@@ -221,16 +232,17 @@ const buildIntervalLiteralFromDates = (
 };
 
 const buildTaskWithDerivedStatus = (task: any) => {
+  const normalizedTask = normalizeTaskRecurrenceForClient(task);
   const computedStatus = getComputedStatus({
-    id: String(task.id),
-    status: task.status,
-    start_date: task.start_date,
-    due_date: task.due_date,
-    deleted_at: task.deleted_at,
+    id: String(normalizedTask.id),
+    status: normalizedTask.status,
+    start_date: normalizedTask.start_date,
+    due_date: normalizedTask.due_date,
+    deleted_at: normalizedTask.deleted_at,
   });
 
   return {
-    ...task,
+    ...normalizedTask,
     status: computedStatus.status,
     derived_status: computedStatus.derivedStatus,
   };
@@ -886,6 +898,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     const normalizedRecurrenceType =
       typeof recurrence_type === 'string' ? recurrence_type.toLowerCase() : null;
+    const recurrenceTypeForStorage =
+      normalizedRecurrenceType === 'yearly' ? 'annually' : normalizedRecurrenceType;
     // Weekly schedules are day-of-week based, so we store them as specific_weekday frequency.
     const frequency =
       normalizedRecurrenceType === 'weekly'
@@ -899,6 +913,21 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           ? 'yearly'
           : normalizedRecurrenceType
         : null;
+    let accountingYearStart: string | null = null;
+    if (
+      organizationId &&
+      (normalizedRecurrenceType === 'yearly' || normalizedRecurrenceType === 'annually')
+    ) {
+      const organizationResult = await client.query(
+        `SELECT accounting_year_start::text AS accounting_year_start
+         FROM organizations
+         WHERE id = $1
+         LIMIT 1`,
+        [organizationId]
+      );
+      accountingYearStart =
+        organizationResult.rows[0]?.accounting_year_start?.split?.('T')?.[0] || '2000-04-01';
+    }
     const normalizedSpecificWeekdayRaw =
       typeof specific_weekday === 'number'
         ? specific_weekday
@@ -931,7 +960,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             recurrence_type || frequency,
             recurrence_interval || 1,
             specificWeekdayValue,
-            cycleAnchorDate
+            cycleAnchorDate,
+            frequency === 'yearly' ? accountingYearStart : null
           )
         : null;
 
@@ -1028,7 +1058,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     insertColumns.push('recurrence_type', 'recurrence_interval', 'auto_escalate', 'escalation_rules');
     insertValues.push(
-      recurrence_type || null,
+      recurrenceTypeForStorage || null,
       recurrence_interval || 1,
       auto_escalate || false,
       finalEscalationRules ? JSON.stringify(finalEscalationRules) : null
@@ -1259,7 +1289,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
                 category || null,
                 taskCreatorId,
                 reporting_member_id || null,
-                recurrence_type || null,
+                recurrenceTypeForStorage || null,
                 recurrence_interval || 1,
                 recurrence_day_of_month || null,
                 specificWeekdayValue || null,
@@ -1299,7 +1329,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
                 category || null,
                 taskCreatorId,
                 reporting_member_id || null,
-                recurrence_type || null,
+                recurrenceTypeForStorage || null,
                 recurrence_interval || 1,
                 recurrence_day_of_month || null,
                 specificWeekdayValue || null,
@@ -1508,7 +1538,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       [conversation.id, task.id]
     );
 
-    res.status(201).json({ task: fullTaskResult.rows[0] });
+    res.status(201).json({ task: normalizeTaskRecurrenceForClient(fullTaskResult.rows[0]) });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('Create task error:', error);

@@ -210,47 +210,6 @@ function toLocalDateOnlyString(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-const addMonthsClamped = (date: Date, monthsToAdd: number): Date => {
-  const year = date.getFullYear();
-  const month = date.getMonth();
-  const day = date.getDate();
-  const target = new Date(year, month + monthsToAdd, 1);
-  const daysInTargetMonth = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
-  const clampedDay = Math.min(day, daysInTargetMonth);
-  const next = new Date(target.getFullYear(), target.getMonth(), clampedDay);
-  next.setHours(date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
-  return next;
-};
-
-function calculateNextRecurrenceDate(
-  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly' | 'specific_weekday',
-  specificWeekday: number | null,
-  baseDate: Date
-): Date {
-  const base = new Date(baseDate);
-  const next = new Date(base);
-  switch (frequency) {
-    case 'weekly':
-      next.setDate(next.getDate() + 7);
-      return next;
-    case 'monthly':
-      return addMonthsClamped(base, 1);
-    case 'quarterly':
-      return addMonthsClamped(base, 3);
-    case 'yearly':
-      return addMonthsClamped(base, 12);
-    case 'specific_weekday': {
-      if (specificWeekday == null) return next;
-      const current = next.getDay();
-      const daysUntilNext = (specificWeekday - current + 7) % 7 || 7;
-      next.setDate(next.getDate() + daysUntilNext);
-      return next;
-    }
-    default:
-      return next;
-  }
-}
-
 function getCellStr(row: ExcelJS.Row, colIdx: number): string {
   if (colIdx < 0) return '';
   const cell = row.getCell(colIdx);
@@ -571,6 +530,7 @@ export interface TaskBulkJobPayload {
   /** Optional client/entity link (resolved from "Client Name" column). */
   clientEntityId: string | null;
   description: string | null;
+  taskUnit: string | null;
   taskType: string;
   startDate: string | null;
   targetDate: string | null;
@@ -578,12 +538,21 @@ export interface TaskBulkJobPayload {
   frequency: string | null;
   specificWeekday: number | null;
   nextRecurrenceDate: string | null;
+  taskRolloutType: string | null;
+  recurrenceEndType: string | null;
+  recurrenceEndDate: string | null;
+  recurrenceAfterOccurrences: number | null;
   assigneeIds: string[];
   taskCreatorId: string;
   reportingMemberId: string | null;
   parsedFinancialValue: number | null;
   autoEscalate: boolean;
+  escalationTrigger: string | null;
+  escalationDaysBefore: number | null;
+  escalationContactIds: string[];
   escalationRules: object | null;
+  complianceId: string | null;
+  documentInstanceId: string | null;
   allAssigneeIds: string[];
   isDifferentOwner: boolean;
   idempotencyKey?: string;
@@ -607,6 +576,7 @@ export async function createTaskFromPayload(
     clientName,
     clientEntityId,
     description,
+    taskUnit,
     taskType,
     startDate,
     targetDate,
@@ -614,11 +584,20 @@ export async function createTaskFromPayload(
     frequency,
     specificWeekday,
     nextRecurrenceDate,
+    taskRolloutType,
+    recurrenceEndType,
+    recurrenceEndDate,
+    recurrenceAfterOccurrences,
     taskCreatorId,
     reportingMemberId,
     parsedFinancialValue,
     autoEscalate,
+    escalationTrigger,
+    escalationDaysBefore,
+    escalationContactIds,
     escalationRules,
+    complianceId,
+    documentInstanceId,
     allAssigneeIds,
     isDifferentOwner,
     idempotencyKey,
@@ -646,16 +625,47 @@ export async function createTaskFromPayload(
   const columnCheck = await client.query(
     `SELECT column_name FROM information_schema.columns
      WHERE table_name = 'tasks'
-     AND column_name IN ('created_by', 'creator_id', 'financial_value', 'finance_type', 'auto_escalate', 'escalation_rules', 'client_entity_id', 'client_name')`
+     AND column_name IN (
+       'created_by',
+       'creator_id',
+       'reporting_member_id',
+       'financial_value',
+       'finance_type',
+       'auto_escalate',
+       'escalation_rules',
+       'client_entity_id',
+       'client_name',
+       'task_unit',
+       'task_unit_name',
+       'compliance_id',
+       'document_instance_id',
+       'task_rollout_type',
+       'recurrence_end_type',
+       'recurrence_end_date',
+       'recurrence_after_occurrences',
+       'escalation_trigger',
+       'escalation_days_before'
+     )`
   );
   const hasCreatedBy = columnCheck.rows.some((c: any) => c.column_name === 'created_by');
   const hasCreatorId = columnCheck.rows.some((c: any) => c.column_name === 'creator_id');
+  const hasReportingMemberId = columnCheck.rows.some((c: any) => c.column_name === 'reporting_member_id');
   const hasFinancialValue = columnCheck.rows.some((c: any) => c.column_name === 'financial_value');
   const hasFinanceType = columnCheck.rows.some((c: any) => c.column_name === 'finance_type');
   const hasAutoEscalate = columnCheck.rows.some((c: any) => c.column_name === 'auto_escalate');
   const hasEscalationRules = columnCheck.rows.some((c: any) => c.column_name === 'escalation_rules');
   const hasClientEntityId = columnCheck.rows.some((c: any) => c.column_name === 'client_entity_id');
   const hasClientName = columnCheck.rows.some((c: any) => c.column_name === 'client_name');
+  const hasTaskUnit = columnCheck.rows.some((c: any) => c.column_name === 'task_unit');
+  const hasTaskUnitName = columnCheck.rows.some((c: any) => c.column_name === 'task_unit_name');
+  const hasComplianceId = columnCheck.rows.some((c: any) => c.column_name === 'compliance_id');
+  const hasDocumentInstanceId = columnCheck.rows.some((c: any) => c.column_name === 'document_instance_id');
+  const hasTaskRolloutType = columnCheck.rows.some((c: any) => c.column_name === 'task_rollout_type');
+  const hasRecurrenceEndType = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_end_type');
+  const hasRecurrenceEndDate = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_end_date');
+  const hasRecurrenceAfterOccurrences = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_after_occurrences');
+  const hasEscalationTrigger = columnCheck.rows.some((c: any) => c.column_name === 'escalation_trigger');
+  const hasEscalationDaysBefore = columnCheck.rows.some((c: any) => c.column_name === 'escalation_days_before');
 
   let insertCols = [
     'title',
@@ -708,7 +718,7 @@ export async function createTaskFromPayload(
     insertCols.push('escalation_rules');
     insertVals.push(JSON.stringify(escalationRules));
   }
-  if (reportingMemberId) {
+  if (hasReportingMemberId && reportingMemberId) {
     insertCols.push('reporting_member_id');
     insertVals.push(reportingMemberId);
   }
@@ -719,6 +729,47 @@ export async function createTaskFromPayload(
   if (hasClientName && clientName) {
     insertCols.push('client_name');
     insertVals.push(clientName);
+  }
+  if (taskUnit) {
+    if (hasTaskUnit) {
+      insertCols.push('task_unit');
+      insertVals.push(taskUnit);
+    } else if (hasTaskUnitName) {
+      insertCols.push('task_unit_name');
+      insertVals.push(taskUnit);
+    }
+  }
+  if (hasComplianceId && complianceId) {
+    insertCols.push('compliance_id');
+    insertVals.push(complianceId);
+  }
+  if (hasDocumentInstanceId && documentInstanceId) {
+    insertCols.push('document_instance_id');
+    insertVals.push(documentInstanceId);
+  }
+  if (hasTaskRolloutType && taskRolloutType) {
+    insertCols.push('task_rollout_type');
+    insertVals.push(taskRolloutType);
+  }
+  if (hasRecurrenceEndType && recurrenceEndType) {
+    insertCols.push('recurrence_end_type');
+    insertVals.push(recurrenceEndType);
+  }
+  if (hasRecurrenceEndDate && recurrenceEndDate) {
+    insertCols.push('recurrence_end_date');
+    insertVals.push(recurrenceEndDate);
+  }
+  if (hasRecurrenceAfterOccurrences && recurrenceAfterOccurrences != null) {
+    insertCols.push('recurrence_after_occurrences');
+    insertVals.push(recurrenceAfterOccurrences);
+  }
+  if (hasEscalationTrigger && escalationTrigger) {
+    insertCols.push('escalation_trigger');
+    insertVals.push(escalationTrigger);
+  }
+  if (hasEscalationDaysBefore && escalationDaysBefore != null) {
+    insertCols.push('escalation_days_before');
+    insertVals.push(escalationDaysBefore);
   }
 
   const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
@@ -853,6 +904,26 @@ export async function createTaskFromPayload(
     }
   }
 
+  if (autoEscalate && escalationContactIds.length > 0) {
+    const uniqueEscalationContacts = Array.from(new Set(escalationContactIds.filter(Boolean)));
+    for (const escalationUserId of uniqueEscalationContacts) {
+      await client.query(
+        `INSERT INTO task_assignees (task_id, user_id, status, role)
+         VALUES ($1, $2, $3, 'escalation_contact')
+         ON CONFLICT (task_id, user_id) DO NOTHING`,
+        [task.id, escalationUserId, initialAssigneeStatus]
+      );
+      if (conversationId) {
+        await client.query(
+          `INSERT INTO conversation_members (conversation_id, user_id, role)
+           VALUES ($1, $2, 'member')
+           ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+          [conversationId, escalationUserId]
+        );
+      }
+    }
+  }
+
   return { taskId: task.id, inserted: true };
 }
 
@@ -938,6 +1009,17 @@ export async function parseAndApply(
     const financialValueCol = col('financial value|financial_value');
     const descCol = col('description');
     const autoEscalateCol = col('auto escalate|auto_escalate');
+    const taskUnitCol = col('task unit|task_unit');
+    const tagsCol = col('tags');
+    const taskRolloutTypeCol = col('task roll out|task rollout|task_rollout_type');
+    const recurrenceEndTypeCol = col('recurrence end type|recurrence_end_type');
+    const recurrenceEndDateCol = col('recurrence end date|recurrence_end_date');
+    const recurrenceAfterOccurrencesCol = col('recurrence after occurrences|recurrence_after_occurrences');
+    const escalationTriggerCol = col('escalation trigger|escalation_trigger');
+    const escalationDaysBeforeCol = col('escalation days before|escalation_days_before');
+    const escalationContactsCol = col('escalation contacts|escalation_contact_ids|escalation contacts ids');
+    const complianceIdCol = col('compliance id|compliance_id');
+    const documentInstanceIdCol = col('document instance id|document_instance_id');
 
     console.log('[TaskBulk] column indices', {
       headers: (headers as any[]).filter(Boolean).map((h: any, i: number) => ({ i, h: String(h || '').trim() })),
@@ -1002,9 +1084,29 @@ export async function parseAndApply(
       const parsedFinancialValue = financialValueStr
         ? (parseFloat(financialValueStr) || null)
         : null;
+      const taskUnit = getCellStrMax(row, taskUnitCol, 255) || null;
+      const tagsText = getCellStrMax(row, tagsCol, STRING_MAX) || null;
 
       const autoEscalateStr = getCellStr(row, autoEscalateCol).toLowerCase();
       const autoEscalate = autoEscalateStr === 'yes' || autoEscalateStr === 'true' || autoEscalateStr === '1';
+      const taskRolloutTypeRaw = getCellStr(row, taskRolloutTypeCol).toLowerCase();
+      const taskRolloutType = taskRolloutTypeRaw || (taskType === 'recurring' ? 'cycle_start' : null);
+      const recurrenceEndTypeRaw = getCellStr(row, recurrenceEndTypeCol).toLowerCase();
+      const recurrenceEndType = recurrenceEndTypeRaw || null;
+      const recurrenceEndDateParsed = parseDate(getCellStr(row, recurrenceEndDateCol));
+      const recurrenceEndDate = recurrenceEndDateParsed ? toLocalDateOnlyString(recurrenceEndDateParsed) : null;
+      const recurrenceAfterOccurrencesRaw = getCellStr(row, recurrenceAfterOccurrencesCol);
+      const recurrenceAfterOccurrences = recurrenceAfterOccurrencesRaw
+        ? Number.parseInt(recurrenceAfterOccurrencesRaw, 10) || null
+        : null;
+      const escalationTriggerRaw = getCellStr(row, escalationTriggerCol).toLowerCase();
+      const escalationTrigger = escalationTriggerRaw || null;
+      const escalationDaysBeforeRaw = getCellStr(row, escalationDaysBeforeCol);
+      const escalationDaysBefore = escalationDaysBeforeRaw
+        ? Number.parseInt(escalationDaysBeforeRaw, 10) || null
+        : null;
+      const complianceId = getCellStrMax(row, complianceIdCol, 255) || null;
+      const documentInstanceId = getCellStrMax(row, documentInstanceIdCol, 255) || null;
 
       const assigneesStr = getCellStr(row, assignedToCol);
       const { userIds: assigneeIds, errors: assigneeErrors } = await resolveAssignees(
@@ -1039,10 +1141,27 @@ export async function parseAndApply(
         }
       }
 
-    // Optional: Client Name -> resolve client_entities.id (scoped to org).
-    // Backward compatible: if column is missing or blank, this stays null.
+      let escalationContactIds: string[] = [];
+      const escalationContactsStr = getCellStr(row, escalationContactsCol);
+      if (escalationContactsStr) {
+        const { userIds, errors } = await resolveAssignees(
+          client,
+          organizationId,
+          escalationContactsStr,
+          assigneeCache
+        );
+        if (errors.length > 0) {
+          pushError({ sheet: tasksSheet.name, row: r, message: errors.join('; ') });
+          continue;
+        }
+        escalationContactIds = userIds;
+      }
+
+    // Task Tag is treated as client name in current product behavior.
+    // Keep backward compatibility: prefer explicit Client Name column,
+    // otherwise use the Tags column as the client name input.
     let clientEntityId: string | null = null;
-    const clientName = getCellStrMax(row, clientNameCol, 255);
+    const clientName = getCellStrMax(row, clientNameCol, 255) || tagsText || null;
     if (clientName) {
       const ce = await client.query(
         'SELECT id FROM client_entities WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
@@ -1091,6 +1210,24 @@ export async function parseAndApply(
       }
 
       let escalationRules: any = autoEscalate ? { enabled: true } : null;
+      if (autoEscalate && escalationTrigger) {
+        escalationRules = {
+          ...(escalationRules || {}),
+          trigger: escalationTrigger,
+        };
+      }
+      if (autoEscalate && escalationDaysBefore != null) {
+        escalationRules = {
+          ...(escalationRules || {}),
+          days_before: escalationDaysBefore,
+        };
+      }
+      if (autoEscalate && escalationContactIds.length > 0) {
+        escalationRules = {
+          ...(escalationRules || {}),
+          contact_ids: escalationContactIds,
+        };
+      }
       if (isDifferentOwner && escalationRules) {
         escalationRules = {
           ...escalationRules,
@@ -1106,6 +1243,7 @@ export async function parseAndApply(
         clientName: clientName || null,
         clientEntityId,
         description,
+        taskUnit,
         taskType,
         startDate: startDate ? toLocalDateOnlyString(startDate) : null,
         targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
@@ -1113,12 +1251,21 @@ export async function parseAndApply(
         frequency,
         specificWeekday,
         nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+        taskRolloutType,
+        recurrenceEndType,
+        recurrenceEndDate,
+        recurrenceAfterOccurrences,
         assigneeIds,
         taskCreatorId,
         reportingMemberId,
         parsedFinancialValue,
         autoEscalate,
+        escalationTrigger,
+        escalationDaysBefore,
+        escalationContactIds,
         escalationRules,
+        complianceId,
+        documentInstanceId,
         allAssigneeIds: Array.from(allAssigneeIds),
         isDifferentOwner,
         sourceRowIndex: r,
@@ -1132,6 +1279,8 @@ export async function parseAndApply(
               clientName: clientName || null,
               clientEntityId,
               description,
+              taskUnit,
+              tagsText,
               taskType,
               startDate: startDate ? toLocalDateOnlyString(startDate) : null,
               targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
@@ -1139,10 +1288,19 @@ export async function parseAndApply(
               frequency,
               specificWeekday,
               nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+              taskRolloutType,
+              recurrenceEndType,
+              recurrenceEndDate,
+              recurrenceAfterOccurrences,
               taskCreatorId,
               reportingMemberId,
               parsedFinancialValue,
               autoEscalate,
+              escalationTrigger,
+              escalationDaysBefore,
+              escalationContactIds: [...escalationContactIds].sort(),
+              complianceId,
+              documentInstanceId,
               allAssigneeIds: Array.from(allAssigneeIds).sort(),
             })
           )

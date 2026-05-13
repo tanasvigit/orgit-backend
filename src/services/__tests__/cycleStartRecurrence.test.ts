@@ -1,4 +1,5 @@
 import {
+  calculateNextFinancialYearStart,
   calculateNextCycleStartDate,
   startOfCalendarMonth,
 } from '../cycleStartRecurrence';
@@ -35,5 +36,20 @@ describe('cycleStartRecurrence', () => {
     const nextCycleStart = calculateNextCycleStartDate('weekly', 1, null, currentCycleStart);
 
     expect(nextCycleStart.toDateString()).toBe(new Date(2024, 0, 8).toDateString());
+  });
+
+  it('moves yearly cycles to the next accounting year start', () => {
+    const currentCycleStart = new Date(2026, 4, 13, 3, 30, 0, 0);
+    const nextCycleStart = calculateNextFinancialYearStart(
+      currentCycleStart,
+      1,
+      '2026-04-01'
+    );
+
+    expect(nextCycleStart.getFullYear()).toBe(2027);
+    expect(nextCycleStart.getMonth()).toBe(3);
+    expect(nextCycleStart.getDate()).toBe(1);
+    expect(nextCycleStart.getHours()).toBe(3);
+    expect(nextCycleStart.getMinutes()).toBe(30);
   });
 });

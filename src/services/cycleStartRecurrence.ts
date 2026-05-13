@@ -25,6 +25,51 @@ export const startOfCalendarMonth = (date: Date): Date => {
   return next;
 };
 
+const parseAccountingYearStart = (
+  accountingYearStart: string | null | undefined
+): { monthIndex: number; day: number } | null => {
+  if (!accountingYearStart) return null;
+
+  const normalized = String(accountingYearStart).trim();
+  const fullDateMatch = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const monthDayMatch = normalized.match(/^(\d{2})-(\d{2})$/);
+
+  const month = Number(fullDateMatch?.[2] || monthDayMatch?.[1]);
+  const day = Number(fullDateMatch?.[3] || monthDayMatch?.[2]);
+  if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(day) || day < 1) {
+    return null;
+  }
+
+  const monthIndex = month - 1;
+  const daysInMonth = new Date(2000, monthIndex + 1, 0).getDate();
+  return {
+    monthIndex,
+    day: Math.min(day, daysInMonth),
+  };
+};
+
+export const calculateNextFinancialYearStart = (
+  currentCycleStart: Date,
+  recurrenceInterval: number | null | undefined,
+  accountingYearStart: string | null | undefined
+): Date => {
+  const base = new Date(currentCycleStart);
+  const interval = Math.max(1, Number(recurrenceInterval) || 1);
+  const anchor = parseAccountingYearStart(accountingYearStart) || { monthIndex: 3, day: 1 };
+
+  const next = new Date(base.getFullYear(), anchor.monthIndex, anchor.day);
+  next.setHours(base.getHours(), base.getMinutes(), base.getSeconds(), base.getMilliseconds());
+
+  if (next.getTime() <= base.getTime()) {
+    next.setFullYear(next.getFullYear() + 1);
+  }
+  if (interval > 1) {
+    next.setFullYear(next.getFullYear() + interval - 1);
+  }
+
+  return next;
+};
+
 export const normalizeCycleRecurrenceFrequency = (
   recurrenceType: string | null | undefined,
   specificWeekday: number | null | undefined
@@ -44,7 +89,8 @@ export const calculateNextCycleStartDate = (
   recurrenceType: string | null | undefined,
   recurrenceInterval: number | null | undefined,
   specificWeekday: number | null | undefined,
-  currentCycleStart: Date
+  currentCycleStart: Date,
+  accountingYearStart?: string | null
 ): Date => {
   const frequency = normalizeCycleRecurrenceFrequency(recurrenceType, specificWeekday);
   const interval = Math.max(1, Number(recurrenceInterval) || 1);
@@ -62,6 +108,9 @@ export const calculateNextCycleStartDate = (
     case 'quarterly':
       return startOfCalendarMonth(addMonthsClamped(base, 3 * interval));
     case 'yearly':
+      if (accountingYearStart) {
+        return calculateNextFinancialYearStart(base, interval, accountingYearStart);
+      }
       return startOfCalendarMonth(addMonthsClamped(base, 12 * interval));
     default:
       return startOfCalendarMonth(addMonthsClamped(base, interval));
