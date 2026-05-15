@@ -1,4 +1,9 @@
 import { getClient, query } from '../config/database';
+import {
+  getCustomFieldSchemaFromMeta,
+  mergeFieldSchemasByKey,
+  ORG_STRUCTURE_EXTENDED_FIELD_CATALOG,
+} from './organizationStructureExtendedFieldCatalog';
 
 type DbClient = {
   query: (text: string, params?: any[]) => Promise<any>;
@@ -278,12 +283,23 @@ function getFieldValuesFromMetaJson(metaJson?: Record<string, unknown> | null): 
 function buildNodeMetaJson(
   existingMetaJson: Record<string, unknown> | undefined,
   levelLabel: string,
-  fieldValues: Record<string, unknown>
+  fieldValues: Record<string, unknown>,
+  options?: { customFieldSchema?: OrganizationStructureFieldSchemaField[] }
 ): Record<string, unknown> {
+  const existing = existingMetaJson || {};
+  const entityType =
+    typeof existing.entityType === 'string' && String(existing.entityType).trim()
+      ? String(existing.entityType).trim()
+      : levelLabel;
   return {
-    ...(existingMetaJson || {}),
-    entityType: levelLabel,
+    ...existing,
+    entityType,
     fieldValues,
+    ...(options?.customFieldSchema?.length
+      ? { customFieldSchema: options.customFieldSchema }
+      : existing.customFieldSchema
+        ? { customFieldSchema: existing.customFieldSchema }
+        : {}),
   };
 }
 
@@ -1276,10 +1292,15 @@ export async function updateOrganizationStructureNode(
         input.name !== undefined ? input.name : existingNode.name,
         input.code !== undefined ? input.code : existingNode.code
       );
-      const normalizedFieldValues = validateAndNormalizeFieldValues(
+      const existingMeta =
+        (input.metaJson !== undefined ? input.metaJson : existingNode.metaJson) as Record<string, unknown>;
+      const customFieldSchema = getCustomFieldSchemaFromMeta(existingMeta);
+      const validationSchema = mergeFieldSchemasByKey(
         normalizeFieldSchema(targetLevel.fieldSchemaJson, { fallbackToDefault: true }),
-        mergedFieldValues
+        ORG_STRUCTURE_EXTENDED_FIELD_CATALOG,
+        customFieldSchema
       );
+      const normalizedFieldValues = validateAndNormalizeFieldValues(validationSchema, mergedFieldValues);
       const derivedIdentity = deriveNodeNameAndCode(
         normalizedFieldValues,
         input.name !== undefined ? input.name : existingNode.name,
@@ -1326,7 +1347,8 @@ export async function updateOrganizationStructureNode(
             buildNodeMetaJson(
               input.metaJson !== undefined ? input.metaJson : existingNode.metaJson,
               targetLevel.levelLabel,
-              normalizedFieldValues
+              normalizedFieldValues,
+              { customFieldSchema }
             )
           ),
           actorUserId,
