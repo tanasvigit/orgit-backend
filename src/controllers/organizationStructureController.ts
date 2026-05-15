@@ -121,6 +121,8 @@ export async function createOrganizationStructureNode(req: AuthRequest, res: Res
     const node = await organizationStructureService.createOrganizationStructureNode(organizationId, actorUserId, {
       relation: req.body.relation,
       referenceNodeId: req.body.referenceNodeId,
+      targetLevelNumber: req.body.targetLevelNumber,
+      targetSectionLabel: req.body.targetSectionLabel,
       name: req.body.name,
       code: req.body.code,
       description: req.body.description,

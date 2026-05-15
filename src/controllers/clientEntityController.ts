@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { query } from '../config/database';
 import {
+  getOrganizationStructureTree,
   resolveNodeReference,
   validateOrgFieldValuesForNode,
 } from '../services/organizationStructureService';
@@ -30,12 +31,18 @@ async function normalizeClientOrgAssignment(
   const schemaValues = stripOrgNodeByLevel(rawOrgFieldValues);
 
   let orgStructureNodeId = normalizeNodeId(orgStructureNodeIdInput);
-  if (!orgStructureNodeId && Object.keys(orgNodeByLevel).length > 0) {
-    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel);
-  }
 
   if (Object.keys(orgNodeByLevel).length > 0) {
     await validateOrgNodeByLevelChain(organizationId, orgNodeByLevel);
+  }
+
+  if (!orgStructureNodeId && Object.keys(orgNodeByLevel).length > 0) {
+    const tree = await getOrganizationStructureTree(organizationId, {
+      includeArchived: false,
+      includeInactive: false,
+    });
+    const levelsBelowGroup = tree.levels.filter((l) => l.levelNumber > 1 && l.isActive !== false);
+    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup);
   }
 
   if (orgStructureNodeId) {

@@ -96,6 +96,8 @@ export interface OrganizationStructureTree {
 export interface CreateOrganizationStructureNodeInput {
   relation: 'root' | 'child' | 'sibling';
   referenceNodeId?: string;
+  targetLevelNumber?: number;
+  targetSectionLabel?: string;
   name?: string;
   code?: string | null;
   description?: string;
@@ -126,6 +128,7 @@ export interface UpdateOrganizationStructureLevelInput {
 }
 
 const ROOT_LEVEL_NUMBER = 1;
+const MAX_DEFINED_LEVEL = 11;
 
 const NODE_STATUSES: OrganizationStructureNodeStatus[] = ['active', 'inactive', 'archived'];
 const DEFINITION_SOURCES: OrganizationStructureDefinitionSource[] = ['custom', 'preset'];
@@ -1114,20 +1117,47 @@ export async function createOrganizationStructureNode(
             throw new Error('Cannot add child under an inactive or archived parent');
           }
 
-          const nextLevelNumber = referenceNode.levelNumber + 1;
-          targetLevel = levels.find((level) => level.levelNumber === nextLevelNumber);
+          const sectionLabel = String(input.targetSectionLabel || input.createLevelLabel || '').trim();
+          if (!sectionLabel) {
+            throw new Error('Section is required');
+          }
+
+          if (sectionLabel.toLowerCase() === 'group') {
+            throw new Error('Group section can only be used for the root node');
+          }
+
+          const existingByLabel = levels.find(
+            (level) => level.levelLabel.trim().toLowerCase() === sectionLabel.toLowerCase()
+          );
+
+          let requestedLevelNumber: number;
+          if (existingByLabel) {
+            requestedLevelNumber = existingByLabel.levelNumber;
+            targetLevel = existingByLabel;
+          } else {
+            const maxLevelResult = await client.query(
+              `SELECT COALESCE(MAX(level_number), 1) AS max_level
+               FROM organization_structure_levels
+               WHERE organization_id = $1`,
+              [organizationId]
+            );
+            requestedLevelNumber = Number(maxLevelResult.rows[0]?.max_level ?? 1) + 1;
+
+            if (requestedLevelNumber > MAX_DEFINED_LEVEL) {
+              throw new Error(`Cannot add more than ${MAX_DEFINED_LEVEL} sections`);
+            }
+
+            targetLevel = levels.find((level) => level.levelNumber === requestedLevelNumber);
+          }
+
           parentNodeId = referenceNode.id;
 
           if (!targetLevel) {
-            if (!input.createLevelLabel) {
-              throw new Error('This level is not configured');
-            }
-
             targetLevel = await createLevelInternal(client, {
               organizationId,
               actorUserId,
-              levelNumber: nextLevelNumber,
-              levelLabel: input.createLevelLabel,
+              levelNumber: requestedLevelNumber,
+              levelLabel: sectionLabel,
               definitionSource: input.createLevelDefinitionSource,
               presetKey: input.createLevelPresetKey,
               fieldSchemaJson: input.createLevelFieldSchema,

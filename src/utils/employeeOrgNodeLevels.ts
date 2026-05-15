@@ -12,7 +12,7 @@ export function extractOrgNodeByLevel(raw: Record<string, unknown> | undefined):
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(nested as Record<string, unknown>)) {
     if (typeof value === 'string' && value.trim()) {
-      out[key] = value.trim();
+      out[key.trim()] = value.trim();
     }
   }
   return out;
@@ -24,50 +24,86 @@ export function stripOrgNodeByLevel(raw: Record<string, unknown>): Record<string
   return next;
 }
 
+function resolveLevelForKey(
+  key: string,
+  levelsBelowGroup: Array<{ levelNumber: number; levelLabel: string }>
+): { levelNumber: number; levelLabel: string } | undefined {
+  const byLabel = levelsBelowGroup.find((l) => l.levelLabel.toLowerCase() === key.toLowerCase());
+  if (byLabel) return byLabel;
+
+  const asNumber = Number(key);
+  if (Number.isFinite(asNumber)) {
+    return levelsBelowGroup.find((l) => l.levelNumber === asNumber);
+  }
+  return undefined;
+}
+
 export async function validateOrgNodeByLevelChain(
   organizationId: string,
   orgNodeByLevel: Record<string, string>
 ): Promise<void> {
-  const levelKeys = Object.keys(orgNodeByLevel)
-    .map((k) => Number(k))
-    .filter((n) => Number.isFinite(n) && n > 1)
-    .sort((a, b) => a - b);
-
-  if (levelKeys.length === 0) return;
+  if (Object.keys(orgNodeByLevel).length === 0) return;
 
   const tree = await getOrganizationStructureTree(organizationId, {
     includeArchived: false,
     includeInactive: false,
   });
 
-  let expectedParentId = tree.rootNode?.id || null;
+  const rootId = tree.rootNode?.id;
+  if (!rootId) {
+    throw new Error('Organisation group (root) is not configured');
+  }
 
-  for (const levelNumber of levelKeys) {
-    const nodeId = orgNodeByLevel[String(levelNumber)];
+  const levelsBelowGroup = tree.levels
+    .filter((l) => l.levelNumber > 1 && l.isActive !== false)
+    .sort((a, b) => a.levelNumber - b.levelNumber);
+
+  for (const [key, nodeId] of Object.entries(orgNodeByLevel)) {
+    const level = resolveLevelForKey(key, levelsBelowGroup);
+    if (!level) {
+      throw new Error(`Unknown organisation section "${key}"`);
+    }
+
     await resolveNodeReference(organizationId, nodeId, { activeOnly: false });
     const node = tree.nodes.find((n) => n.id === nodeId);
     if (!node) {
-      throw new Error(`Organisation node at level ${levelNumber} not found`);
+      throw new Error(`Organisation node for "${level.levelLabel}" not found`);
     }
-    if (node.levelNumber !== levelNumber) {
-      throw new Error(`Selected node does not belong to level ${levelNumber}`);
+    if ((node.levelLabel || '').trim().toLowerCase() !== level.levelLabel.trim().toLowerCase()) {
+      throw new Error(`Selected node does not belong to section "${level.levelLabel}"`);
     }
-    if (levelNumber === 2) {
-      if (expectedParentId && node.parentNodeId !== expectedParentId) {
-        throw new Error('Invalid organisation (level 2) selection');
-      }
-    } else if (node.parentNodeId !== expectedParentId) {
-      throw new Error(`Invalid selection for level ${levelNumber}`);
+
+    const pathIds = node.pathIds || [];
+    if (!pathIds.includes(rootId)) {
+      throw new Error(`"${level.levelLabel}" selection must be under the organisation group`);
     }
-    expectedParentId = node.id;
   }
 }
 
-export function resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel: Record<string, string>): string | null {
-  const levelKeys = Object.keys(orgNodeByLevel)
+export function resolvePrimaryFromOrgNodeByLevel(
+  orgNodeByLevel: Record<string, string>,
+  levelsBelowGroup?: Array<{ levelNumber: number; levelLabel: string }>
+): string | null {
+  if (Object.keys(orgNodeByLevel).length === 0) return null;
+
+  if (levelsBelowGroup && levelsBelowGroup.length > 0) {
+    const sorted = [...levelsBelowGroup].sort((a, b) => a.levelNumber - b.levelNumber);
+    for (let i = sorted.length - 1; i >= 0; i -= 1) {
+      const level = sorted[i];
+      const nodeId =
+        orgNodeByLevel[level.levelLabel] || orgNodeByLevel[String(level.levelNumber)];
+      if (nodeId) return nodeId;
+    }
+    return null;
+  }
+
+  const numericKeys = Object.keys(orgNodeByLevel)
     .map((k) => Number(k))
     .filter((n) => Number.isFinite(n) && n > 1)
     .sort((a, b) => a - b);
-  if (levelKeys.length === 0) return null;
-  return orgNodeByLevel[String(levelKeys[levelKeys.length - 1])] || null;
+  if (numericKeys.length > 0) {
+    return orgNodeByLevel[String(numericKeys[numericKeys.length - 1])] || null;
+  }
+
+  return Object.values(orgNodeByLevel).find((id) => Boolean(id?.trim())) || null;
 }
