@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import * as organizationService from '../services/organizationService';
+import * as organizationStructureService from '../services/organizationStructureService';
 import { ORG_CONSTITUTION_VALUES } from '../services/masterDataService';
 import { query } from '../config/database';
 
@@ -276,6 +277,27 @@ export async function getMyOrganizationData(req: AuthRequest, res: Response) {
       });
     }
 
+    let orgStructureTree: any = null;
+    let orgStructureOperationalOptions: any = null;
+    let orgStructureReportingRollups: any[] = [];
+
+    try {
+      const [tree, operationalOptions, reportingRollups] = await Promise.all([
+        organizationStructureService.getOrganizationStructureTree(organizationId, {
+          includeArchived: true,
+          includeInactive: true,
+        }),
+        organizationStructureService.getOrganizationStructureOperationalOptions(organizationId),
+        organizationStructureService.getReportingRollups(organizationId),
+      ]);
+
+      orgStructureTree = tree;
+      orgStructureOperationalOptions = operationalOptions;
+      orgStructureReportingRollups = reportingRollups;
+    } catch (orgStructureError: any) {
+      console.warn('Organization structure data unavailable for /organization/data:', orgStructureError?.message || orgStructureError);
+    }
+
     // Return organization data for document auto-fill and entity master (with new Entity Master fields)
     res.json({
       success: true,
@@ -304,11 +326,10 @@ export async function getMyOrganizationData(req: AuthRequest, res: Response) {
         orgConstitution: organization.orgConstitution,
         depotCount: organization.depotCount,
         warehouseCount: organization.warehouseCount,
-        costCentres: organization.costCentres,
-        branches: organization.branches,
-        departmentsCount: organization.departmentsCount,
-        branchesCount: organization.branchesCount,
-        costCentresCount: organization.costCentresCount,
+        orgStructure: orgStructureTree,
+        orgStructureSummary: orgStructureTree?.summary || null,
+        orgStructureOperationalOptions,
+        orgStructureReportingRollups,
         logoUrl: organization.logoUrl, // For backward compatibility
       },
     });

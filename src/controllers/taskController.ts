@@ -15,6 +15,10 @@ import {
 import { dispatchNotification } from '../services/notification-bus.service';
 import { extractBaseTitle, formatRecurringTitle } from '../services/recurringTaskService';
 import { calculateNextCycleStartDate } from '../services/cycleStartRecurrence';
+import {
+  resolveNodeReference,
+  resolveOrganizationIdForUser,
+} from '../services/organizationStructureService';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -283,18 +287,8 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
             'mobile', u.mobile,
             'profile_photo', u.profile_photo_url,
             'profile_photo_url', u.profile_photo_url,
-            'department', (
-              SELECT uo2.department 
-              FROM user_organizations uo2 
-              WHERE uo2.user_id = u.id 
-              LIMIT 1
-            ),
-            'designation', (
-              SELECT uo2.designation 
-              FROM user_organizations uo2 
-              WHERE uo2.user_id = u.id 
-              LIMIT 1
-            ),
+            'department', NULL,
+            'designation', NULL,
             'status', u.status,
             'accepted_at', ta.accepted_at,
             'has_accepted', CASE WHEN ta.accepted_at IS NOT NULL THEN true ELSE false END,
@@ -537,18 +531,8 @@ export const getTask = async (req: AuthRequest, res: Response) => {
             'mobile', u.mobile,
             'profile_photo', u.profile_photo_url,
             'profile_photo_url', u.profile_photo_url,
-            'department', (
-              SELECT uo2.department 
-              FROM user_organizations uo2 
-              WHERE uo2.user_id = u.id 
-              LIMIT 1
-            ),
-            'designation', (
-              SELECT uo2.designation 
-              FROM user_organizations uo2 
-              WHERE uo2.user_id = u.id 
-              LIMIT 1
-            ),
+            'department', NULL,
+            'designation', NULL,
             'status', u.status,
             'accepted_at', ta.accepted_at,
             'has_accepted', CASE WHEN ta.accepted_at IS NOT NULL THEN true ELSE false END,
@@ -666,8 +650,6 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       title,
       description,
       client_name,
-      task_unit,
-      task_unit_name,
       task_type,
       priority,
       assignee_ids,
@@ -695,6 +677,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       document_id,
       client_entity_id,
       end_date,
+      org_structure_node_id,
     } = req.body;
 
     if (!userId) {
@@ -767,15 +750,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     }
 
     // Get user's organization_id
-    let organizationId = req.user?.organizationId;
-    if (!organizationId) {
-      // Fetch from database if not in JWT
-      const orgResult = await client.query(
-        `SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1`,
-        [userId]
-      );
-      organizationId = orgResult.rows[0]?.organization_id || null;
-    }
+    let organizationId = await resolveOrganizationIdForUser(userId, req.user?.organizationId || null);
     
     // Check if organization_id column exists and is required
     const orgIdColumnCheck = await client.query(
@@ -790,6 +765,31 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ 
         error: 'Organization ID is required. User must be associated with an organization.' 
+      });
+    }
+
+    let orgStructureReference:
+      | {
+          nodeId: string;
+          levelKey: string;
+          levelLabel: string;
+          levelNumber: number;
+          path: Array<{
+            id: string;
+            name: string;
+            code: string;
+            levelNumber: number;
+            levelKey: string;
+            levelLabel: string;
+            status: 'active' | 'inactive' | 'archived';
+          }>;
+          pathDisplay: string;
+        }
+      | null = null;
+
+    if (organizationId && typeof org_structure_node_id === 'string' && org_structure_node_id.trim()) {
+      orgStructureReference = await resolveNodeReference(organizationId, org_structure_node_id.trim(), {
+        activeOnly: true,
       });
     }
 
@@ -869,8 +869,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
            'document_id',
            'client_entity_id',
            'client_name',
-           'task_unit',
-           'task_unit_name',
+           'org_structure_node_id',
+           'org_structure_level_key',
+           'org_structure_path',
            'end_date',
            'status'
          )`
@@ -890,8 +891,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const hasDocumentId = columnCheck.rows.some((r: any) => r.column_name === 'document_id');
     const hasClientEntityId = columnCheck.rows.some((r: any) => r.column_name === 'client_entity_id');
     const hasClientName = columnCheck.rows.some((r: any) => r.column_name === 'client_name');
-    const hasTaskUnit = columnCheck.rows.some((r: any) => r.column_name === 'task_unit');
-    const hasTaskUnitName = columnCheck.rows.some((r: any) => r.column_name === 'task_unit_name');
+    const hasOrgStructureNodeId = columnCheck.rows.some((r: any) => r.column_name === 'org_structure_node_id');
+    const hasOrgStructureLevelKey = columnCheck.rows.some((r: any) => r.column_name === 'org_structure_level_key');
+    const hasOrgStructurePath = columnCheck.rows.some((r: any) => r.column_name === 'org_structure_path');
     const hasEndDate = columnCheck.rows.some((r: any) => r.column_name === 'end_date');
     const hasStatusColumn = columnCheck.rows.some((r: any) => r.column_name === 'status');
     const hasTaskRolloutType = columnCheck.rows.some((r: any) => r.column_name === 'task_rollout_type');
@@ -1121,20 +1123,19 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertValues.push(normalizedClientName);
     }
 
-    const normalizedTaskUnit =
-      typeof task_unit === 'string' && task_unit.trim().length > 0
-        ? task_unit.trim()
-        : typeof task_unit_name === 'string' && task_unit_name.trim().length > 0
-        ? task_unit_name.trim()
-        : null;
-    if (normalizedTaskUnit) {
-      if (hasTaskUnit) {
-        insertColumns.push('task_unit');
-        insertValues.push(normalizedTaskUnit);
-      } else if (hasTaskUnitName) {
-        insertColumns.push('task_unit_name');
-        insertValues.push(normalizedTaskUnit);
-      }
+    if (hasOrgStructureNodeId) {
+      insertColumns.push('org_structure_node_id');
+      insertValues.push(orgStructureReference?.nodeId || null);
+    }
+
+    if (hasOrgStructureLevelKey) {
+      insertColumns.push('org_structure_level_key');
+      insertValues.push(orgStructureReference?.levelKey || null);
+    }
+
+    if (hasOrgStructurePath) {
+      insertColumns.push('org_structure_path');
+      insertValues.push(orgStructureReference?.path ? JSON.stringify(orgStructureReference.path) : null);
     }
 
     if (hasEndDate && end_date) {
@@ -1171,7 +1172,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertValues
     );
 
-    const task = taskResult.rows[0];
+    const task = {
+      ...taskResult.rows[0],
+      task_unit: orgStructureReference?.pathDisplay || null,
+    };
 
     // Assign task to users.
     // IMPORTANT: If no assignee_ids are provided, we keep the task unassigned (no task_assignees rows).
@@ -1861,12 +1865,54 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const organizationId = await resolveOrganizationIdForUser(userId, req.user?.organizationId || null);
+    let orgStructureReference:
+      | {
+          nodeId: string;
+          levelKey: string;
+          path: Array<{
+            id: string;
+            name: string;
+            code: string;
+            levelNumber: number;
+            levelKey: string;
+            levelLabel: string;
+            status: 'active' | 'inactive' | 'archived';
+          }>;
+          pathDisplay: string;
+        }
+      | null
+      | undefined = undefined;
+
+    if (updates.org_structure_node_id !== undefined) {
+      if (updates.org_structure_node_id) {
+        if (!organizationId) {
+          return res.status(400).json({ error: 'Organization context is required for org structure updates' });
+        }
+
+        orgStructureReference = await resolveNodeReference(organizationId, String(updates.org_structure_node_id), {
+          activeOnly: true,
+        });
+      } else {
+        orgStructureReference = null;
+      }
+    }
+
+    const columnCheck = await query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_name = 'tasks'
+         AND column_name IN ('org_structure_node_id', 'org_structure_level_key', 'org_structure_path')`
+    );
+    const hasOrgStructureNodeId = columnCheck.rows.some((row: any) => row.column_name === 'org_structure_node_id');
+    const hasOrgStructureLevelKey = columnCheck.rows.some((row: any) => row.column_name === 'org_structure_level_key');
+    const hasOrgStructurePath = columnCheck.rows.some((row: any) => row.column_name === 'org_structure_path');
+
     // Build dynamic update query
     const allowedFields = [
       'title',
       'description',
       'client_name',
-      'task_unit',
       'start_date',
       'target_date',
       'due_date',
@@ -1879,6 +1925,26 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       if (updates[field] !== undefined) {
         updateFields.push(`${field} = $${paramIndex}`);
         values.push(updates[field]);
+        paramIndex++;
+      }
+    }
+
+    if (updates.org_structure_node_id !== undefined) {
+      if (hasOrgStructureNodeId) {
+        updateFields.push(`org_structure_node_id = $${paramIndex}`);
+        values.push(orgStructureReference?.nodeId || null);
+        paramIndex++;
+      }
+
+      if (hasOrgStructureLevelKey) {
+        updateFields.push(`org_structure_level_key = $${paramIndex}`);
+        values.push(orgStructureReference?.levelKey || null);
+        paramIndex++;
+      }
+
+      if (hasOrgStructurePath) {
+        updateFields.push(`org_structure_path = $${paramIndex}`);
+        values.push(orgStructureReference?.path ? JSON.stringify(orgStructureReference.path) : null);
         paramIndex++;
       }
     }
@@ -1900,7 +1966,15 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Task not found or unauthorized' });
     }
 
-    res.json({ task: result.rows[0] });
+    res.json({
+      task: {
+        ...result.rows[0],
+        task_unit:
+          orgStructureReference !== undefined
+            ? orgStructureReference?.pathDisplay || null
+            : result.rows[0]?.task_unit ?? null,
+      },
+    });
   } catch (error: any) {
     console.error('Update task error:', error);
     res.status(500).json({ error: 'Failed to update task' });
@@ -3523,18 +3597,8 @@ export const getTaskAssignees = async (req: AuthRequest, res: Response) => {
         ta.status as assignee_status,
         ta.accepted_at,
         CASE WHEN ta.accepted_at IS NOT NULL THEN true ELSE false END as has_accepted,
-        (
-          SELECT uo.department 
-          FROM user_organizations uo 
-          WHERE uo.user_id = u.id 
-          LIMIT 1
-        ) as department,
-        (
-          SELECT uo.designation 
-          FROM user_organizations uo 
-          WHERE uo.user_id = u.id 
-          LIMIT 1
-        ) as designation,
+        NULL::text as department,
+        NULL::text as designation,
         u.status
       FROM task_assignees ta
       INNER JOIN users u ON ta.user_id = u.id

@@ -59,6 +59,7 @@ router.post(
     body('task_type').optional().isIn(['one_time', 'recurring', 'recurring_instance', 'recurring_template']),
     body('priority').optional().isIn(['high', 'medium', 'low']),
     body('assignee_ids').optional().isArray(),
+    body('org_structure_node_id').optional().isUUID(),
     body('recurrence_day_of_month').optional().isInt({ min: 1, max: 31 }),
     body('specific_weekday').optional().isInt({ min: 0, max: 6 }),
   ],

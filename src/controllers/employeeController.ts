@@ -2,15 +2,100 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { query } from '../config/database';
 import bcrypt from 'bcryptjs';
+import {
+  getOrganizationStructureTree,
+  resolveNodeReference,
+  validateOrgFieldValuesForNode,
+} from '../services/organizationStructureService';
+import { userOrganizationsHasOrgFieldValues } from '../utils/orgFieldValuesColumn';
+import {
+  EMPLOYEE_ORG_NODE_BY_LEVEL_KEY,
+  extractOrgNodeByLevel,
+  resolvePrimaryFromOrgNodeByLevel,
+  stripOrgNodeByLevel,
+  validateOrgNodeByLevelChain,
+} from '../utils/employeeOrgNodeLevels';
+
+async function normalizeEmployeeOrgAssignment(
+  organizationId: string,
+  primaryOrgNodeIdInput: unknown,
+  orgFieldValuesInput: unknown
+): Promise<{ primaryOrgNodeId: string | null; orgFieldValues: Record<string, unknown> }> {
+  const rawOrgFieldValues = parseOrgFieldValuesInput(orgFieldValuesInput) || {};
+  const orgNodeByLevel = extractOrgNodeByLevel(rawOrgFieldValues);
+  const schemaValues = stripOrgNodeByLevel(rawOrgFieldValues);
+
+  let primaryOrgNodeId = normalizeNodeId(primaryOrgNodeIdInput);
+  if (!primaryOrgNodeId && Object.keys(orgNodeByLevel).length > 0) {
+    primaryOrgNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel);
+  }
+
+  if (Object.keys(orgNodeByLevel).length > 0) {
+    await validateOrgNodeByLevelChain(organizationId, orgNodeByLevel);
+  }
+
+  if (primaryOrgNodeId) {
+    await resolveNodeReference(organizationId, primaryOrgNodeId, { activeOnly: false });
+  }
+
+  let normalizedSchema: Record<string, unknown> = {};
+  if (primaryOrgNodeId && Object.keys(schemaValues).length > 0) {
+    normalizedSchema = await validateOrgFieldValuesForNode(
+      organizationId,
+      primaryOrgNodeId,
+      schemaValues
+    );
+  }
+
+  const orgFieldValues =
+    Object.keys(orgNodeByLevel).length > 0
+      ? { ...normalizedSchema, [EMPLOYEE_ORG_NODE_BY_LEVEL_KEY]: orgNodeByLevel }
+      : normalizedSchema;
+
+  return { primaryOrgNodeId, orgFieldValues };
+}
+
+function parseOrgFieldValuesInput(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return { ...(value as Record<string, unknown>) };
+}
+
+const normalizeNodeId = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+};
+
+const normalizeNodeIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+
+  return Array.from(
+    new Set(
+      value
+        .map((item) => (typeof item === 'string' ? item.trim() : ''))
+        .filter(Boolean)
+    )
+  );
+};
 
 /**
  * Add employee to organization by mobile number
  */
 export const addEmployee = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
     const organizationId = req.user?.organizationId;
-    const { mobile, name, department, designation, reportingTo, level, password } = req.body;
+    const {
+      mobile,
+      name,
+      reportingTo,
+      password,
+      primaryOrgNodeId,
+      secondaryOrgNodeIds,
+      orgFieldValues,
+    } = req.body;
 
     if (!organizationId) {
       return res.status(403).json({
@@ -31,6 +116,21 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
         success: false,
         error: 'Employee name is required',
       });
+    }
+
+    const orgAssignment = await normalizeEmployeeOrgAssignment(
+      organizationId,
+      primaryOrgNodeId,
+      orgFieldValues
+    );
+    const normalizedPrimaryOrgNodeId = orgAssignment.primaryOrgNodeId;
+    const normalizedOrgFieldValues = orgAssignment.orgFieldValues;
+    const normalizedSecondaryOrgNodeIds = normalizeNodeIds(secondaryOrgNodeIds).filter(
+      (nodeId) => nodeId !== normalizedPrimaryOrgNodeId
+    );
+
+    for (const nodeId of normalizedSecondaryOrgNodeIds) {
+      await resolveNodeReference(organizationId, nodeId, { activeOnly: false });
     }
 
     // Check if user already exists
@@ -106,18 +206,67 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
       );
     }
 
-    // Add user to organization with department/designation/reporting_to/level
-    await query(
-      `INSERT INTO user_organizations (id, user_id, organization_id, department, designation, reporting_to, level, created_at, updated_at)
-       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       ON CONFLICT (user_id, organization_id) 
-       DO UPDATE SET department = $3, designation = $4, reporting_to = $5, level = $6, updated_at = CURRENT_TIMESTAMP`,
-      [employeeUserId, organizationId, department || null, designation || null, reportingTo || null, level || null]
-    );
+    const hasOrgFvColumn = await userOrganizationsHasOrgFieldValues();
+    if (hasOrgFvColumn) {
+      await query(
+        `INSERT INTO user_organizations (
+           id, user_id, organization_id, reporting_to, primary_org_node_id,
+           secondary_org_node_ids, org_field_values, created_at, updated_at
+         )
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::uuid[], $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id, organization_id)
+         DO UPDATE SET
+           reporting_to = $3,
+           primary_org_node_id = $4,
+           secondary_org_node_ids = $5::uuid[],
+           org_field_values = $6::jsonb,
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          employeeUserId,
+          organizationId,
+          reportingTo || null,
+          normalizedPrimaryOrgNodeId,
+          normalizedSecondaryOrgNodeIds,
+          JSON.stringify(normalizedOrgFieldValues),
+        ]
+      );
+    } else {
+      await query(
+        `INSERT INTO user_organizations (
+           id, user_id, organization_id, reporting_to, primary_org_node_id,
+           secondary_org_node_ids, created_at, updated_at
+         )
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::uuid[], CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (user_id, organization_id)
+         DO UPDATE SET
+           reporting_to = $3,
+           primary_org_node_id = $4,
+           secondary_org_node_ids = $5::uuid[],
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          employeeUserId,
+          organizationId,
+          reportingTo || null,
+          normalizedPrimaryOrgNodeId,
+          normalizedSecondaryOrgNodeIds,
+        ]
+      );
+    }
 
     // Get the created/updated user
     const userResult = await query(
-      `SELECT u.id, u.mobile, u.name, u.role, u.status, uo.department, uo.designation, uo.reporting_to, uo.level
+      `SELECT
+         u.id,
+         u.mobile,
+         u.name,
+         u.role,
+         u.status,
+         NULL::text AS department,
+         NULL::text AS designation,
+         uo.reporting_to,
+         uo.primary_org_node_id,
+         uo.secondary_org_node_ids,
+         NULL::text AS level
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
        WHERE u.id = $1 AND uo.organization_id = $2`,
@@ -145,7 +294,6 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
  */
 export const getEmployees = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
     const organizationId = req.user?.organizationId;
 
     if (!organizationId) {
@@ -155,7 +303,13 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    const result = await query(
+    const hasOrgFvColumn = await userOrganizationsHasOrgFieldValues();
+    const orgFvSelect = hasOrgFvColumn
+      ? 'uo.org_field_values'
+      : `'{}'::jsonb AS org_field_values`;
+
+    const [result, orgTree] = await Promise.all([
+      query(
       `SELECT 
         u.id,
         u.mobile,
@@ -163,10 +317,13 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
         u.role,
         u.status,
         u.profile_photo_url,
-        uo.department,
-        uo.designation,
+        NULL::text AS department,
+        NULL::text AS designation,
         uo.reporting_to,
-        uo.level,
+        uo.primary_org_node_id,
+        uo.secondary_org_node_ids,
+        ${orgFvSelect},
+        NULL::text AS level,
         reporter.name as reporting_to_name,
         u.created_at
        FROM users u
@@ -175,11 +332,34 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
        WHERE uo.organization_id = $1 AND u.role IN ('admin', 'employee')
        ORDER BY u.role DESC, u.name ASC`,
       [organizationId]
-    );
+      ),
+      getOrganizationStructureTree(organizationId, {
+        includeArchived: true,
+        includeInactive: true,
+      }),
+    ]);
+
+    const nodeById = new Map(orgTree.nodes.map((node) => [node.id, node]));
 
     res.json({
       success: true,
-      data: result.rows,
+      data: result.rows.map((row: any) => {
+        const primaryNode = row.primary_org_node_id ? nodeById.get(row.primary_org_node_id) : null;
+        const secondaryNodeIds = Array.isArray(row.secondary_org_node_ids) ? row.secondary_org_node_ids : [];
+        const secondaryNodes = secondaryNodeIds
+          .map((nodeId: string) => nodeById.get(nodeId))
+          .filter(Boolean);
+
+        return {
+          ...row,
+          primary_org_node_id: row.primary_org_node_id,
+          secondary_org_node_ids: secondaryNodeIds,
+          primary_org_path: primaryNode?.pathDisplay || null,
+          primary_org_node_name: primaryNode?.name || null,
+          primary_org_level_label: primaryNode?.levelLabel || null,
+          secondary_org_paths: secondaryNodes.map((node: any) => node?.pathDisplay),
+        };
+      }),
     });
   } catch (error: any) {
     console.error('Error getting employees:', error);
@@ -195,10 +375,9 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
  */
 export const updateEmployee = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
     const organizationId = req.user?.organizationId;
     const { id } = req.params;
-    const { name, department, designation, reportingTo, level, status } = req.body;
+    const { name, reportingTo, status, primaryOrgNodeId, secondaryOrgNodeIds, orgFieldValues } = req.body;
 
     if (!organizationId) {
       return res.status(403).json({
@@ -235,21 +414,114 @@ export const updateEmployee = async (req: AuthRequest, res: Response) => {
       );
     }
 
-    // Update organization details
-    await query(
-      `UPDATE user_organizations 
-       SET department = COALESCE($1, department), 
-           designation = COALESCE($2, designation),
-           reporting_to = $3,
-           level = COALESCE($4, level),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE user_id = $5 AND organization_id = $6`,
-      [department || null, designation || null, reportingTo || null, level || null, id, organizationId]
-    );
+    const primaryOrgNodeIdProvided = primaryOrgNodeId !== undefined || orgFieldValues !== undefined;
+    const secondaryOrgNodeIdsProvided = secondaryOrgNodeIds !== undefined;
+    const orgFieldValuesProvided = orgFieldValues !== undefined || primaryOrgNodeId !== undefined;
 
-    // Get updated employee
+    let normalizedPrimaryOrgNodeId: string | null | undefined =
+      primaryOrgNodeId !== undefined ? normalizeNodeId(primaryOrgNodeId) : undefined;
+    let normalizedOrgFieldValuesJson: string | null = null;
+
+    if (orgFieldValuesProvided) {
+      const existingPrimary =
+        normalizedPrimaryOrgNodeId === undefined
+          ? (
+              await query(
+                'SELECT primary_org_node_id FROM user_organizations WHERE user_id = $1 AND organization_id = $2',
+                [id, organizationId]
+              )
+            ).rows[0]?.primary_org_node_id || null
+          : normalizedPrimaryOrgNodeId;
+
+      const orgAssignment = await normalizeEmployeeOrgAssignment(
+        organizationId,
+        primaryOrgNodeId !== undefined ? primaryOrgNodeId : existingPrimary,
+        orgFieldValues
+      );
+      normalizedPrimaryOrgNodeId = orgAssignment.primaryOrgNodeId;
+      normalizedOrgFieldValuesJson = JSON.stringify(orgAssignment.orgFieldValues);
+    }
+
+    const normalizedSecondaryOrgNodeIds =
+      secondaryOrgNodeIds !== undefined
+        ? normalizeNodeIds(secondaryOrgNodeIds).filter((nodeId) => nodeId !== normalizedPrimaryOrgNodeId)
+        : undefined;
+
+    if (normalizedSecondaryOrgNodeIds) {
+      for (const nodeId of normalizedSecondaryOrgNodeIds) {
+        await resolveNodeReference(organizationId, nodeId, { activeOnly: false });
+      }
+    }
+
+    const hasOrgFvColumn = await userOrganizationsHasOrgFieldValues();
+    if (hasOrgFvColumn) {
+      await query(
+        `UPDATE user_organizations 
+         SET reporting_to = $1,
+             primary_org_node_id = CASE WHEN $2::boolean THEN $3::uuid ELSE primary_org_node_id END,
+             secondary_org_node_ids = CASE
+               WHEN $4::boolean THEN COALESCE($5::uuid[], ARRAY[]::uuid[])
+               ELSE secondary_org_node_ids
+             END,
+             org_field_values = CASE
+               WHEN $6::boolean THEN $7::jsonb
+               ELSE org_field_values
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $8 AND organization_id = $9`,
+        [
+          reportingTo || null,
+          primaryOrgNodeIdProvided,
+          normalizedPrimaryOrgNodeId ?? null,
+          secondaryOrgNodeIdsProvided,
+          normalizedSecondaryOrgNodeIds ?? null,
+          orgFieldValuesProvided,
+          normalizedOrgFieldValuesJson,
+          id,
+          organizationId,
+        ]
+      );
+    } else {
+      await query(
+        `UPDATE user_organizations 
+         SET reporting_to = $1,
+             primary_org_node_id = CASE WHEN $2::boolean THEN $3::uuid ELSE primary_org_node_id END,
+             secondary_org_node_ids = CASE
+               WHEN $4::boolean THEN COALESCE($5::uuid[], ARRAY[]::uuid[])
+               ELSE secondary_org_node_ids
+             END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $5 AND organization_id = $6`,
+        [
+          reportingTo || null,
+          primaryOrgNodeIdProvided,
+          normalizedPrimaryOrgNodeId ?? null,
+          secondaryOrgNodeIdsProvided,
+          normalizedSecondaryOrgNodeIds ?? null,
+          id,
+          organizationId,
+        ]
+      );
+    }
+
+    const orgFvSelect = hasOrgFvColumn
+      ? 'uo.org_field_values'
+      : `'{}'::jsonb AS org_field_values`;
+
     const result = await query(
-      `SELECT u.id, u.mobile, u.name, u.role, u.status, uo.department, uo.designation, uo.reporting_to, uo.level
+      `SELECT
+         u.id,
+         u.mobile,
+         u.name,
+         u.role,
+         u.status,
+         NULL::text AS department,
+         NULL::text AS designation,
+         uo.reporting_to,
+         uo.primary_org_node_id,
+         uo.secondary_org_node_ids,
+         ${orgFvSelect},
+         NULL::text AS level
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
        WHERE u.id = $1 AND uo.organization_id = $2`,
@@ -335,7 +607,6 @@ export const resetEmployeePassword = async (req: AuthRequest, res: Response) => 
  */
 export const removeEmployee = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
     const organizationId = req.user?.organizationId;
     const { id } = req.params;
 

@@ -1,13 +1,3 @@
--- Add task_unit column to tasks so UI Task Unit field is persisted.
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1
-    FROM information_schema.columns
-    WHERE table_name = 'tasks'
-      AND column_name = 'task_unit'
-  ) THEN
-    ALTER TABLE tasks ADD COLUMN task_unit VARCHAR(255);
-  END IF;
-END $$;
+-- Legacy migration retired.
+-- Task unit storage has been replaced by org_structure_node_id/org_structure_path.
 

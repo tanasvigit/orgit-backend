@@ -1,6 +1,5 @@
--- Entity list (clients) and the services provided to them
--- Supports Admin-maintained matrix:
--- NAME OF THE CLIENT | ENTITY TYPE | COST CENTRE | <service columns...>
+-- Entity list (clients) and the services provided to them.
+-- Clients are assigned directly to organization hierarchy nodes.
 
 -- Client entities (per organization)
 CREATE TABLE IF NOT EXISTS client_entities (
@@ -8,7 +7,8 @@ CREATE TABLE IF NOT EXISTS client_entities (
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     entity_type VARCHAR(100), -- e.g. Individual, Company, Partnership (kept flexible)
-    cost_centre_id UUID REFERENCES cost_centres(id) ON DELETE SET NULL,
+    org_structure_node_id UUID REFERENCES organization_structure_nodes(id) ON DELETE SET NULL,
+    org_structure_path JSONB,
     pan VARCHAR(50),
     reporting_partner_mobile VARCHAR(20),
     status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS client_entities (
     UNIQUE(organization_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_client_entities_org_id ON client_entities(organization_id);
-CREATE INDEX IF NOT EXISTS idx_client_entities_cost_centre_id ON client_entities(cost_centre_id);
+CREATE INDEX IF NOT EXISTS idx_client_entities_org_structure_node_id ON client_entities(org_structure_node_id);
 
 -- Per-client service settings (one row per client per service)
 CREATE TABLE IF NOT EXISTS client_entity_services (

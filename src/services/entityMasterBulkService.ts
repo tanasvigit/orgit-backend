@@ -4,6 +4,7 @@ import { PoolClient } from 'pg';
 import { getClient, query } from '../config/database';
 import { ORG_CONSTITUTION_VALUES, ORG_CONSTITUTION_OPTIONS } from './masterDataService';
 import { applyTaskBulkSheetValidations } from './taskBulkService';
+import { resolveNodeReference } from './organizationStructureService';
 
 const TASK_FREQUENCIES = ['Daily', 'Weekly', 'Fortnightly', 'Monthly', 'Quarterly', 'Half Yearly', 'Yearly', 'NA', 'Custom'];
 const TASK_TYPES = ['recurring', 'one_time'];
@@ -46,25 +47,12 @@ const ENTITY_MASTER_VERTICAL_FIELDS: { label: string; key: string }[] = [
   { label: 'Registration Number of the Entity', key: 'cin' },
   { label: 'PAN of the Entity', key: 'pan' },
   { label: 'GST Number', key: 'gst' },
-  { label: 'Branches', key: '_branches' },
-  { label: 'Departments', key: '_departments' },
-  { label: 'Cost Centre', key: '_cost_centre' },
-  { label: 'Cost Centre 1', key: '_cost_centre_1' },
-  { label: 'Cost Centre 1 Short Name', key: '_cost_centre_1_short' },
-  { label: 'Cost Centre 2', key: '_cost_centre_2' },
-  { label: 'Cost Centre 2 Short Name', key: '_cost_centre_2_short' },
-  { label: 'Depot (count; list on Depot sheet)', key: 'depot_count' },
-  { label: 'Warehouse (count; list on Warehouse sheet)', key: 'warehouse_count' },
   { label: 'Country', key: 'country_name' },
   { label: 'State', key: 'state_name' },
   { label: 'City', key: 'city_name' },
   { label: 'Pin Code', key: 'pin_code' },
   { label: 'Address Line 1', key: 'address_line1' },
   { label: 'Address Line 2', key: 'address_line2' },
-  { label: 'Name of the Branch', key: '_branch_name' },
-  { label: 'Branch Short Name', key: '_branch_short_name' },
-  { label: 'Address of the Branch', key: '_branch_address' },
-  { label: 'Branch GST Number', key: '_branch_gst' },
 ];
 
 /**
@@ -114,10 +102,6 @@ const PHONE_PIN_MAX = 20;
 export interface UploadResult {
   updated: {
     organizations: number;
-    cost_centres: number;
-    branches: number;
-    depots: number;
-    warehouses: number;
     task_services: number;
     client_entities: number;
     client_entity_services: number;
@@ -128,7 +112,7 @@ export interface UploadResult {
 
 /**
  * Build Excel template workbook "OrgIt Settings" – one workbook with all updated sheets.
- * Sheet order: Entity Master Data (Org), Entity List, Service List, Employees, Cost Centres, Branches.
+ * Sheet order: Entity Master Data (Org), Entity List, Service List, Tasks, Employees.
  * Sheet names match sections: /admin/entity-master, /admin/entities, /admin/services, /admin/users.
  * Entity List compliance columns are driven by task_services (recurring) in DB only; no initial list.
  */
@@ -171,9 +155,8 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
     { header: 'STATUS', key: 'status', width: 14 },
-    { header: 'COST CENTRE', key: 'cost_centre_name', width: 18 },
-    { header: 'DEPOT', key: 'depot_name', width: 18 },
-    { header: 'WAREHOUSE', key: 'warehouse_name', width: 18 },
+    { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
+    { header: 'ORG NODE NAME', key: 'org_node_name', width: 22 },
     { header: 'PAN', key: 'pan', width: 16 },
     { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
     ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
@@ -182,7 +165,8 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   entityListSheet.getRow(1).font = { bold: true };
   const freqList = TASK_FREQUENCIES.join(',');
   // Dropdown only for compliance columns (after fixed entity columns).
-  for (let c = 9; c <= entityListCols.length; c++) {
+  const entityListComplianceStartCol = 8;
+  for (let c = entityListComplianceStartCol; c <= entityListCols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (entityListSheet as any).dataValidations.add(range, {
       type: 'list',
@@ -242,7 +226,6 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     { header: 'Financial Value', key: 'financial_value', width: 16 },
     { header: 'Description', key: 'description', width: 40 },
     { header: 'Auto Escalate', key: 'auto_escalate', width: 14 },
-    { header: 'Task Unit', key: 'task_unit', width: 18 },
     { header: 'Tags', key: 'tags', width: 24 },
     { header: 'Task Roll Out', key: 'task_rollout_type', width: 20 },
     { header: 'Recurrence End Type', key: 'recurrence_end_type', width: 22 },
@@ -268,61 +251,13 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   employeesSheet.columns = [
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
-    { header: 'DEPARTMENT', key: 'department', width: 22 },
-    { header: 'DESIGNATON', key: 'designation', width: 25 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'LEVEL', key: 'level', width: 10 },
+    { header: 'PRIMARY ORG NODE', key: 'primary_org_node', width: 24 },
   ];
   employeesSheet.getRow(1).font = { bold: true };
 
-  // Sheet 5: Cost Centres
-  const ccSheet = workbook.addWorksheet('Cost Centres', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Cost Centres' },
-  });
-  ccSheet.columns = [
-    { header: 'Cost Centre Name', key: 'name', width: 28 },
-    { header: 'Short Name', key: 'short_name', width: 18 },
-    { header: 'Display Order', key: 'display_order', width: 14 },
-  ];
-  ccSheet.getRow(1).font = { bold: true };
-
-  // Sheet 6: Branches
-  const branchesSheet = workbook.addWorksheet('Branches', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Branches' },
-  });
-  branchesSheet.columns = [
-    { header: 'Branch Name', key: 'name', width: 28 },
-    { header: 'Short Name', key: 'short_name', width: 18 },
-    { header: 'Address', key: 'address', width: 40 },
-    { header: 'GST Number', key: 'gst_number', width: 20 },
-  ];
-  branchesSheet.getRow(1).font = { bold: true };
-
-  // Sheet 7: Depot
-  const depotSheet = workbook.addWorksheet('Depot', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Depot' },
-  });
-  depotSheet.columns = [
-    { header: 'Depot Name', key: 'name', width: 28 },
-    { header: 'Short Name', key: 'short_name', width: 18 },
-    { header: 'Display Order', key: 'display_order', width: 14 },
-  ];
-  depotSheet.getRow(1).font = { bold: true };
-
-  // Sheet 8: Warehouse
-  const warehouseSheet = workbook.addWorksheet('Warehouse', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Warehouse' },
-  });
-  warehouseSheet.columns = [
-    { header: 'Warehouse Name', key: 'name', width: 28 },
-    { header: 'Short Name', key: 'short_name', width: 18 },
-    { header: 'Address', key: 'address', width: 40 },
-    { header: 'GST Number', key: 'gst_number', width: 20 },
-  ];
-  warehouseSheet.getRow(1).font = { bold: true };
-
   const buffer = await workbook.xlsx.writeBuffer();
-  console.log('[EntityMasterTemplate] Built OrgIt Settings workbook (9 sheets: Entity Master Data (Org), Entity List, Service List, Tasks, Employees, Cost Centres, Branches, Depot, Warehouse)');
+  console.log('[EntityMasterTemplate] Built OrgIt Settings workbook (5 sheets: Entity Master Data (Org), Entity List, Service List, Tasks, Employees)');
   return buffer as ExcelJS.Buffer;
 }
 
@@ -366,7 +301,7 @@ export async function buildEntityMasterOnlyTemplate(): Promise<ExcelJS.Buffer> {
 /**
  * Build Excel template with only the Employee sheet.
  * Single sheet for use on /admin/users (Employee management) page.
- * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, DEPARTMENT, DESIGNATON, REPORTING TO, LEVEL.
+ * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG NODE.
  */
 export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -379,10 +314,8 @@ export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
   employeesSheet.columns = [
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
-    { header: 'DEPARTMENT', key: 'department', width: 22 },
-    { header: 'DESIGNATON', key: 'designation', width: 25 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'LEVEL', key: 'level', width: 10 },
+    { header: 'PRIMARY ORG NODE', key: 'primary_org_node', width: 24 },
   ];
   employeesSheet.getRow(1).font = { bold: true };
 
@@ -442,7 +375,7 @@ export async function buildServiceListOnlyTemplate(): Promise<ExcelJS.Buffer> {
 /**
  * Build Excel template with only the Entity List sheet.
  * Compliance columns come from task_services (recurring) in DB only; no initial list.
- * Except first 3, compliance columns have frequency dropdown: Daily, Weekly, Fortnightly, Monthly, etc.
+ * After fixed entity columns, compliance columns have frequency dropdown: Daily, Weekly, Fortnightly, Monthly, etc.
  */
 export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
   const complianceHeaders = await getRecurringTaskServiceTitles(null);
@@ -457,9 +390,8 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
     { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
     { header: 'STATUS', key: 'status', width: 14 },
-    { header: 'COST CENTRE', key: 'cost_centre_name', width: 18 },
-    { header: 'DEPOT', key: 'depot_name', width: 18 },
-    { header: 'WAREHOUSE', key: 'warehouse_name', width: 18 },
+    { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
+    { header: 'ORG NODE NAME', key: 'org_node_name', width: 22 },
     { header: 'PAN', key: 'pan', width: 16 },
     { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
     ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
@@ -469,7 +401,8 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
 
   // Dropdown for all compliance columns (after fixed entity columns)
   const freqList = TASK_FREQUENCIES.join(',');
-  for (let c = 9; c <= cols.length; c++) {
+  const entityListOnlyComplianceStartCol = 8;
+  for (let c = entityListOnlyComplianceStartCol; c <= cols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (sheet as any).dataValidations.add(range, {
       type: 'list',
@@ -645,40 +578,37 @@ async function resolveOrganizationId(client: any, orgName: string): Promise<stri
   return r.rows.length > 0 ? r.rows[0].id : null;
 }
 
-async function resolveCostCentreId(client: any, organizationId: string, ccName: string): Promise<string | null> {
-  if (!ccName || !organizationId) return null;
+async function resolveOrgStructureNodeId(client: any, organizationId: string, raw: string): Promise<string | null> {
+  if (!raw || !organizationId) return null;
+  const trimmed = raw.trim();
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(trimmed)) {
+    const r = await client.query(
+      `SELECT id FROM organization_structure_nodes
+       WHERE organization_id = $1 AND id = $2::uuid
+       LIMIT 1`,
+      [organizationId, trimmed]
+    );
+    return r.rows.length > 0 ? r.rows[0].id : null;
+  }
   const r = await client.query(
-    'SELECT id FROM cost_centres WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-    [organizationId, ccName]
+    `SELECT id FROM organization_structure_nodes
+     WHERE organization_id = $1
+       AND status = 'active'
+       AND LOWER(TRIM(name)) = LOWER($2)
+     ORDER BY level_number DESC
+     LIMIT 1`,
+    [organizationId, trimmed]
   );
   return r.rows.length > 0 ? r.rows[0].id : null;
 }
 
-async function resolveDepotId(client: any, organizationId: string, depotName: string): Promise<string | null> {
-  if (!depotName || !organizationId) return null;
+async function orgPathJsonForNode(organizationId: string, nodeId: string): Promise<string | null> {
   try {
-    const r = await client.query(
-      'SELECT id FROM depots WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-      [organizationId, depotName]
-    );
-    return r.rows.length > 0 ? r.rows[0].id : null;
-  } catch (err: any) {
-    if (err.code === '42P01') return null; // depots table does not exist
-    throw err;
-  }
-}
-
-async function resolveWarehouseId(client: any, organizationId: string, warehouseName: string): Promise<string | null> {
-  if (!warehouseName || !organizationId) return null;
-  try {
-    const r = await client.query(
-      'SELECT id FROM warehouses WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-      [organizationId, warehouseName]
-    );
-    return r.rows.length > 0 ? r.rows[0].id : null;
-  } catch (err: any) {
-    if (err.code === '42P01') return null; // warehouses table does not exist
-    throw err;
+    const ref = await resolveNodeReference(organizationId, nodeId, { activeOnly: false });
+    return ref.path?.length ? JSON.stringify(ref.path) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -789,7 +719,7 @@ export async function parseAndApply(
   isSuperAdmin: boolean
 ): Promise<UploadResult> {
   const result: UploadResult = {
-    updated: { organizations: 0, cost_centres: 0, branches: 0, depots: 0, warehouses: 0, task_services: 0, client_entities: 0, client_entity_services: 0, employees: 0 },
+    updated: { organizations: 0, task_services: 0, client_entities: 0, client_entity_services: 0, employees: 0 },
     errors: [],
   };
 
@@ -817,7 +747,7 @@ export async function parseAndApply(
 
     // Bulk: caches for repeated lookups in same upload
     const orgIdCache = new Map<string, string>();
-    const costCentreCache = new Map<string, string>();
+    const orgNodeCache = new Map<string, string>();
     const clientEntityCache = new Map<string, string>();
     const taskServiceCache = new Map<string, string>();
     const resolveOrgIdCached = async (name: string): Promise<string | null> => {
@@ -828,28 +758,12 @@ export async function parseAndApply(
       if (id) orgIdCache.set(key, id);
       return id;
     };
-    const resolveCostCentreCached = async (organizationId: string, ccName: string): Promise<string | null> => {
-      const key = `cc|${organizationId}|${(ccName || '').trim().toLowerCase()}`;
-      if (!ccName?.trim()) return null;
-      if (costCentreCache.has(key)) return costCentreCache.get(key)!;
-      const id = await resolveCostCentreId(client, organizationId, ccName);
-      if (id) costCentreCache.set(key, id);
-      return id;
-    };
-    const resolveDepotCached = async (organizationId: string, depotName: string): Promise<string | null> => {
-      const key = `depot|${organizationId}|${(depotName || '').trim().toLowerCase()}`;
-      if (!depotName?.trim()) return null;
-      if (costCentreCache.has(key)) return costCentreCache.get(key)!; // reuse cache map
-      const id = await resolveDepotId(client, organizationId, depotName);
-      if (id) costCentreCache.set(key, id);
-      return id;
-    };
-    const resolveWarehouseCached = async (organizationId: string, warehouseName: string): Promise<string | null> => {
-      const key = `wh|${organizationId}|${(warehouseName || '').trim().toLowerCase()}`;
-      if (!warehouseName?.trim()) return null;
-      if (costCentreCache.has(key)) return costCentreCache.get(key)!;
-      const id = await resolveWarehouseId(client, organizationId, warehouseName);
-      if (id) costCentreCache.set(key, id);
+    const resolveOrgNodeCached = async (organizationId: string, hint: string): Promise<string | null> => {
+      const key = `node|${organizationId}|${(hint || '').trim().toLowerCase()}`;
+      if (!hint?.trim()) return null;
+      if (orgNodeCache.has(key)) return orgNodeCache.get(key)!;
+      const id = await resolveOrgStructureNodeId(client, organizationId, hint);
+      if (id) orgNodeCache.set(key, id);
       return id;
     };
     const resolveClientEntityCached = async (organizationId: string, clientName: string): Promise<string | null> => {
@@ -924,12 +838,7 @@ export async function parseAndApply(
           const field = ENTITY_MASTER_VERTICAL_FIELDS.find((f) => f.label.trim().toLowerCase() === label);
           const key = field?.key ?? ENTITY_MASTER_LEGACY_LABELS[label];
           if (key && !key.startsWith('_')) {
-            if (key === 'depot_count' || key === 'warehouse_count') {
-              const num = !cellBStr ? null : parseInt(cellBStr, 10);
-              vals[key] = Number.isNaN(num) ? null : num;
-            } else {
-              vals[key] = cellBStr === '' ? '' : cellBStr;
-            }
+            vals[key] = cellBStr === '' ? '' : cellBStr;
           }
         }
         const name = (vals.name != null && vals.name !== '') ? String(vals.name).slice(0, NAME_MAX) : '';
@@ -967,8 +876,6 @@ export async function parseAndApply(
                 const pan = (vals.pan != null && vals.pan !== '') ? String(vals.pan) : '';
                 const gst = (vals.gst != null && vals.gst !== '') ? String(vals.gst) : '';
                 const cin = (vals.cin != null && vals.cin !== '') ? String(vals.cin).slice(0, NAME_MAX) : '';
-                const depot_count = (vals.depot_count != null && typeof vals.depot_count === 'number') ? vals.depot_count : 0;
-                const warehouse_count = (vals.warehouse_count != null && typeof vals.warehouse_count === 'number') ? vals.warehouse_count : 0;
                 const country_name = (vals.country_name != null && vals.country_name !== '') ? String(vals.country_name).trim() : '';
                 const state_name = (vals.state_name != null && vals.state_name !== '') ? String(vals.state_name).trim() : '';
                 const city_name = (vals.city_name != null && vals.city_name !== '') ? String(vals.city_name).trim() : '';
@@ -986,11 +893,11 @@ export async function parseAndApply(
                 await client.query(
                   `UPDATE organizations SET
                   name = $1, short_name = $2, address = NULLIF($3,''), email = $4, website = $5, phone_number = $6,
-                  org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''), depot_count = COALESCE($11,0), warehouse_count = COALESCE($12,0),
-                  country_id = $13, state_id = $14, city_id = $15, pin_code = NULLIF($16,''), address_line1 = NULLIF($17,''), address_line2 = NULLIF($18,''),
+                  org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''),
+                  country_id = $11, state_id = $12, city_id = $13, pin_code = NULLIF($14,''), address_line1 = NULLIF($15,''), address_line2 = NULLIF($16,''),
                   updated_at = CURRENT_TIMESTAMP
-                  WHERE id = $19`,
-                  [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, depot_count, warehouse_count, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
+                  WHERE id = $17`,
+                  [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
                 );
                 result.updated.organizations += 1;
                 console.log('[EntityMasterUpload] Organisation (vertical) updated', { sheet: orgSheet.name, orgId, name });
@@ -1019,8 +926,6 @@ export async function parseAndApply(
                 const pan = (vals.pan != null && vals.pan !== '') ? String(vals.pan) : '';
                 const gst = (vals.gst != null && vals.gst !== '') ? String(vals.gst) : '';
                 const cin = (vals.cin != null && vals.cin !== '') ? String(vals.cin).slice(0, NAME_MAX) : '';
-                const depot_count = (vals.depot_count != null && typeof vals.depot_count === 'number') ? vals.depot_count : 0;
-                const warehouse_count = (vals.warehouse_count != null && typeof vals.warehouse_count === 'number') ? vals.warehouse_count : 0;
                 const country_name = (vals.country_name != null && vals.country_name !== '') ? String(vals.country_name).trim() : '';
                 const state_name = (vals.state_name != null && vals.state_name !== '') ? String(vals.state_name).trim() : '';
                 const city_name = (vals.city_name != null && vals.city_name !== '') ? String(vals.city_name).trim() : '';
@@ -1038,11 +943,11 @@ export async function parseAndApply(
                 await client.query(
                   `UPDATE organizations SET
                   name = $1, short_name = $2, address = NULLIF($3,''), email = $4, website = $5, phone_number = $6,
-                  org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''), depot_count = COALESCE($11,0), warehouse_count = COALESCE($12,0),
-                  country_id = $13, state_id = $14, city_id = $15, pin_code = NULLIF($16,''), address_line1 = NULLIF($17,''), address_line2 = NULLIF($18,''),
+                  org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''),
+                  country_id = $11, state_id = $12, city_id = $13, pin_code = NULLIF($14,''), address_line1 = NULLIF($15,''), address_line2 = NULLIF($16,''),
                   updated_at = CURRENT_TIMESTAMP
-                  WHERE id = $19`,
-                  [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, depot_count, warehouse_count, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
+                  WHERE id = $17`,
+                  [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
                 );
                 result.updated.organizations += 1;
                 console.log('[EntityMasterUpload] Organisation (vertical) updated', { sheet: orgSheet.name, orgId, name });
@@ -1072,8 +977,6 @@ export async function parseAndApply(
           const panCol = colAny(headers, 'pan', 'pan of the organisation', 'pan of the entity');
           const gstCol = colAny(headers, 'gst', 'gst number');
           const cinCol = colAny(headers, 'cin number', 'cin', 'registration number of the entity');
-          const depotCol = colAny(headers, 'depot_count', 'depot');
-          const warehouseCol = colAny(headers, 'warehouse_count', 'warehouse');
           const countryNameCol = colAny(headers, 'country_name', 'country');
           const stateNameCol = colAny(headers, 'state_name', 'state');
           const cityNameCol = colAny(headers, 'city_name', 'city');
@@ -1121,8 +1024,6 @@ export async function parseAndApply(
               const pan = panCol >= 0 ? getCellStr(row, panCol) : '';
               const gst = gstCol >= 0 ? getCellStr(row, gstCol) : '';
               const cin = cinCol >= 0 ? getCellStrMax(row, cinCol, NAME_MAX) : '';
-              const depot_count = depotCol >= 0 ? getCellNum(row, depotCol) : null;
-              const warehouse_count = warehouseCol >= 0 ? getCellNum(row, warehouseCol) : null;
               const country_name = (countryNameCol >= 0 ? getCellStr(row, countryNameCol) : '').trim();
               const state_name = (stateNameCol >= 0 ? getCellStr(row, stateNameCol) : '').trim();
               const city_name = (cityNameCol >= 0 ? getCellStr(row, cityNameCol) : '').trim();
@@ -1142,11 +1043,11 @@ export async function parseAndApply(
               await client.query(
                 `UPDATE organizations SET
                 name = $1, short_name = $2, address = NULLIF($3,''), email = $4, website = $5, phone_number = $6,
-                org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''), depot_count = COALESCE($11,0), warehouse_count = COALESCE($12,0),
-                country_id = $13, state_id = $14, city_id = $15, pin_code = NULLIF($16,''), address_line1 = NULLIF($17,''), address_line2 = NULLIF($18,''),
+                org_constitution = NULLIF($7,''), pan = $8, gst = $9, cin = NULLIF($10,''),
+                country_id = $11, state_id = $12, city_id = $13, pin_code = NULLIF($14,''), address_line1 = NULLIF($15,''), address_line2 = NULLIF($16,''),
                 updated_at = CURRENT_TIMESTAMP
-                WHERE id = $19`,
-                [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, depot_count ?? 0, warehouse_count ?? 0, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
+                WHERE id = $17`,
+                [name, short_name || null, address || null, email || null, website || null, phone_number || null, org_constitution || null, pan || null, gst || null, cin || null, country_id, state_id, city_id, pin_code || null, address_line1 || null, address_line2 || null, orgId]
               );
               result.updated.organizations += 1;
               console.log('[EntityMasterUpload] Organisation row updated', { sheet: orgSheet.name, row: r, orgId, name });
@@ -1159,251 +1060,6 @@ export async function parseAndApply(
       }
     } else if (!orgSheet) {
       console.log('[EntityMasterUpload] Organisation sheet missing or empty – no organisation rows processed');
-    }
-
-    // --- Cost centres (Cost Centres or legacy Cost centres) ---
-    const ccSheet = getSheet(['Cost Centres', 'Cost centres']);
-    console.log('[EntityMasterUpload] Cost Centres sheet', ccSheet ? { name: ccSheet.name, rowCount: ccSheet.rowCount } : 'NOT FOUND');
-    if (ccSheet && ccSheet.rowCount >= 2) {
-      const headers = ccSheet.getRow(1).values as any[];
-      // Accept both old technical headers and new UI labels from the template.
-      const nameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'name' || v === 'cost centre name' || v === 'cost center name';
-      });
-      const orgNameIdx = headers.findIndex((h: any) => String(h || '').trim().toLowerCase() === 'organization_name');
-      const shortNameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'short_name' || v === 'short name';
-      });
-      const displayOrderIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'display_order' || v === 'display order';
-      });
-      if (nameIdx >= 0) {
-        const maxRow = lastRow(ccSheet);
-        if (hasMoreThanMaxRows(ccSheet))
-          pushError({ sheet: ccSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
-        for (let r = 2; r <= maxRow; r++) {
-          try {
-            const row = ccSheet.getRow(r);
-            if (isRowEmpty(row, [nameIdx])) continue;
-            const name = getCellStrMax(row, nameIdx, NAME_MAX);
-            if (!name) continue;
-            let orgId = defaultOrgId;
-            if (isSuperAdmin && orgNameIdx >= 0) {
-              const on = getCellStr(row, orgNameIdx);
-              if (on) orgId = await resolveOrgIdCached(on);
-            }
-            if (!orgId) continue;
-            const shortName = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, NAME_MAX) : '';
-            const displayOrder = displayOrderIdx >= 0 ? getCellNum(row, displayOrderIdx) : 0;
-            const existing = await client.query(
-              'SELECT id FROM cost_centres WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-              [orgId, name]
-            );
-            if (existing.rows.length > 0) {
-              await client.query(
-                'UPDATE cost_centres SET short_name = $1, display_order = COALESCE($2,0), updated_at = CURRENT_TIMESTAMP WHERE id = $3',
-                [shortName || null, displayOrder ?? 0, existing.rows[0].id]
-              );
-            } else {
-              await client.query(
-                'INSERT INTO cost_centres (organization_id, name, short_name, display_order) VALUES ($1, $2, $3, COALESCE($4,0))',
-                [orgId, name, shortName || null, displayOrder ?? 0]
-              );
-            }
-            result.updated.cost_centres += 1;
-          } catch (err: any) {
-            pushError({ sheet: ccSheet.name, row: r, message: err?.message ?? String(err) });
-          }
-        }
-        console.log('[EntityMasterUpload] Cost Centres processed', { updated: result.updated.cost_centres });
-      }
-    }
-
-    // --- Branches ---
-    const branchesSheet = workbook.getWorksheet('Branches');
-    console.log('[EntityMasterUpload] Branches sheet', branchesSheet ? { name: branchesSheet.name, rowCount: branchesSheet.rowCount } : 'NOT FOUND');
-    if (branchesSheet && branchesSheet.rowCount >= 2) {
-      const headers = branchesSheet.getRow(1).values as any[];
-      const nameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'name' || v === 'branch name';
-      });
-      const orgNameIdx = headers.findIndex((h: any) => String(h || '').trim().toLowerCase() === 'organization_name');
-      const shortNameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'short_name' || v === 'short name';
-      });
-      const addressIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'address';
-      });
-      const gstNumberIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'gst_number' || v === 'gst number';
-      });
-      if (nameIdx >= 0) {
-        const maxRow = lastRow(branchesSheet);
-        if (hasMoreThanMaxRows(branchesSheet))
-          pushError({ sheet: branchesSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
-        for (let r = 2; r <= maxRow; r++) {
-          try {
-            const row = branchesSheet.getRow(r);
-            if (isRowEmpty(row, [nameIdx])) continue;
-            const name = getCellStrMax(row, nameIdx, NAME_MAX);
-            if (!name) continue;
-            let orgId = defaultOrgId;
-            if (isSuperAdmin && orgNameIdx >= 0) {
-              const on = getCellStr(row, orgNameIdx);
-              if (on) orgId = await resolveOrgIdCached(on);
-            }
-            if (!orgId) continue;
-            const shortName = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, NAME_MAX) : '';
-            const address = addressIdx >= 0 ? getCellStrMax(row, addressIdx, STRING_MAX) : '';
-            const gst_number = gstNumberIdx >= 0 ? getCellStr(row, gstNumberIdx) : '';
-            const existing = await client.query(
-              'SELECT id FROM branches WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-              [orgId, name]
-            );
-            if (existing.rows.length > 0) {
-              await client.query(
-                'UPDATE branches SET short_name = $1, address = $2, gst_number = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4',
-                [shortName || null, address || null, gst_number || null, existing.rows[0].id]
-              );
-            } else {
-              await client.query(
-                'INSERT INTO branches (organization_id, name, short_name, address, gst_number) VALUES ($1, $2, $3, $4, $5)',
-                [orgId, name, shortName || null, address || null, gst_number || null]
-              );
-            }
-            result.updated.branches += 1;
-          } catch (err: any) {
-            pushError({ sheet: branchesSheet.name, row: r, message: err?.message ?? String(err) });
-          }
-        }
-        console.log('[EntityMasterUpload] Branches processed', { updated: result.updated.branches });
-      }
-    }
-
-    // --- Depot ---
-    const depotSheet = getSheet(['Depot', 'Depots']);
-    if (depotSheet && depotSheet.rowCount >= 2) {
-      const headers = depotSheet.getRow(1).values as any[];
-      const nameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'name' || v === 'depot name';
-      });
-      const orgNameIdx = headers.findIndex((h: any) => String(h || '').trim().toLowerCase() === 'organization_name');
-      const shortNameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'short_name' || v === 'short name';
-      });
-      const displayOrderIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'display_order' || v === 'display order';
-      });
-      if (nameIdx >= 0) {
-        const maxRow = lastRow(depotSheet);
-        for (let r = 2; r <= maxRow; r++) {
-          try {
-            const row = depotSheet.getRow(r);
-            if (isRowEmpty(row, [nameIdx])) continue;
-            const name = getCellStrMax(row, nameIdx, NAME_MAX);
-            if (!name) continue;
-            let orgId = defaultOrgId;
-            if (isSuperAdmin && orgNameIdx >= 0) {
-              const on = getCellStr(row, orgNameIdx);
-              if (on) orgId = await resolveOrgIdCached(on);
-            }
-            if (!orgId) continue;
-            const shortName = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, NAME_MAX) : '';
-            const displayOrder = displayOrderIdx >= 0 ? getCellNum(row, displayOrderIdx) : 0;
-            const existing = await client.query(
-              'SELECT id FROM depots WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-              [orgId, name]
-            );
-            if (existing.rows.length > 0) {
-              await client.query(
-                'UPDATE depots SET short_name = $1, display_order = COALESCE($2,0), updated_at = CURRENT_TIMESTAMP WHERE id = $3',
-                [shortName || null, displayOrder ?? 0, existing.rows[0].id]
-              );
-            } else {
-              await client.query(
-                'INSERT INTO depots (organization_id, name, short_name, display_order) VALUES ($1, $2, $3, COALESCE($4,0))',
-                [orgId, name, shortName || null, displayOrder ?? 0]
-              );
-            }
-            result.updated.depots += 1;
-          } catch (err: any) {
-            if (err?.code !== '42P01') pushError({ sheet: depotSheet.name, row: r, message: err?.message ?? String(err) });
-          }
-        }
-        console.log('[EntityMasterUpload] Depot processed', { updated: result.updated.depots });
-      }
-    }
-
-    // --- Warehouse ---
-    const warehouseSheet = getSheet(['Warehouse', 'Warehouses']);
-    if (warehouseSheet && warehouseSheet.rowCount >= 2) {
-      const headers = warehouseSheet.getRow(1).values as any[];
-      const nameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'name' || v === 'warehouse name';
-      });
-      const orgNameIdx = headers.findIndex((h: any) => String(h || '').trim().toLowerCase() === 'organization_name');
-      const shortNameIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'short_name' || v === 'short name';
-      });
-      const addressIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'address';
-      });
-      const gstNumberIdx = headers.findIndex((h: any) => {
-        const v = String(h || '').trim().toLowerCase();
-        return v === 'gst_number' || v === 'gst number';
-      });
-      if (nameIdx >= 0) {
-        const maxRow = lastRow(warehouseSheet);
-        for (let r = 2; r <= maxRow; r++) {
-          try {
-            const row = warehouseSheet.getRow(r);
-            if (isRowEmpty(row, [nameIdx])) continue;
-            const name = getCellStrMax(row, nameIdx, NAME_MAX);
-            if (!name) continue;
-            let orgId = defaultOrgId;
-            if (isSuperAdmin && orgNameIdx >= 0) {
-              const on = getCellStr(row, orgNameIdx);
-              if (on) orgId = await resolveOrgIdCached(on);
-            }
-            if (!orgId) continue;
-            const shortName = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, NAME_MAX) : '';
-            const address = addressIdx >= 0 ? getCellStrMax(row, addressIdx, STRING_MAX) : '';
-            const gst_number = gstNumberIdx >= 0 ? getCellStr(row, gstNumberIdx) : '';
-            const existing = await client.query(
-              'SELECT id FROM warehouses WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-              [orgId, name]
-            );
-            if (existing.rows.length > 0) {
-              await client.query(
-                'UPDATE warehouses SET short_name = $1, address = $2, gst_number = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4',
-                [shortName || null, address || null, gst_number || null, existing.rows[0].id]
-              );
-            } else {
-              await client.query(
-                'INSERT INTO warehouses (organization_id, name, short_name, address, gst_number) VALUES ($1, $2, $3, $4, $5)',
-                [orgId, name, shortName || null, address || null, gst_number || null]
-              );
-            }
-            result.updated.warehouses += 1;
-          } catch (err: any) {
-            if (err?.code !== '42P01') pushError({ sheet: warehouseSheet.name, row: r, message: err?.message ?? String(err) });
-          }
-        }
-        console.log('[EntityMasterUpload] Warehouse processed', { updated: result.updated.warehouses });
-      }
     }
 
     // --- Service List (task_services); optional – skip if sheet missing ---
@@ -1505,9 +1161,26 @@ export async function parseAndApply(
       const orgNameIdx = colAny(headers, 'organization_name');
       const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
       const statusIdx = colAny(headers, 'status');
-      const costCentreNameIdx = colAny(headers, 'cost_centre_name', 'cost centre');
-      const depotNameIdx = colAny(headers, 'depot_name', 'depot');
-      const warehouseNameIdx = colAny(headers, 'warehouse_name', 'warehouse');
+      const orgNodeIdIdx = colAny(
+        headers,
+        'org_structure_node_id',
+        'org structure node id',
+        'org node id',
+        'organization node id'
+      );
+      const orgNodeHintIdx = colAny(
+        headers,
+        'org node name',
+        'organization node',
+        'org node',
+        'org path',
+        'cost_centre_name',
+        'cost centre',
+        'depot_name',
+        'depot',
+        'warehouse_name',
+        'warehouse'
+      );
       const panIdx = colAny(headers, 'pan');
       const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
       const clientEntityStatusColumn = await client.query(
@@ -1554,17 +1227,21 @@ export async function parseAndApply(
               pushError({ sheet: clientSheet.name, row: r, message: `Invalid status: ${statusRaw}. Use Active or Inactive.` });
               continue;
             }
-            const cost_centre_name = costCentreNameIdx >= 0 ? getCellStr(row, costCentreNameIdx) : '';
-            const depot_name = depotNameIdx >= 0 ? getCellStr(row, depotNameIdx) : '';
-            const warehouse_name = warehouseNameIdx >= 0 ? getCellStr(row, warehouseNameIdx) : '';
             const pan = panIdx >= 0 ? getCellStrMax(row, panIdx, 50) : '';
             const reporting_partner_mobile = reportingPartnerIdx >= 0 ? getCellStrMax(row, reportingPartnerIdx, PHONE_PIN_MAX) : '';
-            let cost_centre_id: string | null = null;
-            let depot_id: string | null = null;
-            let warehouse_id: string | null = null;
-            if (cost_centre_name) cost_centre_id = await resolveCostCentreCached(orgId, cost_centre_name);
-            if (depot_name) depot_id = await resolveDepotCached(orgId, depot_name);
-            if (warehouse_name) warehouse_id = await resolveWarehouseCached(orgId, warehouse_name);
+            let orgStructureNodeId: string | null = null;
+            if (orgNodeIdIdx >= 0) {
+              const rawId = getCellStr(row, orgNodeIdIdx);
+              if (rawId?.trim()) orgStructureNodeId = await resolveOrgNodeCached(orgId, rawId);
+            }
+            if (!orgStructureNodeId && orgNodeHintIdx >= 0) {
+              const hint = getCellStr(row, orgNodeHintIdx);
+              if (hint?.trim()) orgStructureNodeId = await resolveOrgNodeCached(orgId, hint);
+            }
+            let orgStructurePathJson: string | null = null;
+            if (orgStructureNodeId) {
+              orgStructurePathJson = await orgPathJsonForNode(orgId, orgStructureNodeId);
+            }
             const existing = await client.query(
               'SELECT id FROM client_entities WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
               [orgId, name]
@@ -1572,25 +1249,33 @@ export async function parseAndApply(
             if (existing.rows.length > 0) {
               if (hasClientEntityStatus) {
                 await client.query(
-                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), cost_centre_id = $3, depot_id = $4, warehouse_id = $5, pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
-                  [entity_type || null, status, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+                  [
+                    entity_type || null,
+                    status,
+                    orgStructureNodeId,
+                    orgStructurePathJson,
+                    pan || null,
+                    reporting_partner_mobile || null,
+                    existing.rows[0].id,
+                  ]
                 );
               } else {
                 await client.query(
-                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
-                  [entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), org_structure_node_id = $2, org_structure_path = $3::jsonb, pan = NULLIF($4, ''), reporting_partner_mobile = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $6",
+                  [entity_type || null, orgStructureNodeId, orgStructurePathJson, pan || null, reporting_partner_mobile || null, existing.rows[0].id]
                 );
               }
             } else {
               if (hasClientEntityStatus) {
                 await client.query(
-                  "INSERT INTO client_entities (organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6, $7, NULLIF($8, ''), NULLIF($9, ''))",
-                  [orgId, name, entity_type || null, status, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null]
+                  "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, NULLIF($7, ''), NULLIF($8, ''))",
+                  [orgId, name, entity_type || null, status, orgStructureNodeId, orgStructurePathJson, pan || null, reporting_partner_mobile || null]
                 );
               } else {
                 await client.query(
-                  "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, ''))",
-                  [orgId, name, entity_type || null, cost_centre_id, depot_id, warehouse_id, pan || null, reporting_partner_mobile || null]
+                  "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, NULLIF($6, ''), NULLIF($7, ''))",
+                  [orgId, name, entity_type || null, orgStructureNodeId, orgStructurePathJson, pan || null, reporting_partner_mobile || null]
                 );
               }
             }
@@ -1673,17 +1358,24 @@ export async function parseAndApply(
       }
     }
 
-    // --- Employees (NAME OF THE EMPLOYEE, MOBILE NUMBER, DEPARTMENT, DESIGNATION, REPORTING TO, LEVEL; Department & Designation not mandatory) ---
+    // --- Employees (NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG NODE) ---
     const employeesSheet = workbook.getWorksheet('Employees');
     console.log('[EntityMasterUpload] Employees sheet', employeesSheet ? { name: employeesSheet.name, rowCount: employeesSheet.rowCount, defaultOrgId } : 'NOT FOUND');
     if (employeesSheet && employeesSheet.rowCount >= 2 && defaultOrgId) {
       const headers = employeesSheet.getRow(1).values as any[];
       const mobileIdx = colAny(headers, 'mobile', 'mobile number');
       const nameIdx = colAny(headers, 'name', 'name of the employee');
-      const deptIdx = col(headers, 'department');
-      const desigIdx = colAny(headers, 'designation', 'designaton');
       const reportIdx = colAny(headers, 'reporting_to_mobile', 'reporting to');
-      const levelIdx = colAny(headers, 'level');
+      const primaryOrgNodeIdx = colAny(
+        headers,
+        'primary_org_node',
+        'primary org node',
+        'primary org node id',
+        'org structure node id',
+        'organization node id',
+        'org node id',
+        'org node'
+      );
       if (mobileIdx >= 0 && nameIdx >= 0) {
         const maxRow = lastRow(employeesSheet);
         if (hasMoreThanMaxRows(employeesSheet))
@@ -1716,14 +1408,15 @@ export async function parseAndApply(
               pushError({ sheet: 'Employees', row: r, message: `Invalid mobile: ${mobile}` });
               continue;
             }
-            const department = deptIdx >= 0 ? getCellStrMax(row, deptIdx, NAME_MAX) : '';
-            const designation = desigIdx >= 0 ? getCellStrMax(row, desigIdx, NAME_MAX) : '';
             const reporting_to_value = reportIdx >= 0 ? getCellStr(row, reportIdx) : '';
-            const level = levelIdx >= 0 ? getCellStrMax(row, levelIdx, 50) : '';
-            // REPORTING TO: accept manager mobile or manager name (same org)
             let reporting_to: string | null = null;
             if (reporting_to_value?.trim()) {
               reporting_to = await resolveReportingToByMobileOrName(client, defaultOrgId, reporting_to_value);
+            }
+            let primary_org_node_id: string | null = null;
+            if (primaryOrgNodeIdx >= 0) {
+              const rawNode = getCellStr(row, primaryOrgNodeIdx);
+              if (rawNode?.trim()) primary_org_node_id = await resolveOrgNodeCached(defaultOrgId, rawNode);
             }
             let employeeUserId: string;
             const existingUserId = await resolveUserIdByMobile(client, mobileNorm);
@@ -1746,10 +1439,10 @@ export async function parseAndApply(
               );
             }
             await client.query(
-              `INSERT INTO user_organizations (user_id, organization_id, department, designation, reporting_to, level, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (user_id, organization_id) DO UPDATE SET department = $3, designation = $4, reporting_to = $5, level = $6, updated_at = CURRENT_TIMESTAMP`,
-              [employeeUserId, defaultOrgId, department || null, designation || null, reporting_to, level || null]
+              `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, updated_at = CURRENT_TIMESTAMP`,
+              [employeeUserId, defaultOrgId, reporting_to, primary_org_node_id]
             );
             result.updated.employees += 1;
           } catch (err: any) {
@@ -1779,10 +1472,8 @@ export async function parseAndApply(
 export interface EmployeeJobPayload {
   mobile_normalized: string;
   name: string;
-  department: string | null;
-  designation: string | null;
   reporting_to_user_id: string | null;
-  level: string | null;
+  primary_org_node_id: string | null;
 }
 
 export interface ServiceListJobPayload {
@@ -1801,9 +1492,8 @@ export interface EntityListJobPayload {
   name: string;
   entity_type: string | null;
   status: string | null;
-  cost_centre_id: string | null;
-  depot_id: string | null;
-  warehouse_id: string | null;
+  org_structure_node_id: string | null;
+  org_structure_path: string | null;
   pan: string | null;
   reporting_partner_mobile: string | null;
   compliance: Array<{ task_service_id: string; frequency: string }>;
@@ -1822,10 +1512,17 @@ export async function buildEmployeePayloadsFromSheet(
   const headers = sheet.getRow(1).values as any[];
   const mobileIdx = colAny(headers, 'mobile', 'mobile number');
   const nameIdx = colAny(headers, 'name', 'name of the employee');
-  const deptIdx = col(headers, 'department');
-  const desigIdx = colAny(headers, 'designation', 'designaton');
   const reportIdx = colAny(headers, 'reporting_to_mobile', 'reporting to');
-  const levelIdx = colAny(headers, 'level');
+  const primaryOrgNodeIdx = colAny(
+    headers,
+    'primary_org_node',
+    'primary org node',
+    'primary org node id',
+    'org structure node id',
+    'organization node id',
+    'org node id',
+    'org node'
+  );
   if (mobileIdx < 0 || nameIdx < 0) return [];
   const payloads: EmployeeJobPayload[] = [];
   const maxRow = lastRow(sheet);
@@ -1846,20 +1543,20 @@ export async function buildEmployeePayloadsFromSheet(
       else continue;
     }
     if (!/^\+\d{6,20}$/.test(mobileNorm)) continue;
-    const department = deptIdx >= 0 ? getCellStrMax(row, deptIdx, NAME_MAX) : '';
-    const designation = desigIdx >= 0 ? getCellStrMax(row, desigIdx, NAME_MAX) : '';
     const reporting_to_value = reportIdx >= 0 ? getCellStr(row, reportIdx) : '';
-    const level = levelIdx >= 0 ? getCellStrMax(row, levelIdx, 50) : '';
     const reporting_to_user_id = reporting_to_value?.trim()
       ? await resolveReportingToByMobileOrName(client, organizationId, reporting_to_value)
       : null;
+    let primary_org_node_id: string | null = null;
+    if (primaryOrgNodeIdx >= 0) {
+      const rawNode = getCellStr(row, primaryOrgNodeIdx);
+      if (rawNode?.trim()) primary_org_node_id = await resolveOrgStructureNodeId(client, organizationId, rawNode);
+    }
     payloads.push({
       mobile_normalized: mobileNorm,
       name: name || 'Employee',
-      department: department || null,
-      designation: designation || null,
       reporting_to_user_id,
-      level: level || null,
+      primary_org_node_id,
     });
   }
   return payloads;
@@ -1922,9 +1619,26 @@ export async function buildEntityListPayloadsFromSheet(
   const orgNameIdx = colAny(headers, 'organization_name');
   const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
   const statusIdx = colAny(headers, 'status');
-  const costCentreNameIdx = colAny(headers, 'cost_centre_name', 'cost centre');
-  const depotNameIdx = colAny(headers, 'depot_name', 'depot');
-  const warehouseNameIdx = colAny(headers, 'warehouse_name', 'warehouse');
+  const orgNodeIdIdx = colAny(
+    headers,
+    'org_structure_node_id',
+    'org structure node id',
+    'org node id',
+    'organization node id'
+  );
+  const orgNodeHintIdx = colAny(
+    headers,
+    'org node name',
+    'organization node',
+    'org node',
+    'org path',
+    'cost_centre_name',
+    'cost centre',
+    'depot_name',
+    'depot',
+    'warehouse_name',
+    'warehouse'
+  );
   const panIdx = colAny(headers, 'pan');
   const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
   const normalizeClientEntityStatus = (raw: string): string | null => {
@@ -1945,6 +1659,14 @@ export async function buildEntityListPayloadsFromSheet(
   }
   if (nameIdx < 0) return [];
   const payloads: EntityListJobPayload[] = [];
+  const orgNodeCache = new Map<string, string | null>();
+  const resolveOrgNodeCached = async (orgId: string, hint: string): Promise<string | null> => {
+    const key = `${orgId}|${hint.trim().toLowerCase()}`;
+    if (orgNodeCache.has(key)) return orgNodeCache.get(key)!;
+    const id = await resolveOrgStructureNodeId(client, orgId, hint);
+    orgNodeCache.set(key, id);
+    return id;
+  };
   const maxRow = lastRow(sheet);
   for (let r = 2; r <= maxRow; r++) {
     const row = sheet.getRow(r);
@@ -1960,14 +1682,21 @@ export async function buildEntityListPayloadsFromSheet(
     const entity_type = entityTypeIdx >= 0 ? getCellStrMax(row, entityTypeIdx, NAME_MAX) : '';
     const statusRaw = statusIdx >= 0 ? getCellStr(row, statusIdx) : '';
     const status = normalizeClientEntityStatus(statusRaw);
-    const cost_centre_name = costCentreNameIdx >= 0 ? getCellStr(row, costCentreNameIdx) : '';
-    const depot_name = depotNameIdx >= 0 ? getCellStr(row, depotNameIdx) : '';
-    const warehouse_name = warehouseNameIdx >= 0 ? getCellStr(row, warehouseNameIdx) : '';
     const pan = panIdx >= 0 ? getCellStrMax(row, panIdx, 50) : '';
     const reporting_partner_mobile = reportingPartnerIdx >= 0 ? getCellStrMax(row, reportingPartnerIdx, PHONE_PIN_MAX) : '';
-    const cost_centre_id = cost_centre_name ? await resolveCostCentreId(client, orgId, cost_centre_name) : null;
-    const depot_id = depot_name ? await resolveDepotId(client, orgId, depot_name) : null;
-    const warehouse_id = warehouse_name ? await resolveWarehouseId(client, orgId, warehouse_name) : null;
+    let org_structure_node_id: string | null = null;
+    if (orgNodeIdIdx >= 0) {
+      const rawId = getCellStr(row, orgNodeIdIdx);
+      if (rawId?.trim()) org_structure_node_id = await resolveOrgNodeCached(orgId, rawId);
+    }
+    if (!org_structure_node_id && orgNodeHintIdx >= 0) {
+      const hint = getCellStr(row, orgNodeHintIdx);
+      if (hint?.trim()) org_structure_node_id = await resolveOrgNodeCached(orgId, hint);
+    }
+    let org_structure_path: string | null = null;
+    if (org_structure_node_id) {
+      org_structure_path = await orgPathJsonForNode(orgId, org_structure_node_id);
+    }
     const compliance: EntityListJobPayload['compliance'] = [];
     for (const { colIndex, taskServiceTitle } of complianceCols) {
       const frequencyVal = getCellStr(row, colIndex);
@@ -1980,9 +1709,8 @@ export async function buildEntityListPayloadsFromSheet(
       name,
       entity_type: entity_type || null,
       status,
-      cost_centre_id,
-      depot_id: depot_id ?? null,
-      warehouse_id: warehouse_id ?? null,
+      org_structure_node_id,
+      org_structure_path,
       pan: pan || null,
       reporting_partner_mobile: reporting_partner_mobile || null,
       compliance,
@@ -2000,7 +1728,7 @@ export async function createEmployeeFromPayload(
   payload: EmployeeJobPayload,
   organizationId: string
 ): Promise<string> {
-  const { mobile_normalized, name, department, designation, reporting_to_user_id, level } = payload;
+  const { mobile_normalized, name, reporting_to_user_id, primary_org_node_id } = payload;
   let employeeUserId: string;
   const existingUserId = (await client.query(
     'SELECT id FROM users WHERE REPLACE(mobile, \' \', \'\') = $1 OR mobile = $1 LIMIT 1',
@@ -2025,10 +1753,10 @@ export async function createEmployeeFromPayload(
     );
   }
   await client.query(
-    `INSERT INTO user_organizations (user_id, organization_id, department, designation, reporting_to, level, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-     ON CONFLICT (user_id, organization_id) DO UPDATE SET department = $3, designation = $4, reporting_to = $5, level = $6, updated_at = CURRENT_TIMESTAMP`,
-    [employeeUserId, organizationId, department || null, designation || null, reporting_to_user_id, level || null]
+    `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, updated_at = CURRENT_TIMESTAMP`,
+    [employeeUserId, organizationId, reporting_to_user_id, primary_org_node_id]
   );
   return employeeUserId;
 }
@@ -2092,7 +1820,7 @@ export async function createClientEntityFromPayload(
   payload: EntityListJobPayload,
   _organizationId: string
 ): Promise<string> {
-  const { organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile, compliance } = payload;
+  const { organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile, compliance } = payload;
   const orgId = organization_id || _organizationId;
   const nameTrim = (name || '').trim();
   if (!nameTrim) throw new Error('Client entity name is required');
@@ -2111,24 +1839,24 @@ export async function createClientEntityFromPayload(
     clientEntityId = existing.rows[0].id;
     if (hasClientEntityStatus) {
       await client.query(
-        "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), cost_centre_id = $3, depot_id = $4, warehouse_id = $5, pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
-        [entity_type || null, status || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null, clientEntityId]
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+        [entity_type || null, status || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null, clientEntityId]
       );
     } else {
       await client.query(
-        "UPDATE client_entities SET entity_type = NULLIF($1, ''), cost_centre_id = $2, depot_id = $3, warehouse_id = $4, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
-        [entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null, clientEntityId]
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), org_structure_node_id = $2, org_structure_path = $3::jsonb, pan = NULLIF($4, ''), reporting_partner_mobile = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $6",
+        [entity_type || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null, clientEntityId]
       );
     }
   } else {
     const ins = hasClientEntityStatus
       ? await client.query(
-          "INSERT INTO client_entities (organization_id, name, entity_type, status, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6, $7, NULLIF($8, ''), NULLIF($9, '')) RETURNING id",
-          [orgId, nameSafe, entity_type || null, status || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null]
+          "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
+          [orgId, nameSafe, entity_type || null, status || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
         )
       : await client.query(
-          "INSERT INTO client_entities (organization_id, name, entity_type, cost_centre_id, depot_id, warehouse_id, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
-          [orgId, nameSafe, entity_type || null, cost_centre_id, depot_id ?? null, warehouse_id ?? null, pan || null, reporting_partner_mobile || null]
+          "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, NULLIF($6, ''), NULLIF($7, '')) RETURNING id",
+          [orgId, nameSafe, entity_type || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
         );
     clientEntityId = ins.rows[0].id;
   }

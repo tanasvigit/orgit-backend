@@ -20,8 +20,6 @@ export interface OrganizationData {
   cin?: string;
   orgConstitution?: string;
   accountingYearStart?: string;
-  costCentres?: Array<{ name: string; shortName?: string }>;
-  branches?: Array<{ name: string; shortName?: string; address?: string; gstNumber?: string }>;
 }
 
 /**
@@ -55,26 +53,6 @@ export async function getOrganizationData(organizationId: string): Promise<Organ
 
   const row = result.rows[0];
 
-  // Defensive: if branches/cost_centres tables don't exist yet (migration not run), return empty
-  let costCentresResult: { rows: any[] } = { rows: [] };
-  let branchesResult: { rows: any[] } = { rows: [] };
-  try {
-    costCentresResult = await query(
-      'SELECT name, short_name FROM cost_centres WHERE organization_id = $1 ORDER BY display_order, name',
-      [organizationId]
-    );
-  } catch (err: any) {
-    if (err?.code !== '42P01') throw err;
-  }
-  try {
-    branchesResult = await query(
-      'SELECT name, short_name, address, gst_number FROM branches WHERE organization_id = $1 ORDER BY name',
-      [organizationId]
-    );
-  } catch (err: any) {
-    if (err?.code !== '42P01') throw err;
-  }
-
   return {
     name: row.name || '',
     shortName: row.short_name || undefined,
@@ -97,13 +75,6 @@ export async function getOrganizationData(organizationId: string): Promise<Organ
     accountingYearStart: row.accounting_year_start
       ? (typeof row.accounting_year_start === 'string' ? row.accounting_year_start : new Date(row.accounting_year_start).toISOString().split('T')[0])
       : undefined,
-    costCentres: costCentresResult.rows.map((r: any) => ({ name: r.name, shortName: r.short_name })),
-    branches: branchesResult.rows.map((r: any) => ({
-      name: r.name,
-      shortName: r.short_name,
-      address: r.address,
-      gstNumber: r.gst_number,
-    })),
   };
 }
 
@@ -133,8 +104,6 @@ export function formatOrganizationDataForTemplate(orgData: OrganizationData): Re
       cin: orgData.cin || '',
       orgConstitution: orgData.orgConstitution || '',
       accountingYearStart: orgData.accountingYearStart || '',
-      costCentres: orgData.costCentres || [],
-      branches: orgData.branches || [],
     },
   };
 }

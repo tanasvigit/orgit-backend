@@ -4,22 +4,14 @@ export type TaskCreationUserConfigPayload = {
   dueDaysFromStart: number;
   targetDaysBeforeDue: number;
   autoEscalateTrigger: 'target_date' | 'due_date';
-  taskUnitPreference:
-    | 'cost_centre'
-    | 'department'
-    | 'depot'
-    | 'branch'
-    | 'entity'
-    | 'warehouse'
-    | 'project'
-    | 'factory';
+  taskUnitPreference: 'org_node';
 };
 
 export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = {
   dueDaysFromStart: 10,
   targetDaysBeforeDue: 3,
   autoEscalateTrigger: 'target_date',
-  taskUnitPreference: 'cost_centre',
+  taskUnitPreference: 'org_node',
 };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -48,16 +40,7 @@ export function mergeTaskCreationUserConfig(
   }
 
   const unitPref = stored.taskUnitPreference;
-  if (
-    unitPref === 'cost_centre' ||
-    unitPref === 'department' ||
-    unitPref === 'depot' ||
-    unitPref === 'branch' ||
-    unitPref === 'entity' ||
-    unitPref === 'warehouse' ||
-    unitPref === 'project' ||
-    unitPref === 'factory'
-  ) {
+  if (unitPref === 'org_node') {
     base.taskUnitPreference = unitPref;
   }
 
@@ -89,25 +72,18 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
   if (autoEscalateTrigger !== 'target_date' && autoEscalateTrigger !== 'due_date') {
     throw new Error('autoEscalateTrigger must be target_date or due_date');
   }
-  if (
-    taskUnitPreference !== undefined &&
-    taskUnitPreference !== 'cost_centre' &&
-    taskUnitPreference !== 'department' &&
-    taskUnitPreference !== 'depot' &&
-    taskUnitPreference !== 'branch' &&
-    taskUnitPreference !== 'entity' &&
-    taskUnitPreference !== 'warehouse' &&
-    taskUnitPreference !== 'project' &&
-    taskUnitPreference !== 'factory'
-  ) {
-    throw new Error('taskUnitPreference must be one of cost_centre, department, depot, branch, entity, warehouse, project, factory');
+  if (taskUnitPreference !== undefined && taskUnitPreference !== 'org_node') {
+    throw new Error('taskUnitPreference must be org_node');
   }
 
   return {
     dueDaysFromStart: Math.round(dueDaysFromStart),
     targetDaysBeforeDue: Math.round(targetDaysBeforeDue),
     autoEscalateTrigger,
-    taskUnitPreference: taskUnitPreference || DEFAULT_TASK_CREATION_USER_CONFIG.taskUnitPreference,
+    taskUnitPreference:
+      typeof taskUnitPreference === 'string'
+        ? (taskUnitPreference as TaskCreationUserConfigPayload['taskUnitPreference'])
+        : DEFAULT_TASK_CREATION_USER_CONFIG.taskUnitPreference,
   };
 }
 

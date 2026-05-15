@@ -3,6 +3,7 @@ import { getClient } from '../config/database';
 import { createHash } from 'crypto';
 import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
 import { calculateNextCycleStartDate } from './cycleStartRecurrence';
+import { resolveNodeReference } from './organizationStructureService';
 
 /** Bulk upload limits and safety */
 const MAX_ROWS_PER_SHEET = 500;
@@ -15,13 +16,6 @@ export interface TaskBulkUploadResult {
   errors: Array<{ sheet?: string; row?: number; message: string }>;
 }
 
-// --- New: Optional masters in the same workbook (backward compatible) ---
-// These sheets are optional. If present, they are processed before Tasks.
-// Sheet names supported:
-// - Cost Center (new) or Cost Centres (existing in OrgIt Settings template)
-// - Branch (new) or Branches (existing in OrgIt Settings template)
-const COST_CENTER_SHEET_NAMES = ['Cost Center', 'Cost Centres'];
-const BRANCH_SHEET_NAMES = ['Branch', 'Branches'];
 /** Resolve user ID by mobile (same logic as entityMasterBulkService) */
 async function resolveUserIdByMobile(client: any, mobile: string): Promise<string | null> {
   if (!mobile) return null;
@@ -256,135 +250,6 @@ function getWorksheetByNames(workbook: ExcelJS.Workbook, names: string[]): Excel
   return undefined;
 }
 
-async function upsertCostCentresFromSheet(
-  client: any,
-  workbook: ExcelJS.Workbook,
-  organizationId: string,
-  pushError: (err: { sheet?: string; row?: number; message: string }) => void
-): Promise<void> {
-  const sheet = getWorksheetByNames(workbook, COST_CENTER_SHEET_NAMES);
-  if (!sheet || (sheet.rowCount ?? 0) < 2) return; // optional
-
-  const headers = sheet.getRow(1).values as any[];
-  const orgNameIdx = colAny(headers, 'organization_name');
-  const nameIdx = colAny(headers, 'name', 'cost centre name', 'cost center name');
-  const shortNameIdx = colAny(headers, 'short_name', 'short name');
-  const displayOrderIdx = colAny(headers, 'display_order', 'display order');
-
-  if (nameIdx < 0) {
-    pushError({ sheet: sheet.name, message: 'Missing required column: name' });
-    return;
-  }
-
-  const maxRow = Math.min(sheet.rowCount ?? 0, MAX_ROWS_PER_SHEET + 1);
-  for (let r = 2; r <= maxRow; r++) {
-    const row = sheet.getRow(r);
-    if (isRowEmpty(row, [nameIdx])) continue;
-
-    // Admin task bulk upload is scoped to the uploader org. If organization_name is present and mismatched, skip gracefully.
-    const orgName = orgNameIdx >= 0 ? getCellStr(row, orgNameIdx) : '';
-    if (orgName) {
-      pushError({
-        sheet: sheet.name,
-        row: r,
-        message: 'organization_name is ignored for Task bulk upload (scoped to current organization)',
-      });
-    }
-
-    const name = getCellStrMax(row, nameIdx, 255);
-    if (!name) {
-      pushError({ sheet: sheet.name, row: r, message: 'Cost Center name is required' });
-      continue;
-    }
-
-    const short_name = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, 100) : '';
-    const display_order_raw = displayOrderIdx >= 0 ? getCellStr(row, displayOrderIdx) : '';
-    const display_order = display_order_raw ? parseInt(display_order_raw, 10) : 0;
-
-    try {
-      await client.query(
-        `INSERT INTO cost_centres (organization_id, name, short_name, display_order)
-         VALUES ($1, $2, NULLIF($3, ''), $4)
-         ON CONFLICT (organization_id, name)
-         DO UPDATE SET short_name = EXCLUDED.short_name, display_order = EXCLUDED.display_order, updated_at = CURRENT_TIMESTAMP`,
-        [organizationId, name, short_name || '', Number.isFinite(display_order) ? display_order : 0]
-      );
-    } catch (e: any) {
-      pushError({ sheet: sheet.name, row: r, message: e?.message || 'Failed to upsert cost centre' });
-    }
-  }
-}
-
-async function upsertBranchesFromSheet(
-  client: any,
-  workbook: ExcelJS.Workbook,
-  organizationId: string,
-  pushError: (err: { sheet?: string; row?: number; message: string }) => void
-): Promise<void> {
-  const sheet = getWorksheetByNames(workbook, BRANCH_SHEET_NAMES);
-  if (!sheet || (sheet.rowCount ?? 0) < 2) return; // optional
-
-  const headers = sheet.getRow(1).values as any[];
-  const orgNameIdx = colAny(headers, 'organization_name');
-  const nameIdx = colAny(headers, 'name', 'branch name');
-  const shortNameIdx = colAny(headers, 'short_name', 'short name');
-  const addressIdx = colAny(headers, 'address');
-  const gstIdx = colAny(headers, 'gst_number', 'gst number');
-
-  if (nameIdx < 0) {
-    pushError({ sheet: sheet.name, message: 'Missing required column: name' });
-    return;
-  }
-
-  const maxRow = Math.min(sheet.rowCount ?? 0, MAX_ROWS_PER_SHEET + 1);
-  for (let r = 2; r <= maxRow; r++) {
-    const row = sheet.getRow(r);
-    if (isRowEmpty(row, [nameIdx])) continue;
-
-    const orgName = orgNameIdx >= 0 ? getCellStr(row, orgNameIdx) : '';
-    if (orgName) {
-      pushError({
-        sheet: sheet.name,
-        row: r,
-        message: 'organization_name is ignored for Task bulk upload (scoped to current organization)',
-      });
-    }
-
-    const name = getCellStrMax(row, nameIdx, 255);
-    if (!name) {
-      pushError({ sheet: sheet.name, row: r, message: 'Branch name is required' });
-      continue;
-    }
-
-    const short_name = shortNameIdx >= 0 ? getCellStrMax(row, shortNameIdx, 100) : '';
-    const address = addressIdx >= 0 ? getCellStrMax(row, addressIdx, 500) : '';
-    const gst_number = gstIdx >= 0 ? getCellStrMax(row, gstIdx, 50) : '';
-
-    try {
-      // branches table doesn't enforce uniqueness by name, so we implement "upsert by org + lower(name)" safely.
-      const existing = await client.query(
-        'SELECT id FROM branches WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
-        [organizationId, name]
-      );
-      if (existing.rows.length > 0) {
-        await client.query(
-          `UPDATE branches
-           SET short_name = NULLIF($1, ''), address = NULLIF($2, ''), gst_number = NULLIF($3, ''), updated_at = CURRENT_TIMESTAMP
-           WHERE id = $4`,
-          [short_name || '', address || '', gst_number || '', existing.rows[0].id]
-        );
-      } else {
-        await client.query(
-          `INSERT INTO branches (organization_id, name, short_name, address, gst_number)
-           VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''))`,
-          [organizationId, name, short_name || '', address || '', gst_number || '']
-        );
-      }
-    } catch (e: any) {
-      pushError({ sheet: sheet.name, row: r, message: e?.message || 'Failed to upsert branch' });
-    }
-  }
-}
 const TASK_BULK_VALIDATION_ROW_START = 2;
 const TASK_BULK_VALIDATION_ROW_END = 1000;
 
@@ -472,7 +337,6 @@ export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
     { header: 'Financial Value', key: 'financial_value', width: 16 },
     { header: 'Description', key: 'description', width: 40 },
     { header: 'Auto Escalate', key: 'auto_escalate', width: 14 },
-    { header: 'Task Unit', key: 'task_unit', width: 18 },
     { header: 'Tags', key: 'tags', width: 24 },
     { header: 'Task Roll Out', key: 'task_rollout_type', width: 20 },
     { header: 'Recurrence End Type', key: 'recurrence_end_type', width: 22 },
@@ -494,31 +358,6 @@ export async function buildTaskTemplate(): Promise<ExcelJS.Buffer> {
 
   applyTaskBulkSheetValidations(sheet);
 
-  // --- New sheets (optional on upload; keeps old files compatible) ---
-  // Use DB-column headers for these masters to avoid ambiguity.
-  const costCenterSheet = workbook.addWorksheet('Cost Center', {
-    headerFooter: { firstHeader: 'OrgIt Task Bulk Upload - Cost Center' },
-  });
-  costCenterSheet.columns = [
-    { header: 'organization_name', key: 'organization_name', width: 25 },
-    { header: 'name', key: 'name', width: 25 },
-    { header: 'short_name', key: 'short_name', width: 15 },
-    { header: 'display_order', key: 'display_order', width: 14 },
-  ];
-  costCenterSheet.getRow(1).font = { bold: true };
-
-  const branchSheet = workbook.addWorksheet('Branch', {
-    headerFooter: { firstHeader: 'OrgIt Task Bulk Upload - Branch' },
-  });
-  branchSheet.columns = [
-    { header: 'organization_name', key: 'organization_name', width: 25 },
-    { header: 'name', key: 'name', width: 25 },
-    { header: 'short_name', key: 'short_name', width: 15 },
-    { header: 'address', key: 'address', width: 40 },
-    { header: 'gst_number', key: 'gst_number', width: 20 },
-  ];
-  branchSheet.getRow(1).font = { bold: true };
-
   return (await workbook.xlsx.writeBuffer()) as ExcelJS.Buffer;
 }
 
@@ -530,7 +369,6 @@ export interface TaskBulkJobPayload {
   /** Optional client/entity link (resolved from "Client Name" column). */
   clientEntityId: string | null;
   description: string | null;
-  taskUnit: string | null;
   taskType: string;
   startDate: string | null;
   targetDate: string | null;
@@ -576,7 +414,6 @@ export async function createTaskFromPayload(
     clientName,
     clientEntityId,
     description,
-    taskUnit,
     taskType,
     startDate,
     targetDate,
@@ -602,6 +439,35 @@ export async function createTaskFromPayload(
     isDifferentOwner,
     idempotencyKey,
   } = payload;
+
+  let orgStructureNodeId: string | null = null;
+  let orgStructurePath: unknown = null;
+  let orgStructureLevelKey: string | null = null;
+  if (clientEntityId) {
+    const ceRes = await client.query(
+      `SELECT ce.org_structure_node_id, ce.org_structure_path, n.level_key AS node_level_key
+       FROM client_entities ce
+       LEFT JOIN organization_structure_nodes n ON n.id = ce.org_structure_node_id
+       WHERE ce.id = $1
+       LIMIT 1`,
+      [clientEntityId]
+    );
+    if (ceRes.rows.length > 0) {
+      const row = ceRes.rows[0];
+      orgStructureNodeId = row.org_structure_node_id ?? null;
+      orgStructurePath = row.org_structure_path ?? null;
+      orgStructureLevelKey = row.node_level_key ?? null;
+      if (orgStructureNodeId && orgStructurePath == null) {
+        try {
+          const ref = await resolveNodeReference(organizationId, orgStructureNodeId, { activeOnly: false });
+          orgStructurePath = ref.path;
+          orgStructureLevelKey = ref.levelKey;
+        } catch {
+          orgStructurePath = null;
+        }
+      }
+    }
+  }
 
   // Guard against accidental duplicate processing of the same bulk row (same file + sheet row).
   // We persist the key in task_activities message and short-circuit if it exists.
@@ -635,8 +501,9 @@ export async function createTaskFromPayload(
        'escalation_rules',
        'client_entity_id',
        'client_name',
-       'task_unit',
-       'task_unit_name',
+       'org_structure_node_id',
+       'org_structure_path',
+       'org_structure_level_key',
        'compliance_id',
        'document_instance_id',
        'task_rollout_type',
@@ -656,8 +523,9 @@ export async function createTaskFromPayload(
   const hasEscalationRules = columnCheck.rows.some((c: any) => c.column_name === 'escalation_rules');
   const hasClientEntityId = columnCheck.rows.some((c: any) => c.column_name === 'client_entity_id');
   const hasClientName = columnCheck.rows.some((c: any) => c.column_name === 'client_name');
-  const hasTaskUnit = columnCheck.rows.some((c: any) => c.column_name === 'task_unit');
-  const hasTaskUnitName = columnCheck.rows.some((c: any) => c.column_name === 'task_unit_name');
+  const hasOrgStructureNodeId = columnCheck.rows.some((c: any) => c.column_name === 'org_structure_node_id');
+  const hasOrgStructurePath = columnCheck.rows.some((c: any) => c.column_name === 'org_structure_path');
+  const hasOrgStructureLevelKey = columnCheck.rows.some((c: any) => c.column_name === 'org_structure_level_key');
   const hasComplianceId = columnCheck.rows.some((c: any) => c.column_name === 'compliance_id');
   const hasDocumentInstanceId = columnCheck.rows.some((c: any) => c.column_name === 'document_instance_id');
   const hasTaskRolloutType = columnCheck.rows.some((c: any) => c.column_name === 'task_rollout_type');
@@ -730,14 +598,19 @@ export async function createTaskFromPayload(
     insertCols.push('client_name');
     insertVals.push(clientName);
   }
-  if (taskUnit) {
-    if (hasTaskUnit) {
-      insertCols.push('task_unit');
-      insertVals.push(taskUnit);
-    } else if (hasTaskUnitName) {
-      insertCols.push('task_unit_name');
-      insertVals.push(taskUnit);
-    }
+  if (hasOrgStructureNodeId && orgStructureNodeId) {
+    insertCols.push('org_structure_node_id');
+    insertVals.push(orgStructureNodeId);
+  }
+  if (hasOrgStructurePath && orgStructurePath != null) {
+    insertCols.push('org_structure_path');
+    insertVals.push(
+      typeof orgStructurePath === 'string' ? orgStructurePath : JSON.stringify(orgStructurePath)
+    );
+  }
+  if (hasOrgStructureLevelKey && orgStructureLevelKey) {
+    insertCols.push('org_structure_level_key');
+    insertVals.push(orgStructureLevelKey);
   }
   if (hasComplianceId && complianceId) {
     insertCols.push('compliance_id');
@@ -975,17 +848,6 @@ export async function parseAndApply(
   const client = await getClient();
   const assigneeCache = new Map<string, string | null>();
   try {
-    try {
-      await upsertCostCentresFromSheet(client, workbook, organizationId, pushError);
-    } catch (e: any) {
-      pushError({ sheet: 'Cost Center', message: e?.message || 'Failed to process Cost Center sheet' });
-    }
-    try {
-      await upsertBranchesFromSheet(client, workbook, organizationId, pushError);
-    } catch (e: any) {
-      pushError({ sheet: 'Branch', message: e?.message || 'Failed to process Branch sheet' });
-    }
-
     const headers = tasksSheet.getRow(1).values as any[];
     const col = (key: string): number => {
       const keys = key.toLowerCase().split('|');
@@ -1009,7 +871,6 @@ export async function parseAndApply(
     const financialValueCol = col('financial value|financial_value');
     const descCol = col('description');
     const autoEscalateCol = col('auto escalate|auto_escalate');
-    const taskUnitCol = col('task unit|task_unit');
     const tagsCol = col('tags');
     const taskRolloutTypeCol = col('task roll out|task rollout|task_rollout_type');
     const recurrenceEndTypeCol = col('recurrence end type|recurrence_end_type');
@@ -1084,7 +945,6 @@ export async function parseAndApply(
       const parsedFinancialValue = financialValueStr
         ? (parseFloat(financialValueStr) || null)
         : null;
-      const taskUnit = getCellStrMax(row, taskUnitCol, 255) || null;
       const tagsText = getCellStrMax(row, tagsCol, STRING_MAX) || null;
 
       const autoEscalateStr = getCellStr(row, autoEscalateCol).toLowerCase();
@@ -1243,7 +1103,6 @@ export async function parseAndApply(
         clientName: clientName || null,
         clientEntityId,
         description,
-        taskUnit,
         taskType,
         startDate: startDate ? toLocalDateOnlyString(startDate) : null,
         targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
@@ -1279,7 +1138,6 @@ export async function parseAndApply(
               clientName: clientName || null,
               clientEntityId,
               description,
-              taskUnit,
               tagsText,
               taskType,
               startDate: startDate ? toLocalDateOnlyString(startDate) : null,

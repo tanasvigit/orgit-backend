@@ -30,6 +30,7 @@ import entityMasterBulkRoutes from './routes/entityMasterBulkRoutes';
 import adminTaskServiceRoutes from './routes/adminTaskServiceRoutes';
 import taskBulkRoutes from './routes/taskBulkRoutes';
 import uploadRoutes from './routes/uploadRoutes';
+import organizationStructureRoutes from './routes/organizationStructureRoutes';
 import { setupMessageHandlers } from './socket/messageHandlers';
 import { getValidatedDeviceTimestamp } from './utils/deviceTime';
 import { setupTaskJobs } from './jobs/taskJobs';
@@ -245,6 +246,7 @@ app.get('/api/organization/data', authenticate, organizationController.getMyOrga
 app.get('/api/organization/task-services', authenticate, clientEntityController.getOrganizationTaskServices);
 // Client-service matrix for current user's organization (accessible to all org members)
 app.get('/api/organization/client-matrix', authenticate, clientEntityController.getClientServiceMatrix);
+app.use('/api/organization-structure', organizationStructureRoutes);
 
 // Master data (countries, states, cities, org-constitutions) - authenticated
 app.use('/api/master', masterDataRoutes);
@@ -262,14 +264,10 @@ app.use('/api/super-admin/settings', platformSettingsRoutes);
 import adminRoutes from './routes/adminRoutes';
 app.use('/api/admin', adminRoutes);
 
-// Admin routes for departments, designations, and employees
-import departmentRoutes from './routes/departmentRoutes';
-import designationRoutes from './routes/designationRoutes';
+// Admin routes for employees and org-node-backed admin features
 import employeeRoutes from './routes/employeeRoutes';
 import documentManagementSettingsRoutes from './routes/documentManagementSettingsRoutes';
 import { errorHandler } from './middleware/errorHandler';
-app.use('/api/admin/departments', departmentRoutes);
-app.use('/api/admin/designations', designationRoutes);
 app.use('/api/admin/employees', employeeRoutes);
 app.use('/api/admin/document-management-settings', documentManagementSettingsRoutes);
 app.use('/api/admin/entities', clientEntityRoutes);

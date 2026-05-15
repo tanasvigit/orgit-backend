@@ -62,13 +62,6 @@ export interface OrganizationExtended {
   depotCount?: number;
   warehouseCount?: number;
   accountingYearStart?: string;
-  costCentres?: CostCentre[];
-  branches?: Branch[];
-  depots?: Depot[];
-  warehouses?: Warehouse[];
-  departmentsCount?: number;
-  branchesCount?: number;
-  costCentresCount?: number;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -160,7 +153,7 @@ export async function getAllOrganizations(filters: OrganizationFilters = {}) {
 }
 
 /**
- * Get organization by ID (with country, state, city, cost centres, branches, counts)
+ * Get organization by ID with org profile details only.
  */
 export async function getOrganizationById(id: string): Promise<OrganizationExtended | null> {
   const result = await query(
@@ -188,57 +181,7 @@ export async function getOrganizationById(id: string): Promise<OrganizationExten
   }
 
   const row = result.rows[0];
-  const org = mapOrganization(row);
-
-  // Defensive: if branches/cost_centres tables don't exist yet (migration not run), return empty
-  const queryOptional = async (sql: string, params: any[]): Promise<{ rows: any[] }> => {
-    try {
-      return await query(sql, params);
-    } catch (err: any) {
-      if (err.code === '42P01') return { rows: [] }; // relation does not exist
-      throw err;
-    }
-  };
-
-  const [costCentresResult, branchesResult, depotsResult, warehousesResult, deptCountResult] = await Promise.all([
-    queryOptional('SELECT id, name, short_name, display_order FROM cost_centres WHERE organization_id = $1 ORDER BY display_order, name', [id]),
-    queryOptional('SELECT id, name, short_name, address, gst_number FROM branches WHERE organization_id = $1 ORDER BY name', [id]),
-    queryOptional('SELECT id, name, short_name, display_order FROM depots WHERE organization_id = $1 ORDER BY display_order, name', [id]),
-    queryOptional('SELECT id, name, short_name, address, gst_number FROM warehouses WHERE organization_id = $1 ORDER BY name', [id]),
-    queryOptional('SELECT COUNT(*) as total FROM departments WHERE organization_id = $1', [id]),
-  ]);
-
-  (org as OrganizationExtended).costCentres = costCentresResult.rows.map((r: any) => ({
-    id: r.id,
-    name: r.name,
-    shortName: r.short_name,
-    displayOrder: r.display_order,
-  }));
-  (org as OrganizationExtended).branches = branchesResult.rows.map((r: any) => ({
-    id: r.id,
-    name: r.name,
-    shortName: r.short_name,
-    address: r.address,
-    gstNumber: r.gst_number,
-  }));
-  (org as OrganizationExtended).depots = depotsResult.rows.map((r: any) => ({
-    id: r.id,
-    name: r.name,
-    shortName: r.short_name,
-    displayOrder: r.display_order,
-  }));
-  (org as OrganizationExtended).warehouses = warehousesResult.rows.map((r: any) => ({
-    id: r.id,
-    name: r.name,
-    shortName: r.short_name,
-    address: r.address,
-    gstNumber: r.gst_number,
-  }));
-  (org as OrganizationExtended).departmentsCount = parseInt(deptCountResult.rows[0]?.total || '0', 10);
-  (org as OrganizationExtended).branchesCount = branchesResult.rows.length;
-  (org as OrganizationExtended).costCentresCount = costCentresResult.rows.length;
-
-  return org as OrganizationExtended;
+  return mapOrganization(row) as OrganizationExtended;
 }
 
 /**
@@ -910,6 +853,28 @@ export async function deleteOrganization(id: string): Promise<boolean> {
     await executeWithSavepoint(
       'sp_designations',
       'DELETE FROM designations WHERE organization_id = $1',
+      [id]
+    );
+
+    // 12b. Delete organization structure tables
+    await executeWithSavepoint(
+      'sp_org_structure_audit_logs',
+      'DELETE FROM organization_structure_audit_logs WHERE organization_id = $1',
+      [id]
+    );
+    await executeWithSavepoint(
+      'sp_org_structure_legacy_mappings',
+      'DELETE FROM organization_structure_legacy_mappings WHERE organization_id = $1',
+      [id]
+    );
+    await executeWithSavepoint(
+      'sp_org_structure_nodes',
+      'DELETE FROM organization_structure_nodes WHERE organization_id = $1',
+      [id]
+    );
+    await executeWithSavepoint(
+      'sp_org_structure_levels',
+      'DELETE FROM organization_structure_levels WHERE organization_id = $1',
       [id]
     );
 
