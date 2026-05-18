@@ -850,7 +850,7 @@ async function validateNodeReferences(
   }
 
   if (options?.activeOnly && node.status !== 'active') {
-    throw new Error('Selected organization node is not active');
+    throw new Error('Selected organization unit is not active');
   }
 
   return node;

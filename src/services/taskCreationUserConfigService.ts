@@ -4,14 +4,14 @@ export type TaskCreationUserConfigPayload = {
   dueDaysFromStart: number;
   targetDaysBeforeDue: number;
   autoEscalateTrigger: 'target_date' | 'due_date';
-  taskUnitPreference: 'org_node';
+  taskUnitPreference: 'org_unit';
 };
 
 export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = {
   dueDaysFromStart: 10,
   targetDaysBeforeDue: 3,
   autoEscalateTrigger: 'target_date',
-  taskUnitPreference: 'org_node',
+  taskUnitPreference: 'org_unit',
 };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -40,8 +40,8 @@ export function mergeTaskCreationUserConfig(
   }
 
   const unitPref = stored.taskUnitPreference;
-  if (unitPref === 'org_node') {
-    base.taskUnitPreference = unitPref;
+  if (unitPref === 'org_unit' || unitPref === 'org_node') {
+    base.taskUnitPreference = 'org_unit';
   }
 
   if (base.targetDaysBeforeDue > base.dueDaysFromStart) {
@@ -72,8 +72,12 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
   if (autoEscalateTrigger !== 'target_date' && autoEscalateTrigger !== 'due_date') {
     throw new Error('autoEscalateTrigger must be target_date or due_date');
   }
-  if (taskUnitPreference !== undefined && taskUnitPreference !== 'org_node') {
-    throw new Error('taskUnitPreference must be org_node');
+  if (
+    taskUnitPreference !== undefined &&
+    taskUnitPreference !== 'org_unit' &&
+    taskUnitPreference !== 'org_node'
+  ) {
+    throw new Error('taskUnitPreference must be org_unit');
   }
 
   return {
@@ -81,8 +85,8 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
     targetDaysBeforeDue: Math.round(targetDaysBeforeDue),
     autoEscalateTrigger,
     taskUnitPreference:
-      typeof taskUnitPreference === 'string'
-        ? (taskUnitPreference as TaskCreationUserConfigPayload['taskUnitPreference'])
+      taskUnitPreference === 'org_unit' || taskUnitPreference === 'org_node'
+        ? 'org_unit'
         : DEFAULT_TASK_CREATION_USER_CONFIG.taskUnitPreference,
   };
 }

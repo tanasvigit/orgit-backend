@@ -1,10 +1,15 @@
 import { Server, Socket } from 'socket.io';
 import { createMessage, updateMessageStatus, markMessagesAsRead } from '../services/messageService';
 import { verifyToken } from '../utils/jwt';
-import { query, getClient } from '../config/database';
+import { query } from '../config/database';
 import { getFileUrl } from '../services/mediaUploadService';
-import { getValidatedDeviceTimestamp } from '../utils/deviceTime';
+import { getValidatedDeviceTimestamp, serializeTimestampForClient } from '../utils/deviceTime';
 import { dispatchNotification } from '../services/notification-bus.service';
+import {
+  resolveConversationId,
+  emitNewMessageToMembers,
+  shouldNotifyRecipient,
+} from '../services/conversationIdResolver';
 
 // Use existing Node firebaseAdmin helper for FCM push notifications
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -173,7 +178,7 @@ export const setupMessageHandlers = (io: Server) => {
              LEFT JOIN message_status ms ON m.id = ms.message_id AND ms.user_id = $2
              WHERE m.conversation_id = $1 
                AND m.sender_id != $2
-               AND (ms.status IS NULL OR ms.status != 'read')
+               AND (ms.status IS NULL OR ms.status = 'sent')
                AND m.is_deleted = false
              ORDER BY m.created_at ASC
              LIMIT 50`,
@@ -198,7 +203,7 @@ export const setupMessageHandlers = (io: Server) => {
               mime_type: msg.mime_type,
               duration: msg.duration,
               sender_name: msg.sender_name,
-              created_at: msg.created_at,
+              created_at: serializeTimestampForClient(msg.created_at) ?? msg.created_at,
               status: msg.status || 'sent',
               deleted_for_all: msg.deleted_for_everyone,
             };
@@ -442,87 +447,26 @@ export const setupMessageHandlers = (io: Server) => {
         // Use 'text' if provided, otherwise use 'content' (matching message-backend)
         const messageContent = text || content;
 
-        // Handle backward compatibility: If conversationId is in direct_<userId> format,
-        // find or create the UUID conversation between the two users
-        let actualConversationId = conversationId;
-        
-        if (conversationId.startsWith('direct_')) {
-          // Extract the user ID from direct_<userId> format
-          const extractedUserId = conversationId.replace('direct_', '');
-          
-          // Determine the other user ID
-          let otherUserId: string;
-          if (extractedUserId === userId) {
-            // The conversationId is using sender's ID - find the other user from conversation_members
-            const otherMemberResult = await query(
-              'SELECT user_id FROM conversation_members WHERE conversation_id::text = $1::text AND user_id != $2 LIMIT 1',
-              [conversationId, userId]
-            );
-            if (otherMemberResult.rows.length === 0) {
-              socket.emit('error', { message: 'Invalid conversation: cannot find other user. Please create conversation first.' });
-              return;
-            }
-            otherUserId = otherMemberResult.rows[0].user_id;
-          } else {
-            otherUserId = extractedUserId;
-          }
+        const resolved = await resolveConversationId(conversationId, userId, {
+          createDirectIfMissing: true,
+        });
+        if (!resolved) {
+          socket.emit('error', { message: 'Invalid conversation' });
+          return;
+        }
+        const actualConversationId = resolved.conversationId;
+        const requestedConversationId = resolved.requestedId;
 
-          // Prevent sending message to yourself
-          if (otherUserId === userId) {
-            socket.emit('error', { message: 'Cannot send message to yourself' });
-            return;
-          }
+        if (resolved.otherUserId && resolved.otherUserId === userId) {
+          socket.emit('error', { message: 'Cannot send message to yourself' });
+          return;
+        }
 
-          // Check if a UUID conversation already exists between these two users
-          const existingConversation = await query(
-            `SELECT CAST(c.id AS TEXT) as id
-             FROM conversations c
-             INNER JOIN conversation_members cm1 ON CAST(c.id AS TEXT) = CAST(cm1.conversation_id AS TEXT)
-             INNER JOIN conversation_members cm2 ON CAST(c.id AS TEXT) = CAST(cm2.conversation_id AS TEXT)
-             WHERE cm1.user_id = $1 AND cm2.user_id = $2 
-               AND COALESCE(c.is_group, FALSE) = FALSE
-               AND COALESCE(c.is_task_group, FALSE) = FALSE
-             LIMIT 1`,
-            [userId, otherUserId]
-          );
-
-          if (existingConversation.rows.length > 0) {
-            // Use the existing UUID conversation
-            actualConversationId = existingConversation.rows[0].id;
-            console.log(`[send_message] Found existing UUID conversation ${actualConversationId} for direct_${extractedUserId}, using UUID`);
-          } else {
-            // Create a new UUID conversation (matching message-backend flow)
-            const client = await getClient();
-            try {
-              await client.query('BEGIN');
-
-              const convResult = await client.query(
-                `INSERT INTO conversations (id, type, is_group, is_task_group, created_by, created_at, updated_at)
-                 VALUES (gen_random_uuid(), 'direct', FALSE, FALSE, $1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                 RETURNING id`,
-                [userId]
-              );
-              actualConversationId = String(convResult.rows[0].id);
-
-              await client.query(
-                'INSERT INTO conversation_members (conversation_id, user_id, role, added_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)',
-                [actualConversationId, userId, 'member']
-              );
-
-              await client.query(
-                'INSERT INTO conversation_members (conversation_id, user_id, role, added_at) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)',
-                [actualConversationId, otherUserId, 'member']
-              );
-
-              await client.query('COMMIT');
-              console.log(`[send_message] Created new UUID conversation ${actualConversationId} for direct_${extractedUserId}`);
-            } catch (error) {
-              await client.query('ROLLBACK');
-              throw error;
-            } finally {
-              client.release();
-            }
-          }
+        if (resolved.resolvedFromLegacy && requestedConversationId !== actualConversationId) {
+          socket.emit('conversation_resolved', {
+            legacyConversationId: requestedConversationId,
+            conversationId: actualConversationId,
+          });
         }
 
         // Verify user is member of conversation (matching message-backend EXACTLY)
@@ -611,7 +555,7 @@ export const setupMessageHandlers = (io: Server) => {
         const senderName = userResult.rows[0]?.name || 'Unknown';
         const senderPhoto = userResult.rows[0]?.profile_photo || null;
 
-        // Determine created_at using validated device timestamp (falls back to server time)
+        // Authoritative server UTC time (ignore naive local device strings)
         const createdAt = getValidatedDeviceTimestamp(deviceTimestamp) || new Date();
 
         // Save message to database using createdAt
@@ -671,7 +615,12 @@ export const setupMessageHandlers = (io: Server) => {
         // Build message payload (matching message-backend structure exactly)
         const messagePayload: any = {
           ...message, // Start with all DB fields
+          created_at: serializeTimestampForClient(message.created_at) ?? message.created_at,
           conversation_id: actualConversationId,
+          legacy_conversation_id:
+            requestedConversationId !== actualConversationId
+              ? requestedConversationId
+              : undefined,
           sender_id: userId,
           content: message.content,
           text: message.content, // Also include 'text' for compatibility
@@ -715,14 +664,7 @@ export const setupMessageHandlers = (io: Server) => {
           );
         }
 
-        if (!(isGroup || isTaskGroup) || finalVisibilityMode !== 'org_only') {
-          io.to(actualConversationId).emit('new_message', messagePayload);
-        }
-
-        for (const memberId of visibleMemberIds) {
-          io.to(`user_${memberId}`).emit('new_message', messagePayload);
-          io.to(`user_${memberId}`).emit('receive_message', messagePayload);
-        }
+        emitNewMessageToMembers(io, visibleMemberIds, messagePayload);
         console.log('[send_message] message emitted', {
           messageId: message.id,
           conversationId: actualConversationId,
@@ -781,7 +723,7 @@ export const setupMessageHandlers = (io: Server) => {
 
         // Create notifications and send FCM push for offline users (matching message-backend)
         for (const member of otherMembers.rows) {
-          if (!onlineUsers.includes(member.user_id)) {
+          if (shouldNotifyRecipient(io, member.user_id, actualConversationId, activeUsers)) {
             const notificationBody = messageContent
               ? (messageContent.length > 50 ? messageContent.substring(0, 50) + '...' : messageContent)
               : (messageType === 'image' ? '📷 Photo'
@@ -859,7 +801,14 @@ export const setupMessageHandlers = (io: Server) => {
     // Legacy: message_read from mobile (per-message or whole conversation)
     socket.on('message_read', async (data) => {
       try {
-        const { conversationId, messageId } = data || {};
+        const { conversationId: rawConversationId, messageId } = data || {};
+        let conversationId = rawConversationId as string | undefined;
+        if (conversationId) {
+          const resolved = await resolveConversationId(conversationId, userId);
+          if (resolved) {
+            conversationId = resolved.conversationId;
+          }
+        }
 
         if (messageId && conversationId) {
           // Mark a single message as read

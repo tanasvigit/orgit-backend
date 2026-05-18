@@ -2,6 +2,11 @@ import { Request, Response } from 'express';
 import { createMessage, createMessageByConversationId, getMessages, editMessage, deleteMessage, togglePinMessage, starMessage, unstarMessage, getStarredMessages, searchMessages, markMessagesAsRead, updateMessageStatus, forwardMessage } from '../services/messageService';
 import { query } from '../config/database';
 import { getFileUrl, uploadMessageMediaToStorage } from '../services/mediaUploadService';
+import {
+  resolveConversationId,
+  emitNewMessageToMembers,
+} from '../services/conversationIdResolver';
+import { serializeTimestampForClient } from '../utils/deviceTime';
 
 /**
  * Send a message
@@ -41,9 +46,14 @@ export const sendMessage = async (req: Request, res: Response) => {
 
     // Conversation-based send (task-group or other conversation chats)
     if (conversationId) {
+      const resolved = await resolveConversationId(conversationId, userId, {
+        createDirectIfMissing: false,
+      });
+      const actualConversationId = resolved?.conversationId ?? conversationId;
+
       const memberCheck = await query(
         'SELECT 1 FROM conversation_members WHERE conversation_id::text = $1::text AND user_id = $2',
-        [conversationId, userId]
+        [actualConversationId, userId]
       );
       if (memberCheck.rows.length === 0) {
         return res.status(403).json({
@@ -53,7 +63,7 @@ export const sendMessage = async (req: Request, res: Response) => {
       }
       const senderOrganizationId = organizationId || null;
       const message = await createMessageByConversationId(
-        conversationId,
+        actualConversationId,
         userId,
         messageType,
         content || null,
@@ -68,7 +78,7 @@ export const sendMessage = async (req: Request, res: Response) => {
       );
       await query(
         'UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id::text = $1::text',
-        [conversationId]
+        [actualConversationId]
       );
       if (io) {
         const senderRow = await query('SELECT name, profile_photo_url as profile_photo FROM users WHERE id = $1', [userId]);
@@ -76,12 +86,14 @@ export const sendMessage = async (req: Request, res: Response) => {
         const senderPhoto = senderRow.rows[0]?.profile_photo || null;
         const convRow = await query(
           'SELECT COALESCE(is_task_group, false) AS is_task_group FROM conversations WHERE id::text = $1::text LIMIT 1',
-          [conversationId]
+          [actualConversationId]
         );
         const isTaskGroupConv = !!convRow.rows[0]?.is_task_group;
         const payload = {
           ...message,
-          conversation_id: conversationId,
+          conversation_id: actualConversationId,
+          legacy_conversation_id:
+            conversationId !== actualConversationId ? conversationId : undefined,
           sender_id: userId,
           text: message.content,
           sender_name: senderName,
@@ -90,12 +102,15 @@ export const sendMessage = async (req: Request, res: Response) => {
           is_task_group: isTaskGroupConv,
           isTaskGroup: isTaskGroupConv,
         };
-        io.to(conversationId).emit('new_message', payload);
-        const members = await query('SELECT user_id FROM conversation_members WHERE conversation_id::text = $1::text', [conversationId]);
-        for (const m of members.rows) {
-          io.to(`user_${m.user_id}`).emit('new_message', payload);
-          io.to(`user_${m.user_id}`).emit('receive_message', payload);
-        }
+        const members = await query(
+          'SELECT user_id FROM conversation_members WHERE conversation_id::text = $1::text',
+          [actualConversationId]
+        );
+        emitNewMessageToMembers(
+          io,
+          members.rows.map((m: { user_id: string }) => m.user_id),
+          payload
+        );
       }
       return res.json({
         success: true,
@@ -430,43 +445,25 @@ export const searchMessagesHandler = async (req: Request, res: Response) => {
 export const getMessagesByConversationId = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.userId;
-    let { conversationId } = req.params;
+    const requestedConversationId = req.params.conversationId;
     const limit = parseInt(req.query.limit as string) || 50;
     const offset = parseInt(req.query.offset as string) || 0;
 
-    if (!conversationId) {
+    if (!requestedConversationId) {
       return res.status(400).json({
         success: false,
         error: 'conversationId is required',
       });
     }
 
-    // CRITICAL FIX: Handle both UUID and "direct_<userId>" format from mobile app
-    // Messages are stored with conversation_id in "direct_<userId>" format when sent via socket
-    // So we can query directly using the conversationId as-is
-    
-    // For "direct_" format, verify the user has access (they're one of the two users)
-    if (conversationId.startsWith('direct_')) {
-      const otherUserId = conversationId.replace('direct_', '');
-      
-      // Verify this is a conversation between current user and other user
-      if (otherUserId !== userId) {
-        // Check if messages exist between these two users with this conversation_id
-        const messageCheck = await query(
-          `SELECT 1 FROM messages 
-           WHERE conversation_id = $1 
-             AND ((sender_id = $2 AND receiver_id = $3) OR (sender_id = $3 AND receiver_id = $2))
-             AND deleted_at IS NULL
-           LIMIT 1`,
-          [conversationId, userId, otherUserId]
-        );
-        
-        if (messageCheck.rows.length === 0) {
-          // No messages exist - return empty (new conversation)
-          return res.json({ messages: [] });
-        }
-      }
-    } else {
+    const resolved = await resolveConversationId(requestedConversationId, userId);
+    let conversationId = resolved?.conversationId ?? requestedConversationId;
+
+    if (requestedConversationId.startsWith('direct_') && conversationId === requestedConversationId) {
+      return res.json({ messages: [], conversationId: requestedConversationId });
+    }
+
+    if (!conversationId.startsWith('direct_')) {
       // For UUID format, verify user is member
       const memberCheck = await query(
         'SELECT * FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
@@ -662,10 +659,16 @@ export const getMessagesByConversationId = async (req: Request, res: Response) =
     // CRITICAL: Resolve media_url to signed URLs for S3 keys
     const messages = result.rows.reverse().map((msg: any) => ({
       ...msg,
+      created_at: serializeTimestampForClient(msg.created_at) ?? msg.created_at,
       media_url: msg.media_url ? getFileUrl(msg.media_url) : msg.media_url,
     }));
     console.log(`[getMessagesByConversationId] Returning ${messages.length} messages in chronological order`);
-    res.json({ messages });
+    res.json({
+      messages,
+      conversationId,
+      requestedConversationId:
+        requestedConversationId !== conversationId ? requestedConversationId : undefined,
+    });
   } catch (error: any) {
     console.error('[getMessagesByConversationId] Error:', error.message);
     console.error('[getMessagesByConversationId] Stack:', error.stack);
@@ -681,18 +684,21 @@ export const getMessagesByConversationId = async (req: Request, res: Response) =
 export const markMessagesAsReadByConversationId = async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user?.userId;
-    const { conversationId } = req.params;
+    const { conversationId: requestedConversationId } = req.params;
 
-    if (!conversationId) {
+    if (!requestedConversationId) {
       return res.status(400).json({
         success: false,
         error: 'conversationId is required',
       });
     }
 
+    const resolved = await resolveConversationId(requestedConversationId, userId);
+    const conversationId = resolved?.conversationId ?? requestedConversationId;
+
     // Verify user is member
     const memberCheck = await query(
-      'SELECT * FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+      'SELECT * FROM conversation_members WHERE conversation_id::text = $1::text AND user_id = $2',
       [conversationId, userId]
     );
 

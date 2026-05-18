@@ -156,7 +156,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
     { header: 'STATUS', key: 'status', width: 14 },
     { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
-    { header: 'ORG NODE NAME', key: 'org_node_name', width: 22 },
+    { header: 'ORG UNIT NAME', key: 'org_node_name', width: 22 },
     { header: 'PAN', key: 'pan', width: 16 },
     { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
     ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
@@ -252,7 +252,7 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'PRIMARY ORG NODE', key: 'primary_org_node', width: 24 },
+    { header: 'PRIMARY ORG UNIT', key: 'primary_org_node', width: 24 },
   ];
   employeesSheet.getRow(1).font = { bold: true };
 
@@ -301,7 +301,7 @@ export async function buildEntityMasterOnlyTemplate(): Promise<ExcelJS.Buffer> {
 /**
  * Build Excel template with only the Employee sheet.
  * Single sheet for use on /admin/users (Employee management) page.
- * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG NODE.
+ * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG UNIT.
  */
 export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
@@ -315,7 +315,7 @@ export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
     { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
     { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'PRIMARY ORG NODE', key: 'primary_org_node', width: 24 },
+    { header: 'PRIMARY ORG UNIT', key: 'primary_org_node', width: 24 },
   ];
   employeesSheet.getRow(1).font = { bold: true };
 
@@ -391,7 +391,7 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
     { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
     { header: 'STATUS', key: 'status', width: 14 },
     { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
-    { header: 'ORG NODE NAME', key: 'org_node_name', width: 22 },
+    { header: 'ORG UNIT NAME', key: 'org_node_name', width: 22 },
     { header: 'PAN', key: 'pan', width: 16 },
     { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
     ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
@@ -1166,13 +1166,18 @@ export async function parseAndApply(
         'org_structure_node_id',
         'org structure node id',
         'org node id',
-        'organization node id'
+        'organization node id',
+        'org unit id',
+        'organization unit id'
       );
       const orgNodeHintIdx = colAny(
         headers,
         'org node name',
         'organization node',
         'org node',
+        'org unit name',
+        'organization unit',
+        'org unit',
         'org path',
         'cost_centre_name',
         'cost centre',
@@ -1358,7 +1363,7 @@ export async function parseAndApply(
       }
     }
 
-    // --- Employees (NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG NODE) ---
+    // --- Employees (NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG UNIT) ---
     const employeesSheet = workbook.getWorksheet('Employees');
     console.log('[EntityMasterUpload] Employees sheet', employeesSheet ? { name: employeesSheet.name, rowCount: employeesSheet.rowCount, defaultOrgId } : 'NOT FOUND');
     if (employeesSheet && employeesSheet.rowCount >= 2 && defaultOrgId) {
@@ -1371,10 +1376,15 @@ export async function parseAndApply(
         'primary_org_node',
         'primary org node',
         'primary org node id',
+        'primary org unit',
+        'primary org unit id',
         'org structure node id',
         'organization node id',
         'org node id',
-        'org node'
+        'org node',
+        'organization unit id',
+        'org unit id',
+        'org unit'
       );
       if (mobileIdx >= 0 && nameIdx >= 0) {
         const maxRow = lastRow(employeesSheet);
@@ -1518,10 +1528,15 @@ export async function buildEmployeePayloadsFromSheet(
     'primary_org_node',
     'primary org node',
     'primary org node id',
+    'primary org unit',
+    'primary org unit id',
     'org structure node id',
     'organization node id',
     'org node id',
-    'org node'
+    'org node',
+    'organization unit id',
+    'org unit id',
+    'org unit'
   );
   if (mobileIdx < 0 || nameIdx < 0) return [];
   const payloads: EmployeeJobPayload[] = [];
@@ -1624,13 +1639,18 @@ export async function buildEntityListPayloadsFromSheet(
     'org_structure_node_id',
     'org structure node id',
     'org node id',
-    'organization node id'
+    'organization node id',
+    'org unit id',
+    'organization unit id'
   );
   const orgNodeHintIdx = colAny(
     headers,
     'org node name',
     'organization node',
     'org node',
+    'org unit name',
+    'organization unit',
+    'org unit',
     'org path',
     'cost_centre_name',
     'cost centre',
