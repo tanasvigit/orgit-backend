@@ -50,13 +50,20 @@ This creates all base tables (users, organizations, tasks, messages, conversatio
 
 ### 5. Run Migrations
 
-After the base schema is created, run incremental migrations:
+**New database (recommended):**
+
+```bash
+npm run db:bootstrap
+```
+
+**Existing database or incremental updates:**
 
 ```bash
 npm run migrate
+npm run migrate:status
 ```
 
-This applies additional migrations from the `migrations/` folder.
+Full guide: **[`migrations/README.md`](migrations/README.md)**.
 
 ### 6. Run Post-Setup Scripts
 

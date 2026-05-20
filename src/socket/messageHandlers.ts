@@ -11,19 +11,6 @@ import {
   shouldNotifyRecipient,
 } from '../services/conversationIdResolver';
 
-// Use existing Node firebaseAdmin helper for FCM push notifications
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const firebaseAdmin = require('../../services/firebaseAdmin') as {
-  sendPushToTokens?: (
-    tokens: string[],
-    title: string,
-    body: string,
-    data?: Record<string, string | number | boolean>
-  ) => Promise<void>;
-};
-
-const sendPushToTokens = firebaseAdmin?.sendPushToTokens;
-
 interface AuthenticatedSocket extends Socket {
   userId?: string;
   organizationId?: string;
@@ -742,36 +729,8 @@ export const setupMessageHandlers = (io: Server) => {
               body: notificationBody,
               refType: 'conversation',
               refId: actualConversationId || message.id,
-              channels: ['in_app'],
               io,
             });
-
-            // Fire-and-forget FCM push (same pattern as legacy JS socket)
-            if (sendPushToTokens) {
-              query('SELECT token FROM user_push_tokens WHERE user_id = $1', [member.user_id])
-                .then((tokenResult) => {
-                  const tokens = (tokenResult.rows || [])
-                    .map((r: any) => r.token)
-                    .filter(Boolean);
-
-                  if (tokens.length > 0) {
-                    console.log(
-                      '[send_message] Sending FCM push',
-                      { userId: member.user_id, tokens: tokens.length, conversationId: actualConversationId }
-                    );
-                    sendPushToTokens(tokens, notificationTitle, notificationBody, {
-                      conversationId: String(actualConversationId),
-                      type: 'message',
-                    });
-                  }
-                })
-                .catch((err: any) => {
-                  console.warn(
-                    '[send_message] FCM token fetch error:',
-                    err?.message || err
-                  );
-                });
-            }
           }
         }
       } catch (error: any) {

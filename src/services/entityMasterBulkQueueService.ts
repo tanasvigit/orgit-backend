@@ -23,6 +23,7 @@ export interface EntityMasterBulkUploadStatus {
   errors?: Array<{ sheet?: string; row?: number; message: string }>;
   summary?: {
     organizations?: number;
+    organization_structure_nodes?: number;
     task_services?: number;
     client_entities?: number;
     client_entity_services?: number;

@@ -59,19 +59,21 @@ This creates all base tables including:
 
 ### 4. Run Migrations
 
-After the base schema is created, run incremental migrations:
+**Recommended for a new database (one command):**
+
+```bash
+npm run db:bootstrap
+```
+
+This applies `database/schema.sql` and all files in `migrations/`.
+
+**Or** run base schema manually, then:
 
 ```bash
 npm run migrate
 ```
 
-This applies additional migrations from the `migrations/` folder:
-- `create-departments-table.sql`
-- `create-designations-table.sql`
-- `add-reporting-member-to-tasks.sql`
-- `add-task-assignees-completion-columns.sql`
-- `ALTER-messages-sender-org-id-nullable.sql`
-- `make-sender-org-id-nullable.sql`
+For **existing** databases, migration workflows, and all commands, see **[`migrations/README.md`](../migrations/README.md)**.
 
 ### 5. Run Post-Setup Scripts
 

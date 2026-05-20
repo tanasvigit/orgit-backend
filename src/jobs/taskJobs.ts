@@ -1,9 +1,5 @@
 import cron from 'node-cron';
-import {
-  escalateUnacceptedTasks,
-  escalateOverdueTasks,
-  escalateMissedRecurrence,
-} from '../services/escalationService';
+import { processTaskFieldEscalations } from '../services/escalationService';
 import { generateNextRecurrence } from '../services/recurringTaskService';
 import { query } from '../config/database';
 import { getReminderConfig } from '../services/platformSettingsService';
@@ -121,9 +117,7 @@ export const setupTaskJobs = (io?: any): void => {
     console.log('Running task status update job...');
     try {
       await updateTaskStatuses(io);
-      await escalateUnacceptedTasks();
-      await escalateOverdueTasks();
-      await escalateMissedRecurrence();
+      await processTaskFieldEscalations();
     } catch (error) {
       console.error('Error in task status update job:', error);
     }

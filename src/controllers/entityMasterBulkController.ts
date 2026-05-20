@@ -12,27 +12,53 @@ export async function getTemplate(req: AuthRequest, res: Response): Promise<void
   try {
     const only = req.query?.only as string;
     const onlyOrganisation = only === 'organisation';
+    const onlyOrganisationStructure = only === 'organisation-structure';
     const onlyEmployees = only === 'employees';
     const onlyServiceList = only === 'service-list';
     const onlyEntityList = only === 'entity-list';
-    console.log('[EntityMasterTemplate] GET template', { only, onlyOrganisation, onlyEmployees, onlyServiceList, onlyEntityList });
+    console.log('[EntityMasterTemplate] GET template', {
+      only,
+      onlyOrganisation,
+      onlyOrganisationStructure,
+      onlyEmployees,
+      onlyServiceList,
+      onlyEntityList,
+    });
+
+    let organizationId = req.user?.organizationId || null;
+    if (!organizationId && req.user?.userId) {
+      const orgResult = await query(
+        'SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1',
+        [req.user.userId]
+      );
+      organizationId = orgResult.rows[0]?.organization_id || null;
+    }
+    if (!organizationId) {
+      return void res.status(400).json({
+        success: false,
+        error: 'Organization ID is required to generate templates.',
+      });
+    }
 
     let buffer: Buffer;
     let filename: string;
     if (onlyOrganisation) {
       buffer = await entityMasterBulkService.buildEntityMasterOnlyTemplate();
       filename = 'Entity_Master_template.xlsx';
+    } else if (onlyOrganisationStructure) {
+      buffer = await entityMasterBulkService.buildOrgStructureOnlyTemplate(organizationId);
+      filename = 'Org_Structure_template.xlsx';
     } else if (onlyEmployees) {
-      buffer = await entityMasterBulkService.buildEmployeeOnlyTemplate();
+      buffer = await entityMasterBulkService.buildEmployeeOnlyTemplate(organizationId);
       filename = 'Employee_template.xlsx';
     } else if (onlyServiceList) {
       buffer = await entityMasterBulkService.buildServiceListOnlyTemplate();
       filename = 'Service_List_template.xlsx';
     } else if (onlyEntityList) {
-      buffer = await entityMasterBulkService.buildEntityListOnlyTemplate();
+      buffer = await entityMasterBulkService.buildEntityListOnlyTemplate(organizationId);
       filename = 'Entity_List_template.xlsx';
     } else {
-      buffer = await entityMasterBulkService.buildTemplateWorkbook();
+      buffer = await entityMasterBulkService.buildTemplateWorkbook(organizationId);
       filename = 'OrgIt_Settings_template.xlsx';
     }
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

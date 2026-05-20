@@ -19,6 +19,11 @@ import {
   resolveNodeReference,
   resolveOrganizationIdForUser,
 } from '../services/organizationStructureService';
+import {
+  buildEscalationRulesFromRequest,
+  normalizeEscalationDaysBefore,
+  normalizeEscalationTrigger,
+} from '../services/taskEscalationHelpers';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -663,6 +668,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       specific_weekday,
       auto_escalate,
       escalation_rules,
+      escalation_trigger,
+      escalation_days_before,
+      escalation_contact_ids,
       compliance_id,
       reporting_member_id,
       // If provided, this is the actual task owner / creator of record
@@ -735,14 +743,50 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       });
     }
 
-    // If the task is being created on behalf of another user, store metadata in escalation_rules.
-    // This is used later to prevent the original requester from joining the task group conversation.
-    let finalEscalationRules = escalation_rules;
-    if (isDifferentOwner) {
+    let finalEscalationRules = buildEscalationRulesFromRequest({
+      auto_escalate,
+      escalation_rules,
+      escalation_trigger,
+      escalation_days_before,
+      escalation_contact_ids,
+    });
+
+    const normalizedEscalationTrigger = auto_escalate
+      ? normalizeEscalationTrigger(
+          escalation_trigger ?? finalEscalationRules?.trigger
+        )
+      : null;
+    const normalizedEscalationDaysBefore = auto_escalate
+      ? normalizeEscalationDaysBefore(
+          escalation_days_before ?? finalEscalationRules?.days_before
+        )
+      : null;
+    const escalationContactIds: string[] =
+      auto_escalate && Array.isArray(escalation_contact_ids)
+        ? Array.from(
+            new Set(
+              escalation_contact_ids
+                .map((id: unknown) => (id != null ? String(id).trim() : ''))
+                .filter(Boolean)
+            )
+          )
+        : Array.isArray(finalEscalationRules?.contact_ids)
+          ? finalEscalationRules.contact_ids.map(String)
+          : [];
+
+    if (finalEscalationRules && escalationContactIds.length > 0) {
       finalEscalationRules = {
-        ...(escalation_rules || {}),
+        ...finalEscalationRules,
+        contact_ids: escalationContactIds,
+      };
+    }
+
+    // If the task is being created on behalf of another user, store metadata in escalation_rules.
+    if (isDifferentOwner && finalEscalationRules) {
+      finalEscalationRules = {
+        ...finalEscalationRules,
         _metadata: {
-          ...(escalation_rules?._metadata || {}),
+          ...(finalEscalationRules._metadata || {}),
           original_creator_id: userId,
           task_creator_id: taskCreatorId,
         },
@@ -873,7 +917,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
            'org_structure_level_key',
            'org_structure_path',
            'end_date',
-           'status'
+           'status',
+           'auto_escalate',
+           'escalation_rules',
+           'escalation_status',
+           'escalation_trigger',
+           'escalation_days_before'
          )`
     );
     const hasCreatedBy = columnCheck.rows.some((r: any) => r.column_name === 'created_by');
@@ -897,6 +946,13 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const hasEndDate = columnCheck.rows.some((r: any) => r.column_name === 'end_date');
     const hasStatusColumn = columnCheck.rows.some((r: any) => r.column_name === 'status');
     const hasTaskRolloutType = columnCheck.rows.some((r: any) => r.column_name === 'task_rollout_type');
+    const hasAutoEscalate = columnCheck.rows.some((r: any) => r.column_name === 'auto_escalate');
+    const hasEscalationRules = columnCheck.rows.some((r: any) => r.column_name === 'escalation_rules');
+    const hasEscalationStatus = columnCheck.rows.some((r: any) => r.column_name === 'escalation_status');
+    const hasEscalationTrigger = columnCheck.rows.some((r: any) => r.column_name === 'escalation_trigger');
+    const hasEscalationDaysBefore = columnCheck.rows.some(
+      (r: any) => r.column_name === 'escalation_days_before'
+    );
 
     const normalizedRecurrenceType =
       typeof recurrence_type === 'string' ? recurrence_type.toLowerCase() : null;
@@ -1058,13 +1114,29 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertValues.push(nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null);
     }
 
-    insertColumns.push('recurrence_type', 'recurrence_interval', 'auto_escalate', 'escalation_rules');
-    insertValues.push(
-      recurrenceTypeForStorage || null,
-      recurrence_interval || 1,
-      auto_escalate || false,
-      finalEscalationRules ? JSON.stringify(finalEscalationRules) : null
-    );
+    if (hasAutoEscalate) {
+      insertColumns.push('auto_escalate');
+      insertValues.push(!!auto_escalate);
+    }
+    if (hasEscalationRules) {
+      insertColumns.push('escalation_rules');
+      insertValues.push(finalEscalationRules ? JSON.stringify(finalEscalationRules) : null);
+    }
+    if (hasEscalationStatus) {
+      insertColumns.push('escalation_status');
+      insertValues.push('none');
+    }
+    if (hasEscalationTrigger && auto_escalate) {
+      insertColumns.push('escalation_trigger');
+      insertValues.push(normalizedEscalationTrigger || 'due_date');
+    }
+    if (hasEscalationDaysBefore && auto_escalate) {
+      insertColumns.push('escalation_days_before');
+      insertValues.push(normalizedEscalationDaysBefore ?? 0);
+    }
+
+    insertColumns.push('recurrence_type', 'recurrence_interval');
+    insertValues.push(recurrenceTypeForStorage || null, recurrence_interval || 1);
 
     if (hasTaskRolloutType && createRecurringTemplate) {
       insertColumns.push('task_rollout_type');
@@ -1438,6 +1510,25 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       );
     }
 
+    if (auto_escalate && escalationContactIds.length > 0) {
+      for (const escalationUserId of escalationContactIds) {
+        if (!escalationUserId) continue;
+        await client.query(
+          `INSERT INTO task_assignees (task_id, user_id, status, role)
+           VALUES ($1, $2, $3, 'escalation_contact')
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET role = 'escalation_contact'`,
+          [task.id, escalationUserId, assigneeStatus]
+        );
+        await client.query(
+          `INSERT INTO conversation_members (conversation_id, user_id, role)
+           VALUES ($1, $2, 'member')
+           ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+          [conversation.id, escalationUserId]
+        );
+      }
+    }
+
     // Create auto-generated message in task group
     // Check which columns exist in messages table
     const messageColumnCheck = await client.query(
@@ -1509,7 +1600,6 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           body: `Task group auto-created by ${creatorName}`,
           refId: conversation.id,
           refType: 'conversation',
-          channels: ['in_app'],
           io,
         });
       }
@@ -1831,7 +1921,6 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
       body: `Task moved to ${status}`,
       refId: id,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
 
@@ -2057,7 +2146,6 @@ export const deleteTask = async (req: AuthRequest, res: Response) => {
       body: `Task "${task.title}" was deleted.`,
       refId: id,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     res.json({ success: true, message: 'Task deleted' });
@@ -2139,7 +2227,6 @@ export const completeTaskForVerification = async (req: AuthRequest, res: Respons
       body: `${task.title} was marked complete and needs your verification.`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     io?.to(`task_${taskId}`).emit('task:status_changed', {
@@ -2222,7 +2309,6 @@ export const verifyTaskCompletion = async (req: AuthRequest, res: Response) => {
       body: `${task.title} was verified by the owner.`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
 
@@ -2350,7 +2436,6 @@ export const ownerCompleteTask = async (req: AuthRequest, res: Response) => {
       body: `${task.title} was marked completed by the owner.`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
 
@@ -2443,7 +2528,6 @@ export const rejectTaskCompletion = async (req: AuthRequest, res: Response) => {
       body: reason,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
 
@@ -2532,7 +2616,6 @@ export const requestTaskDelete = async (req: AuthRequest, res: Response) => {
       body: `${reason}`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     res.json({
@@ -2629,7 +2712,6 @@ export const approveTaskDeleteRequest = async (req: AuthRequest, res: Response) 
         body: `${task.title} has been deleted.`,
         refId: taskId,
         refType: 'task',
-        channels: ['in_app'],
         io,
       });
     }
@@ -2720,7 +2802,6 @@ export const denyTaskDeleteRequest = async (req: AuthRequest, res: Response) => 
         body: `${task.title} delete request was denied.`,
         refId: taskId,
         refType: 'task',
-        channels: ['in_app'],
         io,
       });
     }
@@ -2813,7 +2894,6 @@ export const createExitRequest = async (req: AuthRequest, res: Response) => {
       body: comment,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     res.json({ success: true, request: requestResult.rows[0] });
@@ -2908,7 +2988,6 @@ export const approveExitRequest = async (req: AuthRequest, res: Response) => {
       body: `You have been released from ${task.title}.`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     res.json({ success: true });
@@ -2996,7 +3075,6 @@ export const rejectExitRequest = async (req: AuthRequest, res: Response) => {
       body: `Exit request for ${task.title} was rejected.`,
       refId: taskId,
       refType: 'task',
-      channels: ['in_app'],
       io,
     });
     res.json({ success: true });

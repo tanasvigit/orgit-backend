@@ -4,6 +4,7 @@ import {
   createConversation,
   getConversation,
   getAllUsers,
+  getOrganizationContacts,
   pinConversation,
   createGroupConversation,
   createTaskGroupConversation,
@@ -41,6 +42,16 @@ router.get(
     max: 60, // up to 60 list calls per minute per user/IP
   }),
   getAllUsers
+);
+
+// GET /api/conversations/users/org - Organization directory (same org as requester)
+router.get(
+  '/users/org',
+  rateLimit({
+    windowMs: 60_000,
+    max: 60,
+  }),
+  getOrganizationContacts
 );
 
 // PUT /api/conversations/:conversationId/pin - Pin/unpin conversation

@@ -901,3 +901,57 @@ export const getAllUsers = async (req: AuthRequest, res: Response) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+/**
+ * Active users in the requester's organization (org directory / "org contacts").
+ */
+export const getOrganizationContacts = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const userRole = req.user?.role;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const orgResult = await query(
+      `SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1`,
+      [userId]
+    );
+    const organizationId = orgResult.rows[0]?.organization_id;
+    if (!organizationId) {
+      return res.json({ users: [] });
+    }
+
+    const roleFilter = userRole === 'super_admin' ? '' : " AND u.role != 'super_admin'";
+
+    const result = await query(
+      `SELECT u.id, u.name, u.mobile as phone, u.profile_photo_url as profile_photo,
+              (u.status = 'active') as is_active,
+              uo.organization_id
+       FROM users u
+       INNER JOIN user_organizations uo ON u.id = uo.user_id
+       WHERE uo.organization_id = $1
+         AND u.status = 'active'
+         AND u.id != $2${roleFilter}
+       ORDER BY u.name`,
+      [organizationId, userId]
+    );
+
+    const usersWithResolvedPhotos = result.rows.map((row: any) => {
+      const photoValue = row.profile_photo || null;
+      const resolvedUrl = photoValue ? resolveToUrl(photoValue) || photoValue : null;
+      return {
+        ...row,
+        profile_photo: resolvedUrl,
+        profile_photo_url: resolvedUrl,
+        organizationId: row.organization_id,
+      };
+    });
+
+    res.json({ users: usersWithResolvedPhotos });
+  } catch (error: any) {
+    console.error('Get organization contacts error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};

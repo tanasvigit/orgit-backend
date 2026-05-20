@@ -74,14 +74,14 @@ export const createTask = async (
 
     // Create notifications for assignees
     for (const userId of assignedUserIds) {
-      await createNotification(
+      await createNotification({
         userId,
-        'New Task Assigned',
-        `You have been assigned a new task: ${title}`,
-        'task_assigned',
-        'task',
-        task.id
-      );
+        type: 'task_assigned',
+        title: 'New Task Assigned',
+        body: `You have been assigned a new task: ${title}`,
+        relatedEntityType: 'task',
+        relatedEntityId: task.id,
+      });
     }
   }
 
@@ -288,14 +288,14 @@ export const acceptTask = async (
   const taskResult = await query('SELECT creator_id, title FROM tasks WHERE id = $1', [taskId]);
   if (taskResult.rows.length > 0) {
     const task = taskResult.rows[0];
-    await createNotification(
-      task.creator_id,
-      'Task Accepted',
-      `Task "${task.title}" has been accepted`,
-      'task_accepted',
-      'task',
-      taskId
-    );
+    await createNotification({
+      userId: task.creator_id,
+      type: 'task_accepted',
+      title: 'Task Accepted',
+      body: `Task "${task.title}" has been accepted`,
+      relatedEntityType: 'task',
+      relatedEntityId: taskId,
+    });
   }
 
   return assignment as TaskAssignment;
@@ -340,14 +340,14 @@ export const rejectTask = async (
   const taskResult = await query('SELECT creator_id, title FROM tasks WHERE id = $1', [taskId]);
   if (taskResult.rows.length > 0) {
     const task = taskResult.rows[0];
-    await createNotification(
-      task.creator_id,
-      'Task Rejected',
-      `Task "${task.title}" has been rejected. Reason: ${rejectionReason}`,
-      'task_rejected',
-      'task',
-      taskId
-    );
+    await createNotification({
+      userId: task.creator_id,
+      type: 'task_rejected',
+      title: 'Task Rejected',
+      body: `Task "${task.title}" has been rejected. Reason: ${rejectionReason}`,
+      relatedEntityType: 'task',
+      relatedEntityId: taskId,
+    });
   }
 
   return assignment as TaskAssignment;

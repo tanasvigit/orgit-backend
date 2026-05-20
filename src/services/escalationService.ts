@@ -1,154 +1,223 @@
 import { query } from '../config/database';
-import { createMessage } from './messageService';
-import { getTaskAssignments } from './taskService';
-import { getAutoEscalationConfig } from './platformSettingsService';
+import { createMessageByConversationId } from './messageService';
 import { dispatchNotification } from './notification-bus.service';
+import {
+  parseEscalationRules,
+  resolveTaskEscalationConfig,
+} from './taskEscalationHelpers';
+
+type TaskEscalationCandidate = {
+  id: string;
+  title: string;
+  creator_id: string;
+  organization_id: string;
+  target_date: Date | string | null;
+  due_date: Date | string | null;
+  escalation_trigger: string | null;
+  escalation_days_before: number | null;
+  escalation_rules: unknown;
+};
+
+async function tasksTableHasColumn(columnName: string): Promise<boolean> {
+  const result = await query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'tasks'
+       AND column_name = $1
+     LIMIT 1`,
+    [columnName]
+  );
+  return result.rows.length > 0;
+}
 
 /**
- * Check and escalate tasks that are not accepted
+ * Escalate tasks where auto_escalate is enabled and the per-task schedule is due.
+ * Schedule: CURRENT_DATE >= (anchor_date - escalation_days_before days)
+ * Anchor: target_date or due_date per escalation_trigger / escalation_rules.
  */
+export const processTaskFieldEscalations = async (): Promise<void> => {
+  const hasAutoEscalate = await tasksTableHasColumn('auto_escalate');
+  if (!hasAutoEscalate) return;
+
+  const hasTriggerCol = await tasksTableHasColumn('escalation_trigger');
+  const hasDaysCol = await tasksTableHasColumn('escalation_days_before');
+
+  const triggerExpr = hasTriggerCol
+    ? `COALESCE(NULLIF(TRIM(t.escalation_trigger), ''), NULLIF(TRIM(t.escalation_rules->>'trigger'), ''), 'due_date')`
+    : `COALESCE(NULLIF(TRIM(t.escalation_rules->>'trigger'), ''), 'due_date')`;
+
+  const daysExpr = hasDaysCol
+    ? `COALESCE(t.escalation_days_before, NULLIF(TRIM(t.escalation_rules->>'days_before'), '')::int, 0)`
+    : `COALESCE(NULLIF(TRIM(t.escalation_rules->>'days_before'), '')::int, 0)`;
+
+  const result = await query(
+    `SELECT
+       t.id,
+       t.title,
+       COALESCE(t.created_by, t.creator_id) AS creator_id,
+       t.organization_id,
+       t.target_date,
+       t.due_date,
+       ${hasTriggerCol ? 't.escalation_trigger,' : ''}
+       ${hasDaysCol ? 't.escalation_days_before,' : ''}
+       t.escalation_rules
+     FROM tasks t
+     WHERE COALESCE(t.auto_escalate, false) = true
+       AND COALESCE(t.escalation_status, 'none') = 'none'
+       AND COALESCE(t.status, '') NOT IN ('completed', 'deleted', 'rejected', 'cancelled')
+       AND COALESCE(t.is_recurring_template, false) = false
+       AND COALESCE(t.task_type, 'one_time') NOT IN ('recurring_template')
+       AND (
+         (
+           ${triggerExpr} = 'target_date'
+           AND t.target_date IS NOT NULL
+           AND CURRENT_DATE >= (t.target_date::date - (${daysExpr} * INTERVAL '1 day'))
+         )
+         OR (
+           ${triggerExpr} <> 'target_date'
+           AND t.due_date IS NOT NULL
+           AND CURRENT_DATE >= (t.due_date::date - (${daysExpr} * INTERVAL '1 day'))
+         )
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM task_assignees ta
+         WHERE ta.task_id = t.id
+           AND COALESCE(ta.role, 'member') <> 'escalation_contact'
+           AND ta.verified_at IS NULL
+           AND (
+             ta.completed_at IS NULL
+             OR COALESCE(ta.status, '') NOT IN ('completed', 'done')
+           )
+       )`,
+    []
+  );
+
+  for (const row of result.rows as TaskEscalationCandidate[]) {
+    const { trigger, daysBefore } = resolveTaskEscalationConfig(row);
+    const anchor =
+      trigger === 'target_date' ? row.target_date : row.due_date;
+    const anchorLabel = trigger === 'target_date' ? 'target date' : 'due date';
+    const anchorDay =
+      anchor instanceof Date
+        ? anchor.toISOString().slice(0, 10)
+        : anchor
+          ? String(anchor).slice(0, 10)
+          : '';
+
+    const reason =
+      daysBefore > 0
+        ? `Auto escalation: ${daysBefore} day(s) before ${anchorLabel}${anchorDay ? ` (${anchorDay})` : ''}`
+        : `Auto escalation: ${anchorLabel} threshold reached${anchorDay ? ` (${anchorDay})` : ''}`;
+
+    await escalateTask(row.id, reason);
+  }
+};
+
+/** @deprecated Use processTaskFieldEscalations — kept for imports/tests */
 export const escalateUnacceptedTasks = async (): Promise<void> => {
-  const config = await getAutoEscalationConfig();
-  
-  if (!config.enabled) {
-    return;
-  }
-
-  // Get tasks with pending assignments that are past their start date + configured hours
-  const result = await query(
-    `SELECT DISTINCT t.*, ta.assigned_to_user_id, ta.assigned_by_user_id
-     FROM tasks t
-     INNER JOIN task_assignments ta ON t.id = ta.task_id
-     WHERE ta.status = 'pending'
-     AND t.start_date IS NOT NULL
-     AND t.start_date <= CURRENT_TIMESTAMP - INTERVAL '1 hour' * $1
-     AND t.escalation_status = 'none'`,
-    [config.unacceptedHours]
-  );
-
-  for (const row of result.rows) {
-    await escalateTask(row.id, `Task not accepted within ${config.unacceptedHours} hours`);
-  }
+  await processTaskFieldEscalations();
 };
 
-/**
- * Check and escalate overdue tasks
- */
+/** @deprecated Use processTaskFieldEscalations */
 export const escalateOverdueTasks = async (): Promise<void> => {
-  const config = await getAutoEscalationConfig();
-  
-  if (!config.enabled) {
-    return;
-  }
-
-  // Get tasks that are overdue by configured days
-  const result = await query(
-    `SELECT DISTINCT t.*
-     FROM tasks t
-     INNER JOIN task_assignments ta ON t.id = ta.task_id
-     WHERE ta.status IN ('accepted', 'in_progress')
-     AND t.due_date IS NOT NULL
-     AND t.due_date < CURRENT_DATE - INTERVAL '1 day' * $1
-     AND t.status != 'completed'
-     AND t.escalation_status = 'none'`,
-    [config.overdueDays]
-  );
-
-  for (const row of result.rows) {
-    await escalateTask(row.id, `Task is overdue by more than ${config.overdueDays} days`);
-  }
+  // No-op: per-task fields drive escalation
 };
 
+async function getEscalationRecipientIds(taskId: string): Promise<string[]> {
+  const ids = new Set<string>();
+
+  const assigneeResult = await query(
+    `SELECT user_id
+     FROM task_assignees
+     WHERE task_id = $1
+       AND COALESCE(role, 'member') = 'escalation_contact'`,
+    [taskId]
+  );
+  for (const row of assigneeResult.rows) {
+    if (row.user_id) ids.add(String(row.user_id));
+  }
+
+  const rulesResult = await query(
+    `SELECT escalation_rules FROM tasks WHERE id = $1 LIMIT 1`,
+    [taskId]
+  );
+  const rules = parseEscalationRules(rulesResult.rows[0]?.escalation_rules);
+  if (Array.isArray(rules.contact_ids)) {
+    for (const id of rules.contact_ids) {
+      if (id) ids.add(String(id));
+    }
+  }
+
+  if (ids.size === 0) {
+    const fallback = await query(
+      `SELECT user_id
+       FROM task_assignees
+       WHERE task_id = $1
+         AND COALESCE(role, 'member') <> 'escalation_contact'`,
+      [taskId]
+    );
+    for (const row of fallback.rows) {
+      if (row.user_id) ids.add(String(row.user_id));
+    }
+  }
+
+  return Array.from(ids);
+}
+
 /**
- * Escalate a task
+ * Mark task escalated, post to task group chat, notify escalation contacts (or assignees).
  */
 export const escalateTask = async (
   taskId: string,
   reason: string
 ): Promise<void> => {
-  // Update task escalation status
-  await query(
-    `UPDATE tasks 
+  const updated = await query(
+    `UPDATE tasks
      SET escalation_status = 'escalated', updated_at = NOW()
-     WHERE id = $1`,
+     WHERE id = $1
+       AND COALESCE(escalation_status, 'none') = 'none'
+     RETURNING id, title, COALESCE(created_by, creator_id) AS creator_id, organization_id`,
     [taskId]
   );
 
-  // Get task group
-  const groupResult = await query(
-    `SELECT id FROM groups WHERE task_id = $1 LIMIT 1`,
+  if (updated.rows.length === 0) return;
+
+  const task = updated.rows[0];
+  const conversationResult = await query(
+    `SELECT id FROM conversations
+     WHERE task_id = $1 AND is_task_group = TRUE
+     LIMIT 1`,
     [taskId]
   );
 
-  if (groupResult.rows.length > 0) {
-    const groupId = groupResult.rows[0].id;
-    const taskResult = await query('SELECT title, creator_id, organization_id FROM tasks WHERE id = $1', [taskId]);
-    const task = taskResult.rows[0];
-
-    // Send escalation message to task group
-    await createMessage(
-      task.creator_id, // System message from creator
-      null,
-      groupId,
+  if (conversationResult.rows.length > 0) {
+    const conversationId = conversationResult.rows[0].id;
+    await createMessageByConversationId(
+      conversationId,
+      task.creator_id,
       'text',
       `⚠️ Task Escalation: ${task.title}\nReason: ${reason}`,
-      null,
-      null,
-      null,
-      null,
-      'shared_to_group',
       task.organization_id,
-      null,
-      null,
-      [],
-      []
+      'shared_to_group'
     );
   }
 
-  // Create notifications for all assignees
-  const assignments = await getTaskAssignments(taskId);
-  for (const assignment of assignments) {
-    await dispatchNotification({
-      type: 'TASK_ESCALATED',
-      recipientIds: [assignment.assignedToUserId],
-      title: 'Task Escalated',
-      body: reason,
-      refType: 'task',
-      refId: taskId,
-      channels: ['in_app'],
-    });
-  }
+  const recipientIds = await getEscalationRecipientIds(taskId);
+  if (recipientIds.length === 0) return;
+
+  await dispatchNotification({
+    type: 'TASK_ESCALATED',
+    recipientIds,
+    title: 'Task Escalated',
+    body: reason,
+    refType: 'task',
+    refId: taskId,
+  });
 };
 
-/**
- * Check and escalate missed recurring tasks
- */
+/** Recurring template misses are not per-task field driven — left as no-op */
 export const escalateMissedRecurrence = async (): Promise<void> => {
-  const config = await getAutoEscalationConfig();
-  
-  if (!config.enabled || !config.missedRecurrenceEnabled) {
-    return;
-  }
-
-  const tableCheck = await query(
-    `SELECT to_regclass('public.task_recurrence_templates') AS table_name`,
-    []
-  );
-  if (!tableCheck.rows[0]?.table_name) {
-    return;
-  }
-  const result = await query(
-    `SELECT id, task_id
-     FROM task_recurrence_templates
-     WHERE status = 'active'
-       AND next_recurrence_date IS NOT NULL
-       AND next_recurrence_date < CURRENT_DATE`,
-    []
-  );
-
-  for (const row of result.rows) {
-    if (!row.task_id) continue;
-    await escalateTask(row.task_id, 'Recurring template missed generation schedule');
-  }
+  // Intentionally disabled; use per-task auto_escalate on generated instances instead.
 };
-

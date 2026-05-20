@@ -4,7 +4,23 @@ import { PoolClient } from 'pg';
 import { getClient, query } from '../config/database';
 import { ORG_CONSTITUTION_VALUES, ORG_CONSTITUTION_OPTIONS } from './masterDataService';
 import { applyTaskBulkSheetValidations } from './taskBulkService';
-import { resolveNodeReference } from './organizationStructureService';
+import { resolveNodeReference, type OrganizationStructureLevel } from './organizationStructureService';
+import {
+  addOrganisationStructureDataSheet,
+  addStructureReferenceSheet,
+  buildLevelColumnDefs,
+  buildOrgFieldValuesPayload,
+  findDeprecatedSheets,
+  findLegacyEntityListColumns,
+  findLevelColumnIndices,
+  getActiveLevelsFromL2,
+  getDeepestSelectedNodeId,
+  loadOrganizationStructureLevels,
+  loadTreeForBulk,
+  parseOrganizationStructureSheet,
+  parseOrgNodeByLevelFromRow,
+  type OrgNodeByLevel,
+} from './orgStructureBulkUtils';
 
 const TASK_FREQUENCIES = ['Daily', 'Weekly', 'Fortnightly', 'Monthly', 'Quarterly', 'Half Yearly', 'Yearly', 'NA', 'Custom'];
 const TASK_TYPES = ['recurring', 'one_time'];
@@ -102,6 +118,7 @@ const PHONE_PIN_MAX = 20;
 export interface UploadResult {
   updated: {
     organizations: number;
+    organization_structure_nodes: number;
     task_services: number;
     client_entities: number;
     client_entity_services: number;
@@ -110,18 +127,58 @@ export interface UploadResult {
   errors: Array<{ sheet?: string; row?: number; message: string }>;
 }
 
+function buildEntityListSheetColumns(complianceHeaders: string[], levels: OrganizationStructureLevel[]) {
+  const levelCols = buildLevelColumnDefs(levels).map((def) => ({
+    header: def.header,
+    key: `level_${def.level.levelNumber}`,
+    width: Math.min(28, def.header.length + 4),
+  }));
+  return [
+    { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
+    { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
+    { header: 'STATUS', key: 'status', width: 14 },
+    ...levelCols,
+    { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
+    { header: 'PAN', key: 'pan', width: 16 },
+    { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
+    ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
+  ];
+}
+
+function buildEmployeeSheetColumns(levels: OrganizationStructureLevel[]) {
+  const levelCols = buildLevelColumnDefs(levels).map((def) => ({
+    header: def.header,
+    key: `level_${def.level.levelNumber}`,
+    width: Math.min(28, def.header.length + 4),
+  }));
+  return [
+    { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
+    { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
+    { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
+    ...levelCols,
+    { header: 'ORG STRUCTURE NODE ID', key: 'primary_org_node', width: 24 },
+  ];
+}
+
+/** Fixed columns before dynamic level columns on Entity List (for compliance start index). */
+function entityListFixedColumnCount(levelCount: number): number {
+  return 3 + levelCount + 1 + 2; // name, type, status, levels, node id, pan, partner
+}
+
 /**
  * Build Excel template workbook "OrgIt Settings" – one workbook with all updated sheets.
  * Sheet order: Entity Master Data (Org), Entity List, Service List, Tasks, Employees.
  * Sheet names match sections: /admin/entity-master, /admin/entities, /admin/services, /admin/users.
  * Entity List compliance columns are driven by task_services (recurring) in DB only; no initial list.
  */
-export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
+export async function buildTemplateWorkbook(organizationId: string): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'OrgIt Settings';
   workbook.created = new Date();
 
-  const complianceHeaders = await getRecurringTaskServiceTitles(null);
+  const tree = await loadTreeForBulk(organizationId);
+  const levels = tree.levels;
+  const complianceHeaders = await getRecurringTaskServiceTitles(organizationId);
 
   // Sheet 1: Entity Master Data (Org) – vertical layout: column A = field labels, column B = values
   const orgSheet = workbook.addWorksheet('Entity Master Data (Org)', {
@@ -147,25 +204,18 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
     }
   });
 
-  // Sheet 2: Entity List – for /admin/entities
+  // Sheet 2: Organisation Structure
+  addOrganisationStructureDataSheet(workbook, tree);
+
+  // Sheet 3: Entity List – for /admin/entities
   const entityListSheet = workbook.addWorksheet('Entity List', {
     headerFooter: { firstHeader: 'OrgIt Settings - Entity List' },
   });
-  const entityListCols = [
-    { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
-    { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
-    { header: 'STATUS', key: 'status', width: 14 },
-    { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
-    { header: 'ORG UNIT NAME', key: 'org_node_name', width: 22 },
-    { header: 'PAN', key: 'pan', width: 16 },
-    { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
-    ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
-  ];
+  const entityListCols = buildEntityListSheetColumns(complianceHeaders, levels);
   entityListSheet.columns = entityListCols;
   entityListSheet.getRow(1).font = { bold: true };
   const freqList = TASK_FREQUENCIES.join(',');
-  // Dropdown only for compliance columns (after fixed entity columns).
-  const entityListComplianceStartCol = 8;
+  const entityListComplianceStartCol = entityListFixedColumnCount(getActiveLevelsFromL2(levels).length) + 1;
   for (let c = entityListComplianceStartCol; c <= entityListCols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (entityListSheet as any).dataValidations.add(range, {
@@ -244,20 +294,34 @@ export async function buildTemplateWorkbook(): Promise<ExcelJS.Buffer> {
   tasksSheet.getColumn(10).numFmt = '@'; // Task Owner
   applyTaskBulkSheetValidations(tasksSheet);
 
-  // Sheet 5: Employees – for /admin/users
+  // Sheet 6: Employees – for /admin/users
   const employeesSheet = workbook.addWorksheet('Employees', {
     headerFooter: { firstHeader: 'OrgIt Settings - Employees' },
   });
-  employeesSheet.columns = [
-    { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
-    { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
-    { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'PRIMARY ORG UNIT', key: 'primary_org_node', width: 24 },
-  ];
+  employeesSheet.columns = buildEmployeeSheetColumns(levels);
   employeesSheet.getRow(1).font = { bold: true };
 
+  addStructureReferenceSheet(workbook, tree);
+
   const buffer = await workbook.xlsx.writeBuffer();
-  console.log('[EntityMasterTemplate] Built OrgIt Settings workbook (5 sheets: Entity Master Data (Org), Entity List, Service List, Tasks, Employees)');
+  console.log(
+    '[EntityMasterTemplate] Built OrgIt Settings workbook (Entity Master, Organisation Structure, Entity List, Service List, Tasks, Employees, Structure Reference)'
+  );
+  return buffer as ExcelJS.Buffer;
+}
+
+/**
+ * Build Excel template with only the Organisation Structure sheet (+ Structure Reference).
+ */
+export async function buildOrgStructureOnlyTemplate(organizationId: string): Promise<ExcelJS.Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'OrgIt Organisation Structure';
+  workbook.created = new Date();
+  const tree = await loadTreeForBulk(organizationId);
+  addOrganisationStructureDataSheet(workbook, tree);
+  addStructureReferenceSheet(workbook, tree);
+  const buffer = await workbook.xlsx.writeBuffer();
+  console.log('[EntityMasterTemplate] Built Organisation Structure template');
   return buffer as ExcelJS.Buffer;
 }
 
@@ -303,21 +367,18 @@ export async function buildEntityMasterOnlyTemplate(): Promise<ExcelJS.Buffer> {
  * Single sheet for use on /admin/users (Employee management) page.
  * Same column headers and order as full template: NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG UNIT.
  */
-export async function buildEmployeeOnlyTemplate(): Promise<ExcelJS.Buffer> {
+export async function buildEmployeeOnlyTemplate(organizationId: string): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'OrgIt Employees';
   workbook.created = new Date();
 
+  const tree = await loadTreeForBulk(organizationId);
   const employeesSheet = workbook.addWorksheet('Employees', {
     headerFooter: { firstHeader: 'Employee Management - Bulk Upload' },
   });
-  employeesSheet.columns = [
-    { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
-    { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
-    { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
-    { header: 'PRIMARY ORG UNIT', key: 'primary_org_node', width: 24 },
-  ];
+  employeesSheet.columns = buildEmployeeSheetColumns(tree.levels);
   employeesSheet.getRow(1).font = { bold: true };
+  addStructureReferenceSheet(workbook, tree);
 
   const buffer = await workbook.xlsx.writeBuffer();
   console.log('[EntityMasterTemplate] Built single-sheet Employee template');
@@ -377,31 +438,22 @@ export async function buildServiceListOnlyTemplate(): Promise<ExcelJS.Buffer> {
  * Compliance columns come from task_services (recurring) in DB only; no initial list.
  * After fixed entity columns, compliance columns have frequency dropdown: Daily, Weekly, Fortnightly, Monthly, etc.
  */
-export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
-  const complianceHeaders = await getRecurringTaskServiceTitles(null);
+export async function buildEntityListOnlyTemplate(organizationId: string): Promise<ExcelJS.Buffer> {
+  const complianceHeaders = await getRecurringTaskServiceTitles(organizationId);
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'OrgIt Entity List';
   workbook.created = new Date();
 
+  const tree = await loadTreeForBulk(organizationId);
   const sheet = workbook.addWorksheet('Entity List', {
     headerFooter: { firstHeader: 'Entity List - Bulk Upload' },
   });
-  const cols = [
-    { header: 'NAME OF THE CLIENT', key: 'name', width: 28 },
-    { header: 'ENTITY TYPE', key: 'entity_type', width: 18 },
-    { header: 'STATUS', key: 'status', width: 14 },
-    { header: 'ORG STRUCTURE NODE ID', key: 'org_structure_node_id', width: 22 },
-    { header: 'ORG UNIT NAME', key: 'org_node_name', width: 22 },
-    { header: 'PAN', key: 'pan', width: 16 },
-    { header: 'REPORTING PARTNER', key: 'reporting_partner_mobile', width: 20, style: { numFmt: '@' } as any },
-    ...complianceHeaders.map((h, i) => ({ header: h, key: `col_${i}`, width: Math.min(28, h.length + 2) })),
-  ];
+  const cols = buildEntityListSheetColumns(complianceHeaders, tree.levels);
   sheet.columns = cols;
   sheet.getRow(1).font = { bold: true };
 
-  // Dropdown for all compliance columns (after fixed entity columns)
   const freqList = TASK_FREQUENCIES.join(',');
-  const entityListOnlyComplianceStartCol = 8;
+  const entityListOnlyComplianceStartCol = entityListFixedColumnCount(getActiveLevelsFromL2(tree.levels).length) + 1;
   for (let c = entityListOnlyComplianceStartCol; c <= cols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (sheet as any).dataValidations.add(range, {
@@ -413,6 +465,8 @@ export async function buildEntityListOnlyTemplate(): Promise<ExcelJS.Buffer> {
       error: 'Select a frequency from the list (same as UI).',
     });
   }
+
+  addStructureReferenceSheet(workbook, tree);
 
   const buffer = await workbook.xlsx.writeBuffer();
   console.log('[EntityMasterTemplate] Built single-sheet Entity List template');
@@ -612,6 +666,43 @@ async function orgPathJsonForNode(organizationId: string, nodeId: string): Promi
   }
 }
 
+async function resolveOrgAssignmentForBulkRow(
+  organizationId: string,
+  row: ExcelJS.Row,
+  headers: unknown[],
+  levels: OrganizationStructureLevel[],
+  resolveOrgNodeCached: (orgId: string, hint: string) => Promise<string | null>,
+  explicitNodeColKeys: string[]
+): Promise<{
+  org_structure_node_id: string | null;
+  org_structure_path: string | null;
+  org_field_values: Record<string, unknown> | null;
+}> {
+  const levelsFromL2 = getActiveLevelsFromL2(levels);
+  const levelCols = findLevelColumnIndices(headers, levels);
+  const orgNodeByLevel: OrgNodeByLevel = await parseOrgNodeByLevelFromRow(row, levelCols, (raw) =>
+    resolveOrgNodeCached(organizationId, raw)
+  );
+  let org_structure_node_id = getDeepestSelectedNodeId(orgNodeByLevel, levelsFromL2);
+  const explicitIdx = colAny(headers, ...explicitNodeColKeys);
+  if (explicitIdx >= 0) {
+    const rawId = getCellStr(row, explicitIdx);
+    if (rawId?.trim()) {
+      const override = await resolveOrgNodeCached(organizationId, rawId);
+      if (override) org_structure_node_id = override;
+    }
+  }
+  let org_structure_path: string | null = null;
+  if (org_structure_node_id) {
+    org_structure_path = await orgPathJsonForNode(organizationId, org_structure_node_id);
+  }
+  return {
+    org_structure_node_id,
+    org_structure_path,
+    org_field_values: buildOrgFieldValuesPayload(orgNodeByLevel),
+  };
+}
+
 async function resolveClientEntityId(client: any, organizationId: string, clientName: string): Promise<string | null> {
   if (!clientName || !organizationId) return null;
   const r = await client.query(
@@ -714,17 +805,32 @@ function lastRow(sheet: ExcelJS.Worksheet): number {
  */
 export async function parseAndApply(
   fileBuffer: Buffer,
-  _userId: string,
+  userId: string,
   userOrganizationId: string | null,
   isSuperAdmin: boolean
 ): Promise<UploadResult> {
   const result: UploadResult = {
-    updated: { organizations: 0, task_services: 0, client_entities: 0, client_entity_services: 0, employees: 0 },
+    updated: {
+      organizations: 0,
+      organization_structure_nodes: 0,
+      task_services: 0,
+      client_entities: 0,
+      client_entity_services: 0,
+      employees: 0,
+    },
     errors: [],
   };
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(fileBuffer as any);
+
+  const deprecatedSheets = findDeprecatedSheets(workbook);
+  if (deprecatedSheets.length > 0) {
+    result.errors.push({
+      message: `Unsupported sheet(s): ${deprecatedSheets.join(', ')}. Download the current OrgIt Settings template.`,
+    });
+    return result;
+  }
 
   const sheetNames = workbook.worksheets.map((ws) => ws.name);
   console.log('[EntityMasterUpload] Workbook loaded', { sheetNames, rowCounts: workbook.worksheets.map((ws) => ({ name: ws.name, rows: ws.rowCount ?? 0 })) });
@@ -1062,6 +1168,25 @@ export async function parseAndApply(
       console.log('[EntityMasterUpload] Organisation sheet missing or empty – no organisation rows processed');
     }
 
+    // --- Organisation Structure (before Entity List / Employees) ---
+    const structureSheet = workbook.getWorksheet('Organisation Structure');
+    console.log(
+      '[EntityMasterUpload] Organisation Structure sheet',
+      structureSheet ? { name: structureSheet.name, rowCount: structureSheet.rowCount } : 'NOT FOUND (optional)'
+    );
+    if (structureSheet && (structureSheet.rowCount ?? 0) >= 2 && defaultOrgId) {
+      result.updated.organization_structure_nodes = await parseOrganizationStructureSheet(
+        structureSheet,
+        client,
+        defaultOrgId,
+        userId,
+        pushError
+      );
+      console.log('[EntityMasterUpload] Organisation Structure processed', {
+        updated: result.updated.organization_structure_nodes,
+      });
+    }
+
     // --- Service List (task_services); optional – skip if sheet missing ---
     // Accepts: RECURRING TASK TITLE/SERVICE LIST, FREQUENCY, TASK ROLL OUT, ONE TIME TASK LIST (or legacy title, task_type, frequency, rollout_rule, is_active)
     const serviceListSheet = workbook.getWorksheet('Service List');
@@ -1161,37 +1286,17 @@ export async function parseAndApply(
       const orgNameIdx = colAny(headers, 'organization_name');
       const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
       const statusIdx = colAny(headers, 'status');
-      const orgNodeIdIdx = colAny(
-        headers,
-        'org_structure_node_id',
-        'org structure node id',
-        'org node id',
-        'organization node id',
-        'org unit id',
-        'organization unit id'
-      );
-      const orgNodeHintIdx = colAny(
-        headers,
-        'org node name',
-        'organization node',
-        'org node',
-        'org unit name',
-        'organization unit',
-        'org unit',
-        'org path',
-        'cost_centre_name',
-        'cost centre',
-        'depot_name',
-        'depot',
-        'warehouse_name',
-        'warehouse'
-      );
+      const legacyCols = findLegacyEntityListColumns(headers);
       const panIdx = colAny(headers, 'pan');
       const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
       const clientEntityStatusColumn = await client.query(
         `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'status'`
       );
       const hasClientEntityStatus = clientEntityStatusColumn.rows.length > 0;
+      const clientOrgFieldValuesColumn = await client.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'org_field_values'`
+      );
+      const hasClientOrgFieldValues = clientOrgFieldValuesColumn.rows.length > 0;
       const normalizeClientEntityStatus = (raw: string): string | null => {
         const v = (raw || '').trim().toLowerCase();
         if (!v) return null;
@@ -1209,7 +1314,12 @@ export async function parseAndApply(
         const match = allowedTitles.find((t) => t.toLowerCase() === h.toLowerCase());
         if (match) complianceCols.push({ colIndex: i, taskServiceTitle: match });
       }
-      if (nameIdx >= 0) {
+      if (legacyCols.length > 0) {
+        pushError({
+          sheet: clientSheet.name,
+          message: `Unsupported column(s): ${legacyCols.join(', ')}. Use per-level columns from the current template.`,
+        });
+      } else if (nameIdx >= 0) {
         const maxRow = lastRow(clientSheet);
         if (hasMoreThanMaxRows(clientSheet))
           pushError({ sheet: clientSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
@@ -1234,25 +1344,47 @@ export async function parseAndApply(
             }
             const pan = panIdx >= 0 ? getCellStrMax(row, panIdx, 50) : '';
             const reporting_partner_mobile = reportingPartnerIdx >= 0 ? getCellStrMax(row, reportingPartnerIdx, PHONE_PIN_MAX) : '';
-            let orgStructureNodeId: string | null = null;
-            if (orgNodeIdIdx >= 0) {
-              const rawId = getCellStr(row, orgNodeIdIdx);
-              if (rawId?.trim()) orgStructureNodeId = await resolveOrgNodeCached(orgId, rawId);
-            }
-            if (!orgStructureNodeId && orgNodeHintIdx >= 0) {
-              const hint = getCellStr(row, orgNodeHintIdx);
-              if (hint?.trim()) orgStructureNodeId = await resolveOrgNodeCached(orgId, hint);
-            }
-            let orgStructurePathJson: string | null = null;
-            if (orgStructureNodeId) {
-              orgStructurePathJson = await orgPathJsonForNode(orgId, orgStructureNodeId);
-            }
+            const structureLevels = await loadOrganizationStructureLevels(client, orgId);
+            const assignment = await resolveOrgAssignmentForBulkRow(
+              orgId,
+              row,
+              headers,
+              structureLevels,
+              resolveOrgNodeCached,
+              [
+                'org_structure_node_id',
+                'org structure node id',
+                'org node id',
+                'organization node id',
+                'org unit id',
+                'organization unit id',
+              ]
+            );
+            const orgStructureNodeId = assignment.org_structure_node_id;
+            const orgStructurePathJson = assignment.org_structure_path;
+            const orgFieldValuesJson = assignment.org_field_values
+              ? JSON.stringify(assignment.org_field_values)
+              : null;
             const existing = await client.query(
               'SELECT id FROM client_entities WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
               [orgId, name]
             );
             if (existing.rows.length > 0) {
-              if (hasClientEntityStatus) {
+              if (hasClientEntityStatus && hasClientOrgFieldValues) {
+                await client.query(
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, org_field_values = COALESCE($5::jsonb, org_field_values), pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
+                  [
+                    entity_type || null,
+                    status,
+                    orgStructureNodeId,
+                    orgStructurePathJson,
+                    orgFieldValuesJson,
+                    pan || null,
+                    reporting_partner_mobile || null,
+                    existing.rows[0].id,
+                  ]
+                );
+              } else if (hasClientEntityStatus) {
                 await client.query(
                   "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
                   [
@@ -1265,6 +1397,19 @@ export async function parseAndApply(
                     existing.rows[0].id,
                   ]
                 );
+              } else if (hasClientOrgFieldValues) {
+                await client.query(
+                  "UPDATE client_entities SET entity_type = NULLIF($1, ''), org_structure_node_id = $2, org_structure_path = $3::jsonb, org_field_values = COALESCE($4::jsonb, org_field_values), pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+                  [
+                    entity_type || null,
+                    orgStructureNodeId,
+                    orgStructurePathJson,
+                    orgFieldValuesJson,
+                    pan || null,
+                    reporting_partner_mobile || null,
+                    existing.rows[0].id,
+                  ]
+                );
               } else {
                 await client.query(
                   "UPDATE client_entities SET entity_type = NULLIF($1, ''), org_structure_node_id = $2, org_structure_path = $3::jsonb, pan = NULLIF($4, ''), reporting_partner_mobile = NULLIF($5, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $6",
@@ -1272,10 +1417,39 @@ export async function parseAndApply(
                 );
               }
             } else {
-              if (hasClientEntityStatus) {
+              if (hasClientEntityStatus && hasClientOrgFieldValues) {
+                await client.query(
+                  "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, org_field_values, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, $7::jsonb, NULLIF($8, ''), NULLIF($9, ''))",
+                  [
+                    orgId,
+                    name,
+                    entity_type || null,
+                    status,
+                    orgStructureNodeId,
+                    orgStructurePathJson,
+                    orgFieldValuesJson,
+                    pan || null,
+                    reporting_partner_mobile || null,
+                  ]
+                );
+              } else if (hasClientEntityStatus) {
                 await client.query(
                   "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, NULLIF($7, ''), NULLIF($8, ''))",
                   [orgId, name, entity_type || null, status, orgStructureNodeId, orgStructurePathJson, pan || null, reporting_partner_mobile || null]
+                );
+              } else if (hasClientOrgFieldValues) {
+                await client.query(
+                  "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, org_field_values, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, $6::jsonb, NULLIF($7, ''), NULLIF($8, ''))",
+                  [
+                    orgId,
+                    name,
+                    entity_type || null,
+                    orgStructureNodeId,
+                    orgStructurePathJson,
+                    orgFieldValuesJson,
+                    pan || null,
+                    reporting_partner_mobile || null,
+                  ]
                 );
               } else {
                 await client.query(
@@ -1363,7 +1537,7 @@ export async function parseAndApply(
       }
     }
 
-    // --- Employees (NAME OF THE EMPLOYEE, MOBILE NUMBER, REPORTING TO, PRIMARY ORG UNIT) ---
+    // --- Employees ---
     const employeesSheet = workbook.getWorksheet('Employees');
     console.log('[EntityMasterUpload] Employees sheet', employeesSheet ? { name: employeesSheet.name, rowCount: employeesSheet.rowCount, defaultOrgId } : 'NOT FOUND');
     if (employeesSheet && employeesSheet.rowCount >= 2 && defaultOrgId) {
@@ -1371,21 +1545,11 @@ export async function parseAndApply(
       const mobileIdx = colAny(headers, 'mobile', 'mobile number');
       const nameIdx = colAny(headers, 'name', 'name of the employee');
       const reportIdx = colAny(headers, 'reporting_to_mobile', 'reporting to');
-      const primaryOrgNodeIdx = colAny(
-        headers,
-        'primary_org_node',
-        'primary org node',
-        'primary org node id',
-        'primary org unit',
-        'primary org unit id',
-        'org structure node id',
-        'organization node id',
-        'org node id',
-        'org node',
-        'organization unit id',
-        'org unit id',
-        'org unit'
+      const employeeOrgFieldValuesColumn = await client.query(
+        `SELECT column_name FROM information_schema.columns WHERE table_name = 'user_organizations' AND column_name = 'org_field_values'`
       );
+      const hasEmployeeOrgFieldValues = employeeOrgFieldValuesColumn.rows.length > 0;
+      const employeeStructureLevels = await loadOrganizationStructureLevels(client, defaultOrgId);
       if (mobileIdx >= 0 && nameIdx >= 0) {
         const maxRow = lastRow(employeesSheet);
         if (hasMoreThanMaxRows(employeesSheet))
@@ -1423,11 +1587,27 @@ export async function parseAndApply(
             if (reporting_to_value?.trim()) {
               reporting_to = await resolveReportingToByMobileOrName(client, defaultOrgId, reporting_to_value);
             }
-            let primary_org_node_id: string | null = null;
-            if (primaryOrgNodeIdx >= 0) {
-              const rawNode = getCellStr(row, primaryOrgNodeIdx);
-              if (rawNode?.trim()) primary_org_node_id = await resolveOrgNodeCached(defaultOrgId, rawNode);
-            }
+            const assignment = await resolveOrgAssignmentForBulkRow(
+              defaultOrgId,
+              row,
+              headers,
+              employeeStructureLevels,
+              resolveOrgNodeCached,
+              [
+                'org structure node id',
+                'org_structure_node_id',
+                'org node id',
+                'organization node id',
+                'primary org unit',
+                'primary org node',
+                'primary org node id',
+                'primary org unit id',
+              ]
+            );
+            const primary_org_node_id = assignment.org_structure_node_id;
+            const orgFieldValuesJson = assignment.org_field_values
+              ? JSON.stringify(assignment.org_field_values)
+              : null;
             let employeeUserId: string;
             const existingUserId = await resolveUserIdByMobile(client, mobileNorm);
             if (existingUserId) {
@@ -1448,12 +1628,21 @@ export async function parseAndApply(
                 [employeeUserId, 'Hey there! I am using OrgIT.', mobileNorm]
               );
             }
-            await client.query(
-              `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
+            if (hasEmployeeOrgFieldValues) {
+              await client.query(
+                `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, org_field_values, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, org_field_values = COALESCE($5::jsonb, user_organizations.org_field_values), updated_at = CURRENT_TIMESTAMP`,
+                [employeeUserId, defaultOrgId, reporting_to, primary_org_node_id, orgFieldValuesJson]
+              );
+            } else {
+              await client.query(
+                `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
              VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, updated_at = CURRENT_TIMESTAMP`,
-              [employeeUserId, defaultOrgId, reporting_to, primary_org_node_id]
-            );
+                [employeeUserId, defaultOrgId, reporting_to, primary_org_node_id]
+              );
+            }
             result.updated.employees += 1;
           } catch (err: any) {
             pushError({ sheet: 'Employees', row: r, message: err?.message ?? String(err) });
@@ -1484,6 +1673,7 @@ export interface EmployeeJobPayload {
   name: string;
   reporting_to_user_id: string | null;
   primary_org_node_id: string | null;
+  org_field_values: Record<string, unknown> | null;
 }
 
 export interface ServiceListJobPayload {
@@ -1504,6 +1694,7 @@ export interface EntityListJobPayload {
   status: string | null;
   org_structure_node_id: string | null;
   org_structure_path: string | null;
+  org_field_values: Record<string, unknown> | null;
   pan: string | null;
   reporting_partner_mobile: string | null;
   compliance: Array<{ task_service_id: string; frequency: string }>;
@@ -1523,23 +1714,17 @@ export async function buildEmployeePayloadsFromSheet(
   const mobileIdx = colAny(headers, 'mobile', 'mobile number');
   const nameIdx = colAny(headers, 'name', 'name of the employee');
   const reportIdx = colAny(headers, 'reporting_to_mobile', 'reporting to');
-  const primaryOrgNodeIdx = colAny(
-    headers,
-    'primary_org_node',
-    'primary org node',
-    'primary org node id',
-    'primary org unit',
-    'primary org unit id',
-    'org structure node id',
-    'organization node id',
-    'org node id',
-    'org node',
-    'organization unit id',
-    'org unit id',
-    'org unit'
-  );
   if (mobileIdx < 0 || nameIdx < 0) return [];
+  const structureLevels = await loadOrganizationStructureLevels(client, organizationId);
   const payloads: EmployeeJobPayload[] = [];
+  const orgNodeCache = new Map<string, string | null>();
+  const resolveOrgNodeCached = async (orgId: string, hint: string): Promise<string | null> => {
+    const key = `${orgId}|${hint.trim().toLowerCase()}`;
+    if (orgNodeCache.has(key)) return orgNodeCache.get(key)!;
+    const id = await resolveOrgStructureNodeId(client, orgId, hint);
+    orgNodeCache.set(key, id);
+    return id;
+  };
   const maxRow = lastRow(sheet);
   for (let r = 2; r <= maxRow; r++) {
     const row = sheet.getRow(r);
@@ -1562,16 +1747,29 @@ export async function buildEmployeePayloadsFromSheet(
     const reporting_to_user_id = reporting_to_value?.trim()
       ? await resolveReportingToByMobileOrName(client, organizationId, reporting_to_value)
       : null;
-    let primary_org_node_id: string | null = null;
-    if (primaryOrgNodeIdx >= 0) {
-      const rawNode = getCellStr(row, primaryOrgNodeIdx);
-      if (rawNode?.trim()) primary_org_node_id = await resolveOrgStructureNodeId(client, organizationId, rawNode);
-    }
+    const assignment = await resolveOrgAssignmentForBulkRow(
+      organizationId,
+      row,
+      headers,
+      structureLevels,
+      resolveOrgNodeCached,
+      [
+        'org structure node id',
+        'org_structure_node_id',
+        'org node id',
+        'organization node id',
+        'primary org unit',
+        'primary org node',
+        'primary org node id',
+        'primary org unit id',
+      ]
+    );
     payloads.push({
       mobile_normalized: mobileNorm,
       name: name || 'Employee',
       reporting_to_user_id,
-      primary_org_node_id,
+      primary_org_node_id: assignment.org_structure_node_id,
+      org_field_values: assignment.org_field_values,
     });
   }
   return payloads;
@@ -1634,31 +1832,8 @@ export async function buildEntityListPayloadsFromSheet(
   const orgNameIdx = colAny(headers, 'organization_name');
   const entityTypeIdx = colAny(headers, 'entity_type', 'entity type');
   const statusIdx = colAny(headers, 'status');
-  const orgNodeIdIdx = colAny(
-    headers,
-    'org_structure_node_id',
-    'org structure node id',
-    'org node id',
-    'organization node id',
-    'org unit id',
-    'organization unit id'
-  );
-  const orgNodeHintIdx = colAny(
-    headers,
-    'org node name',
-    'organization node',
-    'org node',
-    'org unit name',
-    'organization unit',
-    'org unit',
-    'org path',
-    'cost_centre_name',
-    'cost centre',
-    'depot_name',
-    'depot',
-    'warehouse_name',
-    'warehouse'
-  );
+  const legacyCols = findLegacyEntityListColumns(headers);
+  if (legacyCols.length > 0) return [];
   const panIdx = colAny(headers, 'pan');
   const reportingPartnerIdx = colAny(headers, 'reporting_partner_mobile', 'reporting partner', 'reporting_partner');
   const normalizeClientEntityStatus = (raw: string): string | null => {
@@ -1687,6 +1862,13 @@ export async function buildEntityListPayloadsFromSheet(
     orgNodeCache.set(key, id);
     return id;
   };
+  const structureLevelsCache = new Map<string, OrganizationStructureLevel[]>();
+  const loadLevelsCached = async (orgId: string) => {
+    if (!structureLevelsCache.has(orgId)) {
+      structureLevelsCache.set(orgId, await loadOrganizationStructureLevels(client, orgId));
+    }
+    return structureLevelsCache.get(orgId)!;
+  };
   const maxRow = lastRow(sheet);
   for (let r = 2; r <= maxRow; r++) {
     const row = sheet.getRow(r);
@@ -1704,19 +1886,22 @@ export async function buildEntityListPayloadsFromSheet(
     const status = normalizeClientEntityStatus(statusRaw);
     const pan = panIdx >= 0 ? getCellStrMax(row, panIdx, 50) : '';
     const reporting_partner_mobile = reportingPartnerIdx >= 0 ? getCellStrMax(row, reportingPartnerIdx, PHONE_PIN_MAX) : '';
-    let org_structure_node_id: string | null = null;
-    if (orgNodeIdIdx >= 0) {
-      const rawId = getCellStr(row, orgNodeIdIdx);
-      if (rawId?.trim()) org_structure_node_id = await resolveOrgNodeCached(orgId, rawId);
-    }
-    if (!org_structure_node_id && orgNodeHintIdx >= 0) {
-      const hint = getCellStr(row, orgNodeHintIdx);
-      if (hint?.trim()) org_structure_node_id = await resolveOrgNodeCached(orgId, hint);
-    }
-    let org_structure_path: string | null = null;
-    if (org_structure_node_id) {
-      org_structure_path = await orgPathJsonForNode(orgId, org_structure_node_id);
-    }
+    const structureLevels = await loadLevelsCached(orgId);
+    const assignment = await resolveOrgAssignmentForBulkRow(
+      orgId,
+      row,
+      headers,
+      structureLevels,
+      resolveOrgNodeCached,
+      [
+        'org_structure_node_id',
+        'org structure node id',
+        'org node id',
+        'organization node id',
+        'org unit id',
+        'organization unit id',
+      ]
+    );
     const compliance: EntityListJobPayload['compliance'] = [];
     for (const { colIndex, taskServiceTitle } of complianceCols) {
       const frequencyVal = getCellStr(row, colIndex);
@@ -1729,8 +1914,9 @@ export async function buildEntityListPayloadsFromSheet(
       name,
       entity_type: entity_type || null,
       status,
-      org_structure_node_id,
-      org_structure_path,
+      org_structure_node_id: assignment.org_structure_node_id,
+      org_structure_path: assignment.org_structure_path,
+      org_field_values: assignment.org_field_values,
       pan: pan || null,
       reporting_partner_mobile: reporting_partner_mobile || null,
       compliance,
@@ -1748,7 +1934,7 @@ export async function createEmployeeFromPayload(
   payload: EmployeeJobPayload,
   organizationId: string
 ): Promise<string> {
-  const { mobile_normalized, name, reporting_to_user_id, primary_org_node_id } = payload;
+  const { mobile_normalized, name, reporting_to_user_id, primary_org_node_id, org_field_values } = payload;
   let employeeUserId: string;
   const existingUserId = (await client.query(
     'SELECT id FROM users WHERE REPLACE(mobile, \' \', \'\') = $1 OR mobile = $1 LIMIT 1',
@@ -1772,12 +1958,26 @@ export async function createEmployeeFromPayload(
       [employeeUserId, 'Hey there! I am using OrgIT.', mobile_normalized]
     );
   }
-  await client.query(
-    `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
+  const orgFieldValuesColumn = await client.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = 'user_organizations' AND column_name = 'org_field_values'`
+  );
+  const hasOrgFieldValues = orgFieldValuesColumn.rows.length > 0;
+  const orgFieldValuesJson = org_field_values ? JSON.stringify(org_field_values) : null;
+  if (hasOrgFieldValues) {
+    await client.query(
+      `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, org_field_values, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+     ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, org_field_values = COALESCE($5::jsonb, user_organizations.org_field_values), updated_at = CURRENT_TIMESTAMP`,
+      [employeeUserId, organizationId, reporting_to_user_id, primary_org_node_id, orgFieldValuesJson]
+    );
+  } else {
+    await client.query(
+      `INSERT INTO user_organizations (user_id, organization_id, reporting_to, primary_org_node_id, created_at, updated_at)
      VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
      ON CONFLICT (user_id, organization_id) DO UPDATE SET reporting_to = $3, primary_org_node_id = $4, updated_at = CURRENT_TIMESTAMP`,
-    [employeeUserId, organizationId, reporting_to_user_id, primary_org_node_id]
-  );
+      [employeeUserId, organizationId, reporting_to_user_id, primary_org_node_id]
+    );
+  }
   return employeeUserId;
 }
 
@@ -1840,7 +2040,18 @@ export async function createClientEntityFromPayload(
   payload: EntityListJobPayload,
   _organizationId: string
 ): Promise<string> {
-  const { organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile, compliance } = payload;
+  const {
+    organization_id,
+    name,
+    entity_type,
+    status,
+    org_structure_node_id,
+    org_structure_path,
+    org_field_values,
+    pan,
+    reporting_partner_mobile,
+    compliance,
+  } = payload;
   const orgId = organization_id || _organizationId;
   const nameTrim = (name || '').trim();
   if (!nameTrim) throw new Error('Client entity name is required');
@@ -1850,6 +2061,11 @@ export async function createClientEntityFromPayload(
     `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'status'`
   );
   const hasClientEntityStatus = clientEntityStatusColumn.rows.length > 0;
+  const clientOrgFieldValuesColumn = await client.query(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = 'client_entities' AND column_name = 'org_field_values'`
+  );
+  const hasClientOrgFieldValues = clientOrgFieldValuesColumn.rows.length > 0;
+  const orgFieldValuesJson = org_field_values ? JSON.stringify(org_field_values) : null;
   const existing = await client.query(
     'SELECT id FROM client_entities WHERE organization_id = $1 AND LOWER(TRIM(name)) = LOWER($2) LIMIT 1',
     [orgId, nameSafe]
@@ -1857,10 +2073,37 @@ export async function createClientEntityFromPayload(
   let clientEntityId: string;
   if (existing.rows.length > 0) {
     clientEntityId = existing.rows[0].id;
-    if (hasClientEntityStatus) {
+    if (hasClientEntityStatus && hasClientOrgFieldValues) {
+      await client.query(
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, org_field_values = COALESCE($5::jsonb, org_field_values), pan = NULLIF($6, ''), reporting_partner_mobile = NULLIF($7, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $8",
+        [
+          entity_type || null,
+          status || null,
+          org_structure_node_id,
+          org_structure_path,
+          orgFieldValuesJson,
+          pan || null,
+          reporting_partner_mobile || null,
+          clientEntityId,
+        ]
+      );
+    } else if (hasClientEntityStatus) {
       await client.query(
         "UPDATE client_entities SET entity_type = NULLIF($1, ''), status = COALESCE($2, status), org_structure_node_id = $3, org_structure_path = $4::jsonb, pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
         [entity_type || null, status || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null, clientEntityId]
+      );
+    } else if (hasClientOrgFieldValues) {
+      await client.query(
+        "UPDATE client_entities SET entity_type = NULLIF($1, ''), org_structure_node_id = $2, org_structure_path = $3::jsonb, org_field_values = COALESCE($4::jsonb, org_field_values), pan = NULLIF($5, ''), reporting_partner_mobile = NULLIF($6, ''), updated_at = CURRENT_TIMESTAMP WHERE id = $7",
+        [
+          entity_type || null,
+          org_structure_node_id,
+          org_structure_path,
+          orgFieldValuesJson,
+          pan || null,
+          reporting_partner_mobile || null,
+          clientEntityId,
+        ]
       );
     } else {
       await client.query(
@@ -1869,15 +2112,44 @@ export async function createClientEntityFromPayload(
       );
     }
   } else {
-    const ins = hasClientEntityStatus
+    const ins = hasClientEntityStatus && hasClientOrgFieldValues
       ? await client.query(
-          "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
-          [orgId, nameSafe, entity_type || null, status || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
+          "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, org_field_values, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, $7::jsonb, NULLIF($8, ''), NULLIF($9, '')) RETURNING id",
+          [
+            orgId,
+            nameSafe,
+            entity_type || null,
+            status || null,
+            org_structure_node_id,
+            org_structure_path,
+            orgFieldValuesJson,
+            pan || null,
+            reporting_partner_mobile || null,
+          ]
         )
-      : await client.query(
-          "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, NULLIF($6, ''), NULLIF($7, '')) RETURNING id",
-          [orgId, nameSafe, entity_type || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
-        );
+      : hasClientEntityStatus
+        ? await client.query(
+            "INSERT INTO client_entities (organization_id, name, entity_type, status, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), COALESCE($4, 'active'), $5, $6::jsonb, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
+            [orgId, nameSafe, entity_type || null, status || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
+          )
+        : hasClientOrgFieldValues
+          ? await client.query(
+              "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, org_field_values, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, $6::jsonb, NULLIF($7, ''), NULLIF($8, '')) RETURNING id",
+              [
+                orgId,
+                nameSafe,
+                entity_type || null,
+                org_structure_node_id,
+                org_structure_path,
+                orgFieldValuesJson,
+                pan || null,
+                reporting_partner_mobile || null,
+              ]
+            )
+          : await client.query(
+              "INSERT INTO client_entities (organization_id, name, entity_type, org_structure_node_id, org_structure_path, pan, reporting_partner_mobile) VALUES ($1, $2, NULLIF($3, ''), $4, $5::jsonb, NULLIF($6, ''), NULLIF($7, '')) RETURNING id",
+              [orgId, nameSafe, entity_type || null, org_structure_node_id, org_structure_path, pan || null, reporting_partner_mobile || null]
+            );
     clientEntityId = ins.rows[0].id;
   }
   const freqNorm = (s: string) => {
