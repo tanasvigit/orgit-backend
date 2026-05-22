@@ -4,6 +4,19 @@ import {
   mergeFieldSchemasByKey,
   ORG_STRUCTURE_EXTENDED_FIELD_CATALOG,
 } from './organizationStructureExtendedFieldCatalog';
+import {
+  getOrgStructureSchemaCapabilities,
+} from './orgStructureSchemaCapabilities';
+import {
+  ensureStageAtOrder,
+  ensureStagesForOrganization,
+  getStagesInternal,
+  linkLevelToStage,
+  resolveStageOrderForNodeCreate,
+  type OrganizationStructureStage,
+} from './organizationStructureStages';
+
+export type { OrganizationStructureStage } from './organizationStructureStages';
 
 type DbClient = {
   query: (text: string, params?: any[]) => Promise<any>;
@@ -44,10 +57,14 @@ export interface OrganizationStructureLevel {
 export interface OrganizationStructureNode {
   id: string;
   organizationId: string;
+  stageId?: string | null;
+  stageOrder?: number | null;
+  stageLabel?: string | null;
   levelId: string;
   levelNumber: number;
   levelKey: string;
   levelLabel: string;
+  entityField?: string | null;
   parentNodeId?: string | null;
   parentName?: string | null;
   name: string;
@@ -81,23 +98,30 @@ export interface OrganizationStructureNode {
 }
 
 export interface OrganizationStructureTree {
+  stages: OrganizationStructureStage[];
   levels: OrganizationStructureLevel[];
   nodes: OrganizationStructureNode[];
   rootNode: OrganizationStructureNode | null;
   summary: {
+    totalStages: number;
     totalLevels: number;
     totalNodes: number;
     activeNodes: number;
     archivedNodes: number;
-    hasRootGroup: boolean;
+    hasRootNode: boolean;
   };
 }
 
 export interface CreateOrganizationStructureNodeInput {
   relation: 'root' | 'child' | 'sibling';
   referenceNodeId?: string;
+  /** When set, node attaches under this parent (loose coupling — any ancestor, not only reference). */
+  parentNodeId?: string;
+  targetLevelId?: string;
+  stageId?: string;
   targetLevelNumber?: number;
   targetSectionLabel?: string;
+  entityField?: string;
   name?: string;
   code?: string | null;
   description?: string;
@@ -418,10 +442,18 @@ function mapLevel(row: any): OrganizationStructureLevel {
 function mapNodeBase(row: any): Omit<OrganizationStructureNode, 'path' | 'pathDisplay' | 'pathCodes' | 'pathIds' | 'hasChildren' | 'childrenCount'> {
   const status = normalizeStatus(row.status);
   const metaJson = row.meta_json ?? {};
+  const entityFieldFromMeta =
+    typeof metaJson.entityType === 'string' && String(metaJson.entityType).trim()
+      ? String(metaJson.entityType).trim()
+      : null;
   return {
     id: row.id,
     organizationId: row.organization_id,
+    stageId: row.stage_id ?? null,
+    stageOrder: row.stage_order != null ? Number(row.stage_order) : null,
+    stageLabel: row.stage_label ?? null,
     levelId: row.level_id,
+    entityField: row.entity_field ?? entityFieldFromMeta,
     levelNumber: Number(row.level_number),
     levelKey: row.level_key,
     levelLabel: row.level_label,
@@ -612,14 +644,30 @@ async function getNodesInternal(
     conditions.push(`n.status = 'active'`);
   }
 
+  const capabilities = await getOrgStructureSchemaCapabilities(client);
+  const stageJoin = capabilities.hasNodeStageId
+    ? `LEFT JOIN organization_structure_stages st ON st.id = n.stage_id`
+    : '';
+  const stageSelect = capabilities.hasNodeStageId
+    ? `st.stage_order,
+       st.stage_label`
+    : `NULL::integer AS stage_order,
+       NULL::text AS stage_label`;
+
   const result = await client.query(
     `SELECT
        n.*,
-       parent.name AS parent_name
+       parent.name AS parent_name,
+       ${stageSelect}
      FROM organization_structure_nodes n
      LEFT JOIN organization_structure_nodes parent ON parent.id = n.parent_node_id
+     ${stageJoin}
      WHERE ${conditions.join(' AND ')}
-     ORDER BY n.level_number ASC, n.display_order ASC, n.name ASC`,
+     ORDER BY ${
+       capabilities.hasNodeStageId
+         ? 'COALESCE(st.stage_order, n.level_number)'
+         : 'n.level_number'
+     } ASC, n.display_order ASC, n.name ASC`,
     params
   );
 
@@ -669,30 +717,33 @@ async function createLevelInternal(
   const presetKey = typeof params.presetKey === 'string' && params.presetKey.trim() ? params.presetKey.trim() : null;
   const fieldSchemaJson = validateAndNormalizeFieldSchema(params.fieldSchemaJson);
 
-  const existingLevel = await client.query(
-    `SELECT *
-     FROM organization_structure_levels
-     WHERE organization_id = $1
-       AND level_number = $2
-     LIMIT 1`,
-    [params.organizationId, params.levelNumber]
-  );
-
-  if (existingLevel.rows.length > 0) {
-    return mapLevel(existingLevel.rows[0]);
+  if (params.levelNumber === ROOT_LEVEL_NUMBER) {
+    const existingRoot = await client.query(
+      `SELECT *
+       FROM organization_structure_levels
+       WHERE organization_id = $1
+         AND level_number = ${ROOT_LEVEL_NUMBER}
+       LIMIT 1`,
+      [params.organizationId]
+    );
+    if (existingRoot.rows.length > 0) {
+      return mapLevel(existingRoot.rows[0]);
+    }
   }
 
-  const existingLabel = await client.query(
-    `SELECT 1
+  const maxLevelResult = await client.query(
+    `SELECT COALESCE(MAX(level_number), 0) AS max_level
      FROM organization_structure_levels
-     WHERE organization_id = $1
-       AND LOWER(level_label) = LOWER($2)
-     LIMIT 1`,
-    [params.organizationId, levelLabel]
+     WHERE organization_id = $1`,
+    [params.organizationId]
+  );
+  const assignedLevelNumber = Math.max(
+    params.levelNumber === ROOT_LEVEL_NUMBER ? ROOT_LEVEL_NUMBER : 0,
+    Number(maxLevelResult.rows[0]?.max_level ?? 0) + 1
   );
 
-  if (existingLabel.rows.length > 0) {
-    throw new Error(`Level "${levelLabel}" already exists`);
+  if (assignedLevelNumber > MAX_DEFINED_LEVEL) {
+    throw new Error(`Cannot add more than ${MAX_DEFINED_LEVEL} level definitions`);
   }
 
   const keyBase = slugifyLevelKey(levelLabel);
@@ -753,7 +804,7 @@ async function createLevelInternal(
      RETURNING *`,
     [
       params.organizationId,
-      params.levelNumber,
+      assignedLevelNumber,
       keyValue,
       levelLabel,
       definitionSource,
@@ -775,6 +826,110 @@ async function createLevelInternal(
   });
 
   return level;
+}
+
+async function attachLevelToStage(
+  client: DbClient,
+  organizationId: string,
+  level: OrganizationStructureLevel,
+  preferredStageId?: string | null
+): Promise<string | null> {
+  let stages = await getStagesInternal(client, organizationId);
+  if (stages.length === 0) {
+    stages = await ensureStagesForOrganization(client, organizationId, [level]);
+    const created = stages.find((stage) => stage.levelIds.includes(level.id));
+    return created?.id ?? null;
+  }
+
+  if (preferredStageId) {
+    await linkLevelToStage(client, organizationId, preferredStageId, level.id);
+    return preferredStageId;
+  }
+
+  const existing = stages.find((stage) => stage.levelIds.includes(level.id));
+  if (existing) {
+    return existing.id;
+  }
+
+  const maxStageResult = await client.query(
+    `SELECT COALESCE(MAX(stage_order), 0) AS max_stage
+     FROM organization_structure_stages
+     WHERE organization_id = $1`,
+    [organizationId]
+  );
+  const nextStageOrder = Number(maxStageResult.rows[0]?.max_stage ?? 0) + 1;
+  const stageInsert = await client.query(
+    `INSERT INTO organization_structure_stages (
+       id, organization_id, stage_order, stage_label, is_active, created_at, updated_at
+     ) VALUES (
+       gen_random_uuid(), $1, $2, $3, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+     )
+     RETURNING id`,
+    [organizationId, nextStageOrder, level.levelLabel]
+  );
+  const stageId = stageInsert.rows[0].id as string;
+  await linkLevelToStage(client, organizationId, stageId, level.id);
+  return stageId;
+}
+
+async function resolveTargetLevelForNodeCreate(
+  client: DbClient,
+  organizationId: string,
+  actorUserId: string,
+  levels: OrganizationStructureLevel[],
+  input: CreateOrganizationStructureNodeInput,
+  relation: CreateOrganizationStructureNodeInput['relation']
+): Promise<OrganizationStructureLevel> {
+  if (input.targetLevelId) {
+    const level = await getLevelByIdInternal(client, organizationId, input.targetLevelId);
+    if (!level) {
+      throw new Error('Level not found');
+    }
+    if (input.stageId) {
+      await linkLevelToStage(client, organizationId, input.stageId, level.id);
+    }
+    return level;
+  }
+
+  const sectionLabel = String(input.targetSectionLabel || input.createLevelLabel || '').trim();
+  if (!sectionLabel) {
+    throw new Error('Level / section is required');
+  }
+
+  if (input.stageId) {
+    const stages = await getStagesInternal(client, organizationId);
+    const stage = stages.find((item) => item.id === input.stageId);
+    const inStage = levels.filter(
+      (level) =>
+        level.levelLabel.trim().toLowerCase() === sectionLabel.toLowerCase() &&
+        stage?.levelIds.includes(level.id)
+    );
+    if (inStage.length === 1) {
+      return inStage[0];
+    }
+  }
+
+  const matchingLevels = levels.filter(
+    (level) => level.levelLabel.trim().toLowerCase() === sectionLabel.toLowerCase()
+  );
+  if (matchingLevels.length > 1) {
+    throw new Error('Multiple levels match this section. Select a specific level.');
+  }
+  if (matchingLevels.length === 1) {
+    return matchingLevels[0];
+  }
+
+  const newLevel = await createLevelInternal(client, {
+    organizationId,
+    actorUserId,
+    levelNumber: ROOT_LEVEL_NUMBER + 1,
+    levelLabel: sectionLabel,
+    definitionSource: input.createLevelDefinitionSource,
+    presetKey: input.createLevelPresetKey,
+    fieldSchemaJson: input.createLevelFieldSchema,
+  });
+  await attachLevelToStage(client, organizationId, newLevel, input.stageId);
+  return newLevel;
 }
 
 async function validateNodeNameUnique(
@@ -1037,133 +1192,118 @@ export async function getOrganizationStructureTree(
 ): Promise<OrganizationStructureTree> {
   return withClient(async (client) => {
     const levels = await getLevelsInternal(client, organizationId, true);
+    let stages = await getStagesInternal(client, organizationId);
+    if (stages.length === 0 && levels.length > 0) {
+      stages = await ensureStagesForOrganization(client, organizationId, levels);
+    }
     const nodes = await getNodesInternal(client, organizationId, options);
-    const rootNode = nodes.find((node) => node.levelNumber === ROOT_LEVEL_NUMBER) || null;
+    const rootNode = nodes.find((node) => !node.parentNodeId) || null;
 
     return {
+      stages,
       levels,
       nodes,
       rootNode,
       summary: {
+        totalStages: stages.length,
         totalLevels: levels.length,
         totalNodes: nodes.length,
         activeNodes: nodes.filter((node) => node.status === 'active').length,
         archivedNodes: nodes.filter((node) => node.status === 'archived').length,
-        hasRootGroup: Boolean(rootNode),
+        hasRootNode: Boolean(rootNode),
       },
     };
   });
 }
 
-export async function createOrganizationStructureNode(
+export async function getOrganizationStructureStages(organizationId: string): Promise<OrganizationStructureStage[]> {
+  return withClient(async (client) => {
+    const levels = await getLevelsInternal(client, organizationId, true);
+    let stages = await getStagesInternal(client, organizationId);
+    if (stages.length === 0 && levels.length > 0) {
+      stages = await ensureStagesForOrganization(client, organizationId, levels);
+    }
+    return stages;
+  });
+}
+
+/** Create node using an existing DB client (no transaction). Used by bulk upload inside outer transactions. */
+export async function createOrganizationStructureNodeWithClient(
+  client: DbClient,
   organizationId: string,
   actorUserId: string,
   input: CreateOrganizationStructureNodeInput
 ): Promise<OrganizationStructureNode> {
-  return withClient(async (client) => {
-    await client.query('BEGIN');
-    try {
-      const levels = await getLevelsInternal(client, organizationId, true);
+  const levels = await getLevelsInternal(client, organizationId, true);
       const relation = input.relation;
       let targetLevel: OrganizationStructureLevel | undefined;
       let parentNodeId: string | null = null;
+      let referenceNode: OrganizationStructureNode | null = null;
 
       if (relation === 'root') {
         const rootExists = await client.query(
-          `SELECT 1
+          `SELECT id, name, level_label
            FROM organization_structure_nodes
            WHERE organization_id = $1
-             AND level_number = 1
+             AND parent_node_id IS NULL
            LIMIT 1`,
           [organizationId]
         );
 
         if (rootExists.rows.length > 0) {
-          throw new Error('Root entity already exists for this organization');
-        }
-
-        targetLevel = levels.find((level) => level.levelNumber === ROOT_LEVEL_NUMBER);
-        if (!targetLevel) {
-          if (!input.createLevelLabel) {
-            throw new Error('Root entity section label is required');
-          }
-
-          targetLevel = await createLevelInternal(client, {
-            organizationId,
-            actorUserId,
-            levelNumber: ROOT_LEVEL_NUMBER,
-            levelLabel: input.createLevelLabel,
-            definitionSource: input.createLevelDefinitionSource,
-            presetKey: input.createLevelPresetKey,
-            fieldSchemaJson: input.createLevelFieldSchema,
-          });
-        }
-      } else {
-        if (!input.referenceNodeId) {
-          throw new Error('Reference node is required');
-        }
-
-        const referenceNode = await validateNodeReferences(client, organizationId, input.referenceNodeId);
-
-        if (relation === 'sibling') {
-          if (!referenceNode.parentNodeId) {
-            throw new Error('Root entity cannot have siblings');
-          }
-
-          targetLevel = levels.find((level) => level.levelNumber === referenceNode.levelNumber);
-          parentNodeId = referenceNode.parentNodeId;
-        } else {
-          if (referenceNode.status !== 'active') {
-            throw new Error('Cannot add child under an inactive or archived parent');
-          }
-
-          const sectionLabel = String(input.targetSectionLabel || input.createLevelLabel || '').trim();
-          if (!sectionLabel) {
-            throw new Error('Section is required');
-          }
-
-          if (sectionLabel.toLowerCase() === 'group') {
-            throw new Error('Group section can only be used for the root node');
-          }
-
-          const existingByLabel = levels.find(
-            (level) => level.levelLabel.trim().toLowerCase() === sectionLabel.toLowerCase()
+          const existing = rootExists.rows[0];
+          throw new Error(
+            `Root entity already exists (${existing.name || existing.level_label || existing.id}). Add children under it instead.`
           );
+        }
 
-          let requestedLevelNumber: number;
-          if (existingByLabel) {
-            requestedLevelNumber = existingByLabel.levelNumber;
-            targetLevel = existingByLabel;
-          } else {
-            const maxLevelResult = await client.query(
-              `SELECT COALESCE(MAX(level_number), 1) AS max_level
-               FROM organization_structure_levels
-               WHERE organization_id = $1`,
-              [organizationId]
-            );
-            requestedLevelNumber = Number(maxLevelResult.rows[0]?.max_level ?? 1) + 1;
+        targetLevel = await resolveTargetLevelForNodeCreate(
+          client,
+          organizationId,
+          actorUserId,
+          levels,
+          input,
+          relation
+        );
+      } else {
+        if (!input.referenceNodeId && !input.parentNodeId) {
+          throw new Error('Reference node or parent node is required');
+        }
 
-            if (requestedLevelNumber > MAX_DEFINED_LEVEL) {
-              throw new Error(`Cannot add more than ${MAX_DEFINED_LEVEL} sections`);
-            }
+        referenceNode = input.referenceNodeId
+          ? await validateNodeReferences(client, organizationId, input.referenceNodeId)
+          : null;
 
-            targetLevel = levels.find((level) => level.levelNumber === requestedLevelNumber);
+        if (input.parentNodeId) {
+          const explicitParent = await validateNodeReferences(client, organizationId, input.parentNodeId);
+          if (explicitParent.status !== 'active') {
+            throw new Error('Cannot attach under an inactive or archived parent');
           }
-
-          parentNodeId = referenceNode.id;
-
-          if (!targetLevel) {
-            targetLevel = await createLevelInternal(client, {
-              organizationId,
-              actorUserId,
-              levelNumber: requestedLevelNumber,
-              levelLabel: sectionLabel,
-              definitionSource: input.createLevelDefinitionSource,
-              presetKey: input.createLevelPresetKey,
-              fieldSchemaJson: input.createLevelFieldSchema,
-            });
+          parentNodeId = explicitParent.id;
+        } else if (referenceNode) {
+          if (relation === 'sibling') {
+            if (!referenceNode.parentNodeId) {
+              throw new Error(
+                'The root node cannot have siblings. Add a child under the root, or select another parent.'
+              );
+            }
+            parentNodeId = referenceNode.parentNodeId;
+          } else {
+            if (referenceNode.status !== 'active') {
+              throw new Error('Cannot add child under an inactive or archived parent');
+            }
+            parentNodeId = referenceNode.id;
           }
         }
+
+        targetLevel = await resolveTargetLevelForNodeCreate(
+          client,
+          organizationId,
+          actorUserId,
+          levels,
+          input,
+          relation
+        );
       }
 
       if (!targetLevel) {
@@ -1206,86 +1346,157 @@ export async function createOrganizationStructureNode(
            AND (
              (parent_node_id IS NULL AND $2::uuid IS NULL)
              OR parent_node_id = $2
-           )
-           AND level_number = $3`,
-        [organizationId, parentNodeId, targetLevel.levelNumber]
+           )`,
+        [organizationId, parentNodeId]
       );
 
       const displayOrder = Number(siblingOrderResult.rows[0]?.max_display_order ?? -1) + 1;
       const status = normalizeStatus(input.status, 'active');
-      const nextMetaJson = buildNodeMetaJson(input.metaJson, targetLevel.levelLabel, normalizedFieldValues);
-
-      const insertResult = await client.query(
-        `INSERT INTO organization_structure_nodes (
-           id,
-           organization_id,
-           level_id,
-           level_number,
-           level_key,
-           level_label,
-           parent_node_id,
-           name,
-           code,
-           description,
-           display_order,
-           status,
-           meta_json,
-           created_by,
-           updated_by,
-           created_at,
-           updated_at
-         )
-         VALUES (
-           gen_random_uuid(),
-           $1,
-           $2,
-           $3,
-           $4,
-           $5,
-           $6,
-           $7,
-           $8,
-           $9,
-           $10,
-           $11,
-           $12::jsonb,
-           $13,
-           $13,
-           CURRENT_TIMESTAMP,
-           CURRENT_TIMESTAMP
-         )
-         RETURNING *`,
-        [
-          organizationId,
-          targetLevel.id,
-          targetLevel.levelNumber,
-          targetLevel.levelKey,
-          targetLevel.levelLabel,
-          parentNodeId,
-          name,
-          code,
-          input.description?.trim() || null,
-          displayOrder,
-          status,
-          JSON.stringify(nextMetaJson),
-          actorUserId,
-        ]
+      const entityField =
+        String(input.entityField || '').trim() ||
+        (typeof input.metaJson?.entityType === 'string' ? String(input.metaJson.entityType).trim() : '') ||
+        targetLevel.levelLabel;
+      const nextMetaJson = buildNodeMetaJson(
+        { ...(input.metaJson || {}), entityType: entityField },
+        targetLevel.levelLabel,
+        normalizedFieldValues
       );
+
+      const schemaCaps = await getOrgStructureSchemaCapabilities(client);
+      let resolvedStageId: string | null = null;
+
+      if (schemaCaps.hasStagesTable) {
+        const parentNode = parentNodeId
+          ? await validateNodeReferences(client, organizationId, parentNodeId)
+          : null;
+        const stageOrder = resolveStageOrderForNodeCreate(relation, parentNode, referenceNode);
+        resolvedStageId = await ensureStageAtOrder(client, organizationId, stageOrder);
+        if (resolvedStageId) {
+          await linkLevelToStage(client, organizationId, resolvedStageId, targetLevel.id);
+        }
+      }
+
+      let insertResult;
+      if (schemaCaps.hasNodeStageId && schemaCaps.hasNodeEntityField) {
+        insertResult = await client.query(
+          `INSERT INTO organization_structure_nodes (
+             id, organization_id, stage_id, level_id, level_number, level_key, level_label,
+             entity_field, parent_node_id, name, code, description, display_order, status,
+             meta_json, created_by, updated_by, created_at, updated_at
+           )
+           VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             $14::jsonb, $15, $15, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+           )
+           RETURNING *`,
+          [
+            organizationId,
+            resolvedStageId,
+            targetLevel.id,
+            targetLevel.levelNumber,
+            targetLevel.levelKey,
+            targetLevel.levelLabel,
+            entityField,
+            parentNodeId,
+            name,
+            code,
+            input.description?.trim() || null,
+            displayOrder,
+            status,
+            JSON.stringify(nextMetaJson),
+            actorUserId,
+          ]
+        );
+      } else if (schemaCaps.hasNodeStageId) {
+        insertResult = await client.query(
+          `INSERT INTO organization_structure_nodes (
+             id, organization_id, stage_id, level_id, level_number, level_key, level_label,
+             parent_node_id, name, code, description, display_order, status,
+             meta_json, created_by, updated_by, created_at, updated_at
+           )
+           VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+             $13::jsonb, $14, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+           )
+           RETURNING *`,
+          [
+            organizationId,
+            resolvedStageId,
+            targetLevel.id,
+            targetLevel.levelNumber,
+            targetLevel.levelKey,
+            targetLevel.levelLabel,
+            parentNodeId,
+            name,
+            code,
+            input.description?.trim() || null,
+            displayOrder,
+            status,
+            JSON.stringify(nextMetaJson),
+            actorUserId,
+          ]
+        );
+      } else {
+        insertResult = await client.query(
+          `INSERT INTO organization_structure_nodes (
+             id, organization_id, level_id, level_number, level_key, level_label,
+             parent_node_id, name, code, description, display_order, status,
+             meta_json, created_by, updated_by, created_at, updated_at
+           )
+           VALUES (
+             gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+             $12::jsonb, $13, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+           )
+           RETURNING *`,
+          [
+            organizationId,
+            targetLevel.id,
+            targetLevel.levelNumber,
+            targetLevel.levelKey,
+            targetLevel.levelLabel,
+            parentNodeId,
+            name,
+            code,
+            input.description?.trim() || null,
+            displayOrder,
+            status,
+            JSON.stringify(nextMetaJson),
+            actorUserId,
+          ]
+        );
+      }
 
       const createdNode = mapNodeBase(insertResult.rows[0]);
 
-      await writeAuditLog(client, {
+  await writeAuditLog(client, {
+    organizationId,
+    actorUserId,
+    entityType: 'node',
+    entityId: createdNode.id,
+    action: 'created',
+    afterValue: createdNode,
+    metadata: { relation, referenceNodeId: input.referenceNodeId || null },
+  });
+
+  return (await getNodeByIdInternal(client, organizationId, createdNode.id)) as OrganizationStructureNode;
+}
+
+export async function createOrganizationStructureNode(
+  organizationId: string,
+  actorUserId: string,
+  input: CreateOrganizationStructureNodeInput
+): Promise<OrganizationStructureNode> {
+  return withClient(async (client) => {
+    await client.query('BEGIN');
+    try {
+      const created = await createOrganizationStructureNodeWithClient(
+        client,
         organizationId,
         actorUserId,
-        entityType: 'node',
-        entityId: createdNode.id,
-        action: 'created',
-        afterValue: createdNode,
-        metadata: { relation, referenceNodeId: input.referenceNodeId || null },
-      });
-
+        input
+      );
       await client.query('COMMIT');
-      return (await getNodeByIdInternal(client, organizationId, createdNode.id)) as OrganizationStructureNode;
+      return created;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -1309,7 +1520,7 @@ export async function updateOrganizationStructureNode(
         throw new Error('Target hierarchy level is not available');
       }
 
-      if (existingNode.levelNumber === ROOT_LEVEL_NUMBER && input.status === 'archived') {
+      if (!existingNode.parentNodeId && input.status === 'archived') {
         throw new Error('Root entity cannot be archived');
       }
 
@@ -1418,7 +1629,7 @@ export async function archiveOrganizationStructureNode(
     try {
       const existingNode = await validateNodeReferences(client, organizationId, nodeId);
 
-      if (existingNode.levelNumber === ROOT_LEVEL_NUMBER) {
+      if (!existingNode.parentNodeId) {
         throw new Error('Root entity cannot be archived');
       }
 
@@ -1452,39 +1663,60 @@ export async function archiveOrganizationStructureNode(
   });
 }
 
+async function collectNodeSubtreeIds(
+  client: DbClient,
+  organizationId: string,
+  nodeId: string
+): Promise<string[]> {
+  const subtreeResult = await client.query(
+    `WITH RECURSIVE subtree AS (
+       SELECT id, 0 AS depth
+       FROM organization_structure_nodes
+       WHERE id = $1
+         AND organization_id = $2
+       UNION ALL
+       SELECT child.id, subtree.depth + 1
+       FROM organization_structure_nodes child
+       INNER JOIN subtree ON child.parent_node_id = subtree.id
+       WHERE child.organization_id = $2
+     )
+     SELECT id
+     FROM subtree
+     ORDER BY depth DESC`,
+    [nodeId, organizationId]
+  );
+
+  return subtreeResult.rows.map((row) => row.id as string);
+}
+
 export async function deleteOrganizationStructureNode(
   organizationId: string,
   actorUserId: string,
   nodeId: string
-): Promise<void> {
+): Promise<{ deletedCount: number; deletedNodeIds: string[] }> {
   return withClient(async (client) => {
     await client.query('BEGIN');
     try {
       const existingNode = await validateNodeReferences(client, organizationId, nodeId);
+      const subtreeIds = await collectNodeSubtreeIds(client, organizationId, nodeId);
 
-      const childrenResult = await client.query(
-        `SELECT 1
-         FROM organization_structure_nodes
-         WHERE parent_node_id = $1
-         LIMIT 1`,
-        [nodeId]
-      );
-
-      if (childrenResult.rows.length > 0) {
-        throw new Error('Node with children cannot be deleted');
+      if (subtreeIds.length === 0) {
+        throw new Error('Organization structure node not found');
       }
 
       const taskReferenceResult = await client.query(
         `SELECT 1
          FROM tasks
          WHERE organization_id = $1
-           AND org_structure_node_id = $2
+           AND org_structure_node_id = ANY($2::uuid[])
          LIMIT 1`,
-        [organizationId, nodeId]
+        [organizationId, subtreeIds]
       );
 
       if (taskReferenceResult.rows.length > 0) {
-        throw new Error('Node cannot be deleted because tasks reference it');
+        throw new Error(
+          'Node cannot be deleted because tasks reference this node or one of its descendants'
+        );
       }
 
       const employeeReferenceResult = await client.query(
@@ -1492,22 +1724,24 @@ export async function deleteOrganizationStructureNode(
          FROM user_organizations
          WHERE organization_id = $1
            AND (
-             primary_org_node_id = $2
-             OR $2 = ANY(COALESCE(secondary_org_node_ids, ARRAY[]::uuid[]))
+             primary_org_node_id = ANY($2::uuid[])
+             OR secondary_org_node_ids && $2::uuid[]
            )
          LIMIT 1`,
-        [organizationId, nodeId]
+        [organizationId, subtreeIds]
       );
 
       if (employeeReferenceResult.rows.length > 0) {
-        throw new Error('Node cannot be deleted because employees reference it');
+        throw new Error(
+          'Node cannot be deleted because employees are assigned to this node or one of its descendants'
+        );
       }
 
       await client.query(
         `DELETE FROM organization_structure_nodes
-         WHERE id = $1
-           AND organization_id = $2`,
-        [nodeId, organizationId]
+         WHERE organization_id = $1
+           AND id = ANY($2::uuid[])`,
+        [organizationId, subtreeIds]
       );
 
       await writeAuditLog(client, {
@@ -1517,9 +1751,18 @@ export async function deleteOrganizationStructureNode(
         entityId: nodeId,
         action: 'deleted',
         beforeValue: existingNode,
+        metadata: {
+          cascade: true,
+          deletedCount: subtreeIds.length,
+          deletedNodeIds: subtreeIds,
+        },
       });
 
       await client.query('COMMIT');
+      return {
+        deletedCount: subtreeIds.length,
+        deletedNodeIds: subtreeIds,
+      };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

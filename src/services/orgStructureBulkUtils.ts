@@ -1,10 +1,22 @@
 import ExcelJS from 'exceljs';
 import { PoolClient } from 'pg';
 import {
+  BULK_CREATE_LEVEL_FIELD_SCHEMA,
+  getEntityTypeOptionsForSection,
+  getOrgLevelDefinitionByHeader,
+} from './organizationStructureCatalog';
+import {
+  createOrganizationStructureNodeWithClient,
   getOrganizationStructureTree,
   type OrganizationStructureLevel,
+  type OrganizationStructureNode,
   type OrganizationStructureTree,
 } from './organizationStructureService';
+import {
+  buildStructureSheetPlan,
+  formatNodeDisplayLabel,
+  getNodeEntityTypeFromMeta,
+} from './orgStructureBulkTemplate';
 
 export const EMPLOYEE_ORG_NODE_BY_LEVEL_KEY = 'orgNodeByLevel';
 
@@ -35,8 +47,6 @@ export const LEGACY_ENTITY_LIST_COLUMN_NAMES = [
   'org unit name',
   'org node name',
 ] as const;
-
-const ROOT_LEVEL_NUMBER = 1;
 
 export function getSectionStorageKey(level: OrganizationStructureLevel): string {
   return level.levelLabel.trim();
@@ -196,93 +206,223 @@ export function findLevelColumnIndices(
   });
 }
 
-export function addStructureReferenceSheet(
-  workbook: ExcelJS.Workbook,
-  tree: OrganizationStructureTree | null
-): void {
-  const sheet = workbook.addWorksheet('Structure Reference', {
-    headerFooter: { firstHeader: 'OrgIt - Structure Reference (read-only guide)' },
-  });
-  sheet.columns = [
-    { header: 'NODE_ID', key: 'node_id', width: 38 },
-    { header: 'LEVEL', key: 'level', width: 18 },
-    { header: 'NAME', key: 'name', width: 28 },
-    { header: 'CODE', key: 'code', width: 16 },
-    { header: 'FULL_PATH', key: 'full_path', width: 50 },
-  ];
-  sheet.getRow(1).font = { bold: true };
-  if (!tree?.nodes?.length) {
-    sheet.getRow(2).getCell(1).value =
-      'No organisation structure nodes yet. Fill the Organisation Structure sheet first, then upload.';
-    return;
-  }
-  const sorted = [...tree.nodes].sort(
-    (a, b) => a.levelNumber - b.levelNumber || a.displayOrder - b.displayOrder || a.name.localeCompare(b.name)
-  );
-  sorted.forEach((node, idx) => {
-    const row = sheet.getRow(idx + 2);
-    row.getCell(1).value = node.id;
-    row.getCell(2).value = node.levelLabel || String(node.levelNumber);
-    row.getCell(3).value = node.name;
-    row.getCell(4).value = node.code || '';
-    row.getCell(5).value = node.pathDisplay || node.name;
-  });
-}
-
-export function addOrganisationStructureDataSheet(
-  workbook: ExcelJS.Workbook,
-  tree: OrganizationStructureTree | null
-): void {
-  const sheet = workbook.addWorksheet('Organisation Structure', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Organisation Structure' },
-  });
-  sheet.columns = [
-    { header: 'LEVEL', key: 'level', width: 20 },
-    { header: 'PARENT_NAME', key: 'parent_name', width: 28 },
-    { header: 'NAME', key: 'name', width: 28 },
-    { header: 'CODE', key: 'code', width: 16 },
-  ];
-  sheet.getRow(1).font = { bold: true };
-  if (!tree?.nodes?.length) {
-    sheet.getRow(2).getCell(1).value = 'Group';
-    sheet.getRow(2).getCell(2).value = '';
-    sheet.getRow(2).getCell(3).value = '';
-    sheet.getRow(2).getCell(4).value = '';
-    return;
-  }
-  const sorted = [...tree.nodes].sort(
-    (a, b) => a.levelNumber - b.levelNumber || a.displayOrder - b.displayOrder || a.name.localeCompare(b.name)
-  );
-  sorted.forEach((node, idx) => {
-    const row = sheet.getRow(idx + 2);
-    row.getCell(1).value = node.levelLabel || String(node.levelNumber);
-    row.getCell(2).value = node.parentName || '';
-    row.getCell(3).value = node.name;
-    row.getCell(4).value = node.code || '';
-  });
-}
-
-function resolveLevelFromRaw(
+/** Resolve org node by UUID, exact display label (web dropdown), or plain name. */
+export async function resolveOrgStructureNodeFromHint(
+  client: PoolClient,
+  organizationId: string,
   raw: string,
+  nodes?: OrganizationStructureNode[]
+): Promise<string | null> {
+  if (!raw?.trim() || !organizationId) return null;
+  const trimmed = raw.trim();
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(trimmed)) {
+    const r = await client.query(
+      `SELECT id FROM organization_structure_nodes WHERE organization_id = $1 AND id = $2::uuid LIMIT 1`,
+      [organizationId, trimmed]
+    );
+    return r.rows.length > 0 ? r.rows[0].id : null;
+  }
+
+  if (nodes?.length) {
+    for (const node of nodes) {
+      const display = formatNodeDisplayLabel(node, getNodeEntityTypeFromMeta(node));
+      if (display.toLowerCase() === trimmed.toLowerCase()) return node.id;
+    }
+    for (const node of nodes) {
+      if (node.status === 'active' && node.name.toLowerCase() === trimmed.toLowerCase()) {
+        return node.id;
+      }
+    }
+  }
+
+  const r = await client.query(
+    `SELECT id FROM organization_structure_nodes
+     WHERE organization_id = $1 AND status = 'active' AND LOWER(TRIM(name)) = LOWER($2)
+     ORDER BY level_number DESC LIMIT 1`,
+    [organizationId, trimmed]
+  );
+  return r.rows.length > 0 ? r.rows[0].id : null;
+}
+
+function resolveLevelFromSection(
+  sectionRaw: string,
   levels: OrganizationStructureLevel[]
 ): OrganizationStructureLevel | null {
-  const trimmed = (raw || '').trim();
+  const trimmed = (sectionRaw || '').trim();
   if (!trimmed) return null;
   const asNum = Number(trimmed);
   if (Number.isFinite(asNum) && asNum >= 1) {
     return levels.find((l) => l.levelNumber === asNum) ?? null;
   }
-  return (
-    levels.find((l) => l.levelLabel.trim().toLowerCase() === trimmed.toLowerCase()) ?? null
+  const matches = levels.filter(
+    (l) => l.levelLabel.trim().toLowerCase() === trimmed.toLowerCase()
   );
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return null;
+  return null;
 }
 
-export interface StructureBulkRow {
+interface StructureBulkRow {
   rowNumber: number;
-  level: OrganizationStructureLevel;
+  sectionLabel: string;
   parentName: string;
-  name: string;
-  code: string | null;
+  entityType: string;
+  fieldValues: Record<string, string>;
+  needsNewSection: boolean; // section not yet a level row — createLevel on insert
+}
+
+function deriveNameAndCodeFromFieldValues(
+  fieldValues: Record<string, string>
+): { name: string; code: string | null } {
+  const fieldName = (fieldValues.name || '').trim();
+  const fieldCode = (fieldValues.code || '').trim();
+  return {
+    name: fieldName.slice(0, 255),
+    code: fieldCode ? fieldCode.slice(0, 100) : null,
+  };
+}
+
+function nodeCacheKey(parentNodeId: string | null | undefined, name: string): string {
+  return `${parentNodeId ?? 'root'}:${name.trim().toLowerCase()}`;
+}
+
+async function processBulkRowsInParentOrder(
+  items: StructureBulkRow[],
+  client: PoolClient,
+  organizationId: string,
+  actorUserId: string,
+  tree: OrganizationStructureTree,
+  levels: OrganizationStructureLevel[],
+  sheetName: string,
+  pushError: (err: { sheet?: string; row?: number; message: string }) => void
+): Promise<number> {
+  const nodes = [...(tree.nodes || [])];
+  const nodeIdByKey = new Map<string, string>();
+  for (const node of nodes) {
+    nodeIdByKey.set(nodeCacheKey(node.parentNodeId, node.name), node.id);
+  }
+
+  let updated = 0;
+  let pending = [...items];
+  let guard = 0;
+
+  while (pending.length > 0 && guard < pending.length * 8 + 10) {
+    guard += 1;
+    const nextPending: StructureBulkRow[] = [];
+
+    for (const item of pending) {
+      try {
+        const { name, code } = deriveNameAndCodeFromFieldValues(item.fieldValues);
+        let parentNodeId: string | null = null;
+
+        if (item.parentName.trim()) {
+          parentNodeId = await resolveOrgStructureNodeFromHint(
+            client,
+            organizationId,
+            item.parentName,
+            nodes
+          );
+          if (!parentNodeId) {
+            nextPending.push(item);
+            continue;
+          }
+        } else {
+          const rootExists = nodes.some((n) => !n.parentNodeId);
+          if (rootExists) {
+            pushError({
+              sheet: sheetName,
+              row: item.rowNumber,
+              message: 'PARENT_NAME is required (root already exists). Use parent name from Org Node Lookups.',
+            });
+            continue;
+          }
+        }
+
+        const level = resolveLevelFromSection(item.sectionLabel, levels);
+        const catalogDef = getOrgLevelDefinitionByHeader(item.sectionLabel);
+
+        const existing = level
+          ? await client.query(
+              `SELECT id, code, meta_json FROM organization_structure_nodes
+               WHERE organization_id = $1 AND level_id = $2
+                 AND ((parent_node_id IS NULL AND $3::uuid IS NULL) OR parent_node_id = $3::uuid)
+                 AND LOWER(TRIM(name)) = LOWER($4)
+               LIMIT 1`,
+              [organizationId, level.id, parentNodeId, name]
+            )
+          : { rows: [] as { id: string }[] };
+
+        const metaJson = JSON.stringify({
+          entityType: item.entityType,
+          fieldValues: item.fieldValues,
+        });
+
+        if (existing.rows.length > 0) {
+          const nodeId = existing.rows[0].id;
+          await client.query(
+            `UPDATE organization_structure_nodes
+             SET name = $1, code = $2, meta_json = $3::jsonb, updated_by = $4, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5 AND organization_id = $6`,
+            [name, code, metaJson, actorUserId, nodeId, organizationId]
+          );
+          updated += 1;
+          continue;
+        }
+
+        const created = await createOrganizationStructureNodeWithClient(
+          client,
+          organizationId,
+          actorUserId,
+          {
+            relation: parentNodeId ? 'child' : 'root',
+            parentNodeId: parentNodeId || undefined,
+            ...(level
+              ? { targetLevelId: level.id }
+              : {
+                  targetSectionLabel: item.sectionLabel,
+                  createLevelLabel: item.sectionLabel,
+                  createLevelDefinitionSource: catalogDef ? 'preset' : 'custom',
+                  createLevelPresetKey: catalogDef ? `L${catalogDef.levelNumber}` : null,
+                  createLevelFieldSchema: BULK_CREATE_LEVEL_FIELD_SCHEMA,
+                }),
+            entityField: item.entityType,
+            name,
+            code: code || undefined,
+            fieldValues: item.fieldValues,
+            metaJson: { entityType: item.entityType },
+          }
+        );
+
+        if (item.needsNewSection) {
+          const refreshed = await loadOrganizationStructureLevels(client, organizationId);
+          levels.length = 0;
+          levels.push(...refreshed);
+        }
+
+        nodes.push(created);
+        nodeIdByKey.set(nodeCacheKey(created.parentNodeId, created.name), created.id);
+        updated += 1;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        pushError({ sheet: sheetName, row: item.rowNumber, message });
+      }
+    }
+
+    if (nextPending.length === pending.length) {
+      for (const item of nextPending) {
+        pushError({
+          sheet: sheetName,
+          row: item.rowNumber,
+          message: `Parent not found: ${item.parentName}. Add parent row above or check Org Node Lookups.`,
+        });
+      }
+      break;
+    }
+    pending = nextPending;
+  }
+
+  return updated;
 }
 
 export async function parseOrganizationStructureSheet(
@@ -294,27 +434,53 @@ export async function parseOrganizationStructureSheet(
 ): Promise<number> {
   if (!sheet || (sheet.rowCount ?? 0) < 2) return 0;
 
-  const levels = await loadOrganizationStructureLevels(client, organizationId);
-  if (levels.length === 0) {
+  const tree = await getOrganizationStructureTree(organizationId, {
+    includeArchived: false,
+    includeInactive: false,
+  });
+  const levels = [...tree.levels];
+  if (levels.length === 0 && !tree.summary?.hasRootNode) {
     pushError({
       sheet: sheet.name,
-      message: 'No organisation structure levels defined. Create the Group root in Organisation Structure settings first.',
+      message: 'No organisation structure yet. You may upload a root row (SECTION + Name, blank PARENT_NAME) or create root on web first.',
     });
-    return 0;
   }
 
+  const plan = buildStructureSheetPlan(tree, levels);
   const headers = sheet.getRow(1).values as unknown[];
-  const levelIdx = headers.findIndex(
-    (h) => String(h ?? '').trim().toLowerCase() === 'level'
-  );
-  const parentIdx = headers.findIndex(
-    (h) => String(h ?? '').trim().toLowerCase() === 'parent_name' || String(h ?? '').trim().toLowerCase() === 'parent name'
-  );
-  const nameIdx = headers.findIndex((h) => String(h ?? '').trim().toLowerCase() === 'name');
-  const codeIdx = headers.findIndex((h) => String(h ?? '').trim().toLowerCase() === 'code');
 
-  if (levelIdx < 0 || nameIdx < 0) {
-    pushError({ sheet: sheet.name, message: 'Missing required columns: LEVEL and NAME' });
+  const colIndex = (...names: string[]): number => {
+    for (const name of names) {
+      const i = (headers || []).findIndex(
+        (h) => String(h ?? '').trim().toLowerCase() === name.toLowerCase()
+      );
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const sectionIdx = colIndex('section', 'level');
+  const parentIdx = colIndex('parent_name', 'parent name');
+  const entityTypeIdx = colIndex('entity_type', 'entity type');
+
+  const fieldColByKey = new Map<string, number>();
+  for (let i = 1; i < (headers?.length ?? 0); i++) {
+    const h = String(headers[i] ?? '').trim().toLowerCase();
+    if (
+      !h ||
+      ['section', 'level', 'parent_name', 'parent name', 'entity_type', 'entity type'].includes(h)
+    ) {
+      continue;
+    }
+    const key = plan.headerToFieldKey.get(h);
+    if (key) fieldColByKey.set(key, i);
+  }
+
+  if (sectionIdx < 0) {
+    pushError({ sheet: sheet.name, message: 'Missing required column: SECTION (or legacy LEVEL)' });
+    return 0;
+  }
+  if (!fieldColByKey.has('name')) {
+    pushError({ sheet: sheet.name, message: 'Missing required field column: Name (or Registered Name)' });
     return 0;
   }
 
@@ -325,6 +491,7 @@ export async function parseOrganizationStructureSheet(
       if (v == null) return '';
       if (typeof v === 'string') return v.trim();
       if (typeof v === 'object' && v !== null && 'text' in v) return String((v as { text?: string }).text).trim();
+      if (v instanceof Date) return v.toISOString().slice(0, 10);
       return String(v).trim();
     } catch {
       return '';
@@ -336,148 +503,58 @@ export async function parseOrganizationStructureSheet(
 
   for (let r = 2; r <= maxRow; r++) {
     const row = sheet.getRow(r);
-    const levelRaw = getCell(row, levelIdx);
-    const name = getCell(row, nameIdx);
+    const sectionRaw = getCell(row, sectionIdx);
     const parentName = parentIdx >= 0 ? getCell(row, parentIdx) : '';
-    const codeRaw = codeIdx >= 0 ? getCell(row, codeIdx) : '';
-    if (!levelRaw && !name) continue;
-    if (!levelRaw || !name) {
-      pushError({ sheet: sheet.name, row: r, message: 'LEVEL and NAME are required' });
+    const entityTypeRaw = entityTypeIdx >= 0 ? getCell(row, entityTypeIdx) : '';
+    const fieldValues: Record<string, string> = {};
+    for (const [key, col] of fieldColByKey) {
+      const v = getCell(row, col);
+      if (v) fieldValues[key] = v;
+    }
+    const { name } = deriveNameAndCodeFromFieldValues(fieldValues);
+    if (!sectionRaw && !name) continue;
+    if (!sectionRaw) {
+      pushError({ sheet: sheet.name, row: r, message: 'SECTION is required' });
       continue;
     }
-    const level = resolveLevelFromRaw(levelRaw, levels);
-    if (!level) {
-      pushError({ sheet: sheet.name, row: r, message: `Unknown level: ${levelRaw}` });
+    if (!name) {
+      pushError({ sheet: sheet.name, row: r, message: 'Name is required (same as web node form)' });
       continue;
     }
-    if (level.levelNumber === ROOT_LEVEL_NUMBER && parentName) {
-      pushError({ sheet: sheet.name, row: r, message: 'Group root row must have blank PARENT_NAME' });
+
+    const level = resolveLevelFromSection(sectionRaw, levels);
+    const needsNewSection = !level;
+    const entityType = entityTypeRaw || sectionRaw;
+    const allowedTypes = getEntityTypeOptionsForSection(sectionRaw);
+    if (entityTypeRaw && !allowedTypes.some((t) => t.toLowerCase() === entityTypeRaw.toLowerCase())) {
+      pushError({
+        sheet: sheet.name,
+        row: r,
+        message: `Invalid ENTITY_TYPE for section ${sectionRaw}. Examples: ${allowedTypes.slice(0, 5).join(', ')}…`,
+      });
       continue;
     }
-    if (level.levelNumber > ROOT_LEVEL_NUMBER && !parentName) {
-      pushError({ sheet: sheet.name, row: r, message: 'PARENT_NAME is required for non-Group levels' });
-      continue;
-    }
+
     parsed.push({
       rowNumber: r,
-      level,
+      sectionLabel: sectionRaw,
       parentName,
-      name: name.slice(0, 255),
-      code: codeRaw ? codeRaw.slice(0, 100) : null,
+      entityType,
+      fieldValues,
+      needsNewSection,
     });
   }
 
-  parsed.sort((a, b) => a.level.levelNumber - b.level.levelNumber);
-
-  let updated = 0;
-  for (const item of parsed) {
-    try {
-      let parentNodeId: string | null = null;
-      if (item.level.levelNumber > ROOT_LEVEL_NUMBER) {
-        const parentLevelNumber = item.level.levelNumber - 1;
-        const parentRes = await client.query(
-          `SELECT id FROM organization_structure_nodes
-           WHERE organization_id = $1
-             AND level_number = $2
-             AND status = 'active'
-             AND LOWER(TRIM(name)) = LOWER($3)
-           LIMIT 2`,
-          [organizationId, parentLevelNumber, item.parentName]
-        );
-        if (parentRes.rows.length === 0) {
-          pushError({
-            sheet: sheet.name,
-            row: item.rowNumber,
-            message: `Parent not found: ${item.parentName} (level ${parentLevelNumber})`,
-          });
-          continue;
-        }
-        if (parentRes.rows.length > 1) {
-          pushError({
-            sheet: sheet.name,
-            row: item.rowNumber,
-            message: `Ambiguous parent name: ${item.parentName}`,
-          });
-          continue;
-        }
-        parentNodeId = parentRes.rows[0].id;
-      }
-
-      const existing = await client.query(
-        `SELECT id, code FROM organization_structure_nodes
-         WHERE organization_id = $1
-           AND level_number = $2
-           AND (
-             (parent_node_id IS NULL AND $3::uuid IS NULL)
-             OR parent_node_id = $3::uuid
-           )
-           AND LOWER(TRIM(name)) = LOWER($4)
-         LIMIT 1`,
-        [organizationId, item.level.levelNumber, parentNodeId, item.name]
-      );
-
-      if (existing.rows.length > 0) {
-        const nodeId = existing.rows[0].id;
-        if (item.code != null && item.code !== (existing.rows[0].code || '')) {
-          await client.query(
-            `UPDATE organization_structure_nodes
-             SET code = $1, updated_by = $2, updated_at = CURRENT_TIMESTAMP
-             WHERE id = $3 AND organization_id = $4`,
-            [item.code, actorUserId, nodeId, organizationId]
-          );
-        }
-        updated += 1;
-        continue;
-      }
-
-      const siblingOrder = await client.query(
-        `SELECT COALESCE(MAX(display_order), -1) AS max_display_order
-         FROM organization_structure_nodes
-         WHERE organization_id = $1
-           AND (
-             (parent_node_id IS NULL AND $2::uuid IS NULL)
-             OR parent_node_id = $2::uuid
-           )
-           AND level_number = $3`,
-        [organizationId, parentNodeId, item.level.levelNumber]
-      );
-      const displayOrder = Number(siblingOrder.rows[0]?.max_display_order ?? -1) + 1;
-      const metaJson = JSON.stringify({
-        entityType: item.level.levelLabel,
-        fieldValues: { name: item.name, ...(item.code ? { code: item.code } : {}) },
-      });
-
-      await client.query(
-        `INSERT INTO organization_structure_nodes (
-           id, organization_id, level_id, level_number, level_key, level_label,
-           parent_node_id, name, code, description, display_order, status, meta_json,
-           created_by, updated_by, created_at, updated_at
-         ) VALUES (
-           gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, 'active', $10::jsonb,
-           $11, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-         )`,
-        [
-          organizationId,
-          item.level.id,
-          item.level.levelNumber,
-          item.level.levelKey,
-          item.level.levelLabel,
-          parentNodeId,
-          item.name,
-          item.code,
-          displayOrder,
-          metaJson,
-          actorUserId,
-        ]
-      );
-      updated += 1;
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      pushError({ sheet: sheet.name, row: item.rowNumber, message });
-    }
-  }
-
-  return updated;
+  return processBulkRowsInParentOrder(
+    parsed,
+    client,
+    organizationId,
+    actorUserId,
+    tree,
+    levels,
+    sheet.name,
+    pushError
+  );
 }
 
 export async function parseOrgNodeByLevelFromRow(

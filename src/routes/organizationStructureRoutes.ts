@@ -8,6 +8,7 @@ const router = Router();
 router.use(authenticate);
 
 router.get('/tree', organizationStructureController.getOrganizationStructureTree);
+router.get('/stages', organizationStructureController.getOrganizationStructureStages);
 router.get('/levels', organizationStructureController.getOrganizationStructureLevels);
 router.get('/operational-options', organizationStructureController.getOrganizationStructureOperationalOptions);
 router.get('/reporting/rollups', organizationStructureController.getReportingRollups);

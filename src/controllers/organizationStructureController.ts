@@ -56,6 +56,31 @@ export async function getOrganizationStructureTree(req: AuthRequest, res: Respon
   }
 }
 
+export async function getOrganizationStructureStages(req: AuthRequest, res: Response) {
+  try {
+    const organizationId = await resolveRequestOrganizationId(req);
+
+    if (!organizationId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Organization context is required',
+      });
+    }
+
+    const stages = await organizationStructureService.getOrganizationStructureStages(organizationId);
+    res.json({
+      success: true,
+      data: stages,
+    });
+  } catch (error: any) {
+    console.error('Error getting organization structure stages:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to load organization structure stages',
+    });
+  }
+}
+
 export async function getOrganizationStructureLevels(req: AuthRequest, res: Response) {
   try {
     const organizationId = await resolveRequestOrganizationId(req);
@@ -121,8 +146,12 @@ export async function createOrganizationStructureNode(req: AuthRequest, res: Res
     const node = await organizationStructureService.createOrganizationStructureNode(organizationId, actorUserId, {
       relation: req.body.relation,
       referenceNodeId: req.body.referenceNodeId,
+      parentNodeId: req.body.parentNodeId,
+      targetLevelId: req.body.targetLevelId,
+      stageId: req.body.stageId,
       targetLevelNumber: req.body.targetLevelNumber,
       targetSectionLabel: req.body.targetSectionLabel,
+      entityField: req.body.entityField,
       name: req.body.name,
       code: req.body.code,
       description: req.body.description,
@@ -257,10 +286,19 @@ export async function deleteOrganizationStructureNode(req: AuthRequest, res: Res
       });
     }
 
-    await organizationStructureService.deleteOrganizationStructureNode(organizationId, actorUserId, id);
+    const result = await organizationStructureService.deleteOrganizationStructureNode(
+      organizationId,
+      actorUserId,
+      id
+    );
     res.json({
       success: true,
-      message: 'Organization structure node deleted successfully',
+      message:
+        result.deletedCount > 1
+          ? `Deleted ${result.deletedCount} organization structure nodes (including descendants)`
+          : 'Organization structure node deleted successfully',
+      deletedCount: result.deletedCount,
+      deletedNodeIds: result.deletedNodeIds,
     });
   } catch (error: any) {
     console.error('Error deleting organization structure node:', error);

@@ -4,10 +4,19 @@ import { PoolClient } from 'pg';
 import { getClient, query } from '../config/database';
 import { ORG_CONSTITUTION_VALUES, ORG_CONSTITUTION_OPTIONS } from './masterDataService';
 import { applyTaskBulkSheetValidations } from './taskBulkService';
-import { resolveNodeReference, type OrganizationStructureLevel } from './organizationStructureService';
 import {
+  resolveNodeReference,
+  type OrganizationStructureLevel,
+  type OrganizationStructureNode,
+} from './organizationStructureService';
+import {
+  addInstructionsSheet,
+  addOrgNodeLookupsSheet,
   addOrganisationStructureDataSheet,
-  addStructureReferenceSheet,
+  addSectionEntityFieldReferenceSheet,
+  applyBulkTemplateEnhancements,
+} from './orgStructureBulkTemplate';
+import {
   buildLevelColumnDefs,
   buildOrgFieldValuesPayload,
   findDeprecatedSheets,
@@ -19,6 +28,7 @@ import {
   loadTreeForBulk,
   parseOrganizationStructureSheet,
   parseOrgNodeByLevelFromRow,
+  resolveOrgStructureNodeFromHint,
   type OrgNodeByLevel,
 } from './orgStructureBulkUtils';
 
@@ -166,9 +176,9 @@ function entityListFixedColumnCount(levelCount: number): number {
 }
 
 /**
- * Build Excel template workbook "OrgIt Settings" – one workbook with all updated sheets.
- * Sheet order: Entity Master Data (Org), Entity List, Service List, Tasks, Employees.
- * Sheet names match sections: /admin/entity-master, /admin/entities, /admin/services, /admin/users.
+ * Build Excel template workbook "OrgIt Settings" – structure + assignments only (no organisation profile sheet).
+ * Sheet order: Instructions, Org Node Lookups, Organisation Structure, Entity List, Service List, Tasks, Employees.
+ * Organisation profile (legal/contact master) stays in-app or via organisation-only template from Admin → Entity Master.
  * Entity List compliance columns are driven by task_services (recurring) in DB only; no initial list.
  */
 export async function buildTemplateWorkbook(organizationId: string): Promise<ExcelJS.Buffer> {
@@ -178,36 +188,15 @@ export async function buildTemplateWorkbook(organizationId: string): Promise<Exc
 
   const tree = await loadTreeForBulk(organizationId);
   const levels = tree.levels;
+  const levelsFromL2 = getActiveLevelsFromL2(levels);
   const complianceHeaders = await getRecurringTaskServiceTitles(organizationId);
 
-  // Sheet 1: Entity Master Data (Org) – vertical layout: column A = field labels, column B = values
-  const orgSheet = workbook.addWorksheet('Entity Master Data (Org)', {
-    headerFooter: { firstHeader: 'OrgIt Settings - Entity Master Data (Organisation)' },
-  });
-  orgSheet.getColumn(1).width = 28;
-  orgSheet.getColumn(2).width = 40;
-  const orgConstitutionLabels = ORG_CONSTITUTION_OPTIONS.map((o) => o.label);
-  ENTITY_MASTER_TEMPLATE_VERTICAL_FIELDS.forEach((f, i) => {
-    const row = orgSheet.getRow(i + 1);
-    row.getCell(1).value = f.label;
-    row.getCell(1).font = { bold: true };
-    row.getCell(2).value = '';
-    if (f.key === 'org_constitution') {
-      (orgSheet as any).dataValidations.add(`B${i + 1}:B${i + 1}`, {
-        type: 'list',
-        allowBlank: true,
-        formulae: [`"${orgConstitutionLabels.join(',')}"`],
-        showErrorMessage: true,
-        errorTitle: 'Invalid value',
-        error: 'Select a value from the list (same as UI dropdown).',
-      });
-    }
-  });
+  addInstructionsSheet(workbook, tree);
+  addOrgNodeLookupsSheet(workbook, tree);
+  addOrganisationStructureDataSheet(workbook, tree, levels);
+  addSectionEntityFieldReferenceSheet(workbook);
 
-  // Sheet 2: Organisation Structure
-  addOrganisationStructureDataSheet(workbook, tree);
-
-  // Sheet 3: Entity List – for /admin/entities
+  // Entity List – for /admin/entities
   const entityListSheet = workbook.addWorksheet('Entity List', {
     headerFooter: { firstHeader: 'OrgIt Settings - Entity List' },
   });
@@ -215,7 +204,8 @@ export async function buildTemplateWorkbook(organizationId: string): Promise<Exc
   entityListSheet.columns = entityListCols;
   entityListSheet.getRow(1).font = { bold: true };
   const freqList = TASK_FREQUENCIES.join(',');
-  const entityListComplianceStartCol = entityListFixedColumnCount(getActiveLevelsFromL2(levels).length) + 1;
+  const entityListLevelStartCol = 4;
+  const entityListComplianceStartCol = entityListFixedColumnCount(levelsFromL2.length) + 1;
   for (let c = entityListComplianceStartCol; c <= entityListCols.length; c++) {
     const range = `${getExcelColLetter(c)}2:${getExcelColLetter(c)}1000`;
     (entityListSheet as any).dataValidations.add(range, {
@@ -294,32 +284,38 @@ export async function buildTemplateWorkbook(organizationId: string): Promise<Exc
   tasksSheet.getColumn(10).numFmt = '@'; // Task Owner
   applyTaskBulkSheetValidations(tasksSheet);
 
-  // Sheet 6: Employees – for /admin/users
+  // Sheet 5: Employees – for /admin/users
   const employeesSheet = workbook.addWorksheet('Employees', {
     headerFooter: { firstHeader: 'OrgIt Settings - Employees' },
   });
   employeesSheet.columns = buildEmployeeSheetColumns(levels);
   employeesSheet.getRow(1).font = { bold: true };
 
-  addStructureReferenceSheet(workbook, tree);
+  const employeeLevelStartCol = 4;
+  applyBulkTemplateEnhancements(workbook, tree, {
+    entityListLevelStartCol: entityListLevelStartCol,
+    employeesLevelStartCol: employeeLevelStartCol,
+  });
 
   const buffer = await workbook.xlsx.writeBuffer();
   console.log(
-    '[EntityMasterTemplate] Built OrgIt Settings workbook (Entity Master, Organisation Structure, Entity List, Service List, Tasks, Employees, Structure Reference)'
+    '[EntityMasterTemplate] Built OrgIt Settings workbook (Instructions, Lookups, Structure, Entity List, Service List, Tasks, Employees)'
   );
   return buffer as ExcelJS.Buffer;
 }
 
 /**
- * Build Excel template with only the Organisation Structure sheet (+ Structure Reference).
+ * Build Excel template with Organisation Structure (+ Instructions, Org Node Lookups).
  */
 export async function buildOrgStructureOnlyTemplate(organizationId: string): Promise<ExcelJS.Buffer> {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'OrgIt Organisation Structure';
   workbook.created = new Date();
   const tree = await loadTreeForBulk(organizationId);
-  addOrganisationStructureDataSheet(workbook, tree);
-  addStructureReferenceSheet(workbook, tree);
+  addInstructionsSheet(workbook, tree);
+  addOrgNodeLookupsSheet(workbook, tree);
+  addOrganisationStructureDataSheet(workbook, tree, tree.levels);
+  addSectionEntityFieldReferenceSheet(workbook);
   const buffer = await workbook.xlsx.writeBuffer();
   console.log('[EntityMasterTemplate] Built Organisation Structure template');
   return buffer as ExcelJS.Buffer;
@@ -378,7 +374,9 @@ export async function buildEmployeeOnlyTemplate(organizationId: string): Promise
   });
   employeesSheet.columns = buildEmployeeSheetColumns(tree.levels);
   employeesSheet.getRow(1).font = { bold: true };
-  addStructureReferenceSheet(workbook, tree);
+  addInstructionsSheet(workbook, tree);
+  addOrgNodeLookupsSheet(workbook, tree);
+  applyBulkTemplateEnhancements(workbook, tree, { employeesLevelStartCol: 4 });
 
   const buffer = await workbook.xlsx.writeBuffer();
   console.log('[EntityMasterTemplate] Built single-sheet Employee template');
@@ -466,7 +464,9 @@ export async function buildEntityListOnlyTemplate(organizationId: string): Promi
     });
   }
 
-  addStructureReferenceSheet(workbook, tree);
+  addInstructionsSheet(workbook, tree);
+  addOrgNodeLookupsSheet(workbook, tree);
+  applyBulkTemplateEnhancements(workbook, tree, { entityListLevelStartCol: 4 });
 
   const buffer = await workbook.xlsx.writeBuffer();
   console.log('[EntityMasterTemplate] Built single-sheet Entity List template');
@@ -632,29 +632,19 @@ async function resolveOrganizationId(client: any, orgName: string): Promise<stri
   return r.rows.length > 0 ? r.rows[0].id : null;
 }
 
-async function resolveOrgStructureNodeId(client: any, organizationId: string, raw: string): Promise<string | null> {
-  if (!raw || !organizationId) return null;
-  const trimmed = raw.trim();
-  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  if (uuidRe.test(trimmed)) {
-    const r = await client.query(
-      `SELECT id FROM organization_structure_nodes
-       WHERE organization_id = $1 AND id = $2::uuid
-       LIMIT 1`,
-      [organizationId, trimmed]
-    );
-    return r.rows.length > 0 ? r.rows[0].id : null;
+const orgNodesCacheForBulk = new Map<string, OrganizationStructureNode[]>();
+
+async function getOrgNodesForBulkResolve(organizationId: string): Promise<OrganizationStructureNode[]> {
+  if (!orgNodesCacheForBulk.has(organizationId)) {
+    const tree = await loadTreeForBulk(organizationId);
+    orgNodesCacheForBulk.set(organizationId, tree.nodes || []);
   }
-  const r = await client.query(
-    `SELECT id FROM organization_structure_nodes
-     WHERE organization_id = $1
-       AND status = 'active'
-       AND LOWER(TRIM(name)) = LOWER($2)
-     ORDER BY level_number DESC
-     LIMIT 1`,
-    [organizationId, trimmed]
-  );
-  return r.rows.length > 0 ? r.rows[0].id : null;
+  return orgNodesCacheForBulk.get(organizationId)!;
+}
+
+async function resolveOrgStructureNodeId(client: any, organizationId: string, raw: string): Promise<string | null> {
+  const nodes = await getOrgNodesForBulkResolve(organizationId);
+  return resolveOrgStructureNodeFromHint(client, organizationId, raw, nodes);
 }
 
 async function orgPathJsonForNode(organizationId: string, nodeId: string): Promise<string | null> {
@@ -919,7 +909,8 @@ export async function parseAndApply(
       return effectiveRows > MAX_ROWS_PER_SHEET + 1;
     };
 
-    // --- Organizations: sheet name matches /admin/entity-master (Entity Master Data (Org)) ---
+    // --- Organisation profile: only when "Entity Master Data (Org)" is uploaded without structure/assignment sheets
+    // (Admin → Entity Master). OrgIt Settings workbook is structure + assignments only.
     const orgSheet = getSheet([
       'Entity Master Data (Org)',
       'Entity Master (Organisation)',
@@ -927,8 +918,27 @@ export async function parseAndApply(
       'ENTITY MASTER DATA (Organisation)',
       'Organizations',
     ]);
+    const workbookHasStructureOrAssignmentSheet = workbook.worksheets.some((ws) =>
+      [
+        'Organisation Structure',
+        'Entity List',
+        'Client Entities',
+        'Client entities',
+        'Service List',
+        'Tasks',
+        'Employees',
+      ].includes(ws.name)
+    );
+    const skipOrgProfileParse = Boolean(orgSheet && workbookHasStructureOrAssignmentSheet);
+    if (skipOrgProfileParse) {
+      pushError({
+        message:
+          'Organisation profile sheet cannot be merged with OrgIt Settings (structure / Entity List / Service List / Tasks / Employees). Remove "Entity Master Data (Org)", or upload it alone from Admin → Entity Master.',
+      });
+    }
+
     console.log('[EntityMasterUpload] Organisation sheet', orgSheet ? { name: orgSheet.name, rowCount: orgSheet.rowCount } : 'NOT FOUND');
-    if (orgSheet && orgSheet.rowCount >= 1) {
+    if (!skipOrgProfileParse && orgSheet && orgSheet.rowCount >= 1) {
       const firstRow = orgSheet.getRow(1);
       const a1 = String((firstRow.getCell(1).value ?? '')).trim().toLowerCase();
       const isVerticalLayout = a1 === 'name of the organisation' || a1.startsWith('short name');
@@ -1164,8 +1174,10 @@ export async function parseAndApply(
           console.log('[EntityMasterUpload] Organisation processed', { updated: result.updated.organizations });
         }
       }
-    } else if (!orgSheet) {
-      console.log('[EntityMasterUpload] Organisation sheet missing or empty – no organisation rows processed');
+    } else if (!skipOrgProfileParse && !orgSheet) {
+      console.log(
+        '[EntityMasterUpload] No organisation-profile sheet present (structure + assignments only for full settings template)'
+      );
     }
 
     // --- Organisation Structure (before Entity List / Employees) ---

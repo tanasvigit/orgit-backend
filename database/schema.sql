@@ -185,7 +185,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_org_structure_nodes_unique_name_per_parent
   ON organization_structure_nodes (organization_id, COALESCE(parent_node_id, '00000000-0000-0000-0000-000000000000'::uuid), LOWER(name));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_org_structure_nodes_single_root
   ON organization_structure_nodes (organization_id)
-  WHERE level_number = 1;
+  WHERE parent_node_id IS NULL;
 
 DO $$
 BEGIN
