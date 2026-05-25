@@ -10,6 +10,18 @@ import {
   updateTaskCreationUserConfigForUser,
   parseAndValidateTaskCreationUserConfigBody,
 } from '../services/taskCreationUserConfigService';
+import {
+  loadMembershipContext,
+  getEffectivePermissions,
+} from '../services/employeePermissionService';
+
+function membershipFieldsForRole(role: string, userId: string) {
+  return loadMembershipContext(userId).then((ctx) => ({
+    organizationId: ctx.organizationId,
+    employeePermissions: getEffectivePermissions(role, ctx.employeePermissions),
+    notificationSettings: ctx.notificationSettings,
+  }));
+}
 
 /**
  * Request OTP for registration/login
@@ -559,6 +571,8 @@ export const loginWithPassword = async (req: Request, res: Response) => {
     });
     console.log('='.repeat(80));
 
+    const membership = await membershipFieldsForRole(user.role, user.id);
+
     return res.json({
       success: true,
       data: {
@@ -570,8 +584,10 @@ export const loginWithPassword = async (req: Request, res: Response) => {
           status: user.status,
           profilePhotoUrl: user.profile_photo_url,
           bio: user.bio,
-          organizationId: organizationId,
+          organizationId: membership.organizationId ?? organizationId,
           mustChangePassword,
+          employeePermissions: membership.employeePermissions,
+          notificationSettings: membership.notificationSettings,
         },
         token,
         refreshToken,
@@ -970,6 +986,7 @@ export const getCurrentUser = async (req: Request, res: Response) => {
     const organizationId = orgResult.rows[0]?.organization_id || null;
 
     const mustChangePassword = !!userRow.must_change_password;
+    const membership = await membershipFieldsForRole(userRow.role, userId);
 
     // Resolve profile photo URL if it's an S3 key
     const photoValue = userRow.profile_photo_url || null;
@@ -992,8 +1009,10 @@ export const getCurrentUser = async (req: Request, res: Response) => {
         bio: userRow.bio || undefined,
         about: userRow.about || userRow.bio || undefined,
         contact_number: userRow.contact_number || userRow.mobile || undefined,
-        organizationId: organizationId || undefined,
+        organizationId: membership.organizationId || organizationId || undefined,
         mustChangePassword,
+        employeePermissions: membership.employeePermissions,
+        notificationSettings: membership.notificationSettings,
       },
     });
   } catch (error: any) {

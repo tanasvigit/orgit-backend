@@ -13,6 +13,7 @@ import {
   updateGroupConversation,
 } from '../controllers/conversationController';
 import { authenticate } from '../middleware/authMiddleware';
+import { requireModule } from '../middleware/employeePermissionMiddleware';
 import { body, param } from 'express-validator';
 import { rateLimit } from '../middleware/rateLimitMiddleware';
 
@@ -20,6 +21,7 @@ const router = Router();
 
 // All routes require authentication
 router.use(authenticate);
+router.use(requireModule('Messaging'));
 
 // GET /api/conversations - Get all conversations
 router.get('/', getConversations);

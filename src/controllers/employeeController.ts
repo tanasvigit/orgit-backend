@@ -15,6 +15,21 @@ import {
   stripOrgNodeByLevel,
   validateOrgNodeByLevelChain,
 } from '../utils/employeeOrgNodeLevels';
+import {
+  DEFAULT_EMPLOYEE_PERMISSIONS,
+  DEFAULT_NOTIFICATION_SETTINGS,
+  normalizeEmployeePermissions,
+  normalizeNotificationSettings,
+} from '../services/employeeMasterCatalog';
+import { getEmployeeMasterColumnCaps } from '../utils/employeeMasterColumns';
+import {
+  applyMembershipProfileFields,
+  applyUserProfileFields,
+  employeeMasterMembershipSelectSql,
+  employeeMasterUserSelectSql,
+  mapEmployeeRow,
+  parseEmployeeMasterPayload,
+} from '../services/employeeMasterPersistence';
 
 async function normalizeEmployeeOrgAssignment(
   organizationId: string,
@@ -37,7 +52,7 @@ async function normalizeEmployeeOrgAssignment(
       includeInactive: false,
     });
     const levelsBelowGroup = tree.levels.filter((l) => l.levelNumber > 1 && l.isActive !== false);
-    primaryOrgNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup);
+    primaryOrgNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup, tree.nodes);
   }
 
   if (primaryOrgNodeId) {
@@ -101,7 +116,9 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
       primaryOrgNodeId,
       secondaryOrgNodeIds,
       orgFieldValues,
+      status: employeeStatus,
     } = req.body;
+    const masterPayload = parseEmployeeMasterPayload(req.body);
 
     if (!organizationId) {
       return res.status(403).json({
@@ -177,10 +194,12 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
       }
 
       // Update user role to employee if needed
-      if (existingUser.rows[0].role !== 'employee') {
+      const targetRole =
+        masterPayload.userRole === 'admin' ? 'admin' : 'employee';
+      if (existingUser.rows[0].role !== targetRole) {
         await query(
           'UPDATE users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-          ['employee', employeeUserId]
+          [targetRole, employeeUserId]
         );
       }
     } else {
@@ -194,11 +213,15 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
 
       const passwordHash = await bcrypt.hash(password, 10);
       
+      const targetRole =
+        masterPayload.userRole === 'admin' ? 'admin' : 'employee';
+      const initialStatus =
+        employeeStatus === 'inactive' ? 'inactive' : 'active';
       const newUserResult = await query(
         `INSERT INTO users (id, mobile, name, role, status, password_hash)
-         VALUES (gen_random_uuid(), $1, $2, 'employee', 'active', $3)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
          RETURNING id, mobile, name, role, status`,
-        [mobile, name.trim(), passwordHash]
+        [mobile, name.trim(), targetRole, initialStatus, passwordHash]
       );
 
       employeeUserId = newUserResult.rows[0].id;
@@ -259,29 +282,53 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
       );
     }
 
-    // Get the created/updated user
+    const masterCaps = await getEmployeeMasterColumnCaps();
+    if (masterCaps.membershipProfile) {
+      const perms = normalizeEmployeePermissions(
+        masterPayload.employeePermissions ?? DEFAULT_EMPLOYEE_PERMISSIONS
+      );
+      const notif = normalizeNotificationSettings(
+        masterPayload.notificationSettings ?? DEFAULT_NOTIFICATION_SETTINGS
+      );
+      await query(
+        `UPDATE user_organizations
+         SET employee_permissions = $1::jsonb,
+             notification_settings = $2::jsonb,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = $3 AND organization_id = $4`,
+        [JSON.stringify(perms), JSON.stringify(notif), employeeUserId, organizationId]
+      );
+    }
+    await applyUserProfileFields(employeeUserId, masterPayload);
+    await applyMembershipProfileFields(employeeUserId, organizationId, masterPayload);
+
+    const caps = await getEmployeeMasterColumnCaps();
+    const orgFvSelect = (await userOrganizationsHasOrgFieldValues())
+      ? 'uo.org_field_values'
+      : `'{}'::jsonb AS org_field_values`;
     const userResult = await query(
       `SELECT
-         u.id,
-         u.mobile,
-         u.name,
-         u.role,
-         u.status,
-         NULL::text AS department,
-         NULL::text AS designation,
-         uo.reporting_to,
-         uo.primary_org_node_id,
-         uo.secondary_org_node_ids,
-         NULL::text AS level
+         u.id, u.mobile, u.name, u.role, u.status, u.profile_photo_url, u.updated_at AS last_login_time,
+         ${employeeMasterUserSelectSql(caps.userProfile)},
+         uo.reporting_to, uo.primary_org_node_id, uo.secondary_org_node_ids,
+         ${orgFvSelect},
+         ${employeeMasterMembershipSelectSql(caps.membershipProfile)},
+         reporter.name AS reporting_to_name, u.created_at
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
+       LEFT JOIN users reporter ON uo.reporting_to = reporter.id
        WHERE u.id = $1 AND uo.organization_id = $2`,
       [employeeUserId, organizationId]
     );
+    const orgTree = await getOrganizationStructureTree(organizationId, {
+      includeArchived: true,
+      includeInactive: true,
+    });
+    const nodeById = new Map(orgTree.nodes.map((n) => [n.id, n]));
 
     res.status(201).json({
       success: true,
-      data: userResult.rows[0],
+      data: mapEmployeeRow(userResult.rows[0], nodeById),
       message: existingUser.rows.length > 0 
         ? 'Employee added to organization successfully' 
         : 'Employee created and added to organization successfully',
@@ -313,6 +360,7 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
     const orgFvSelect = hasOrgFvColumn
       ? 'uo.org_field_values'
       : `'{}'::jsonb AS org_field_values`;
+    const caps = await getEmployeeMasterColumnCaps();
 
     const [result, orgTree] = await Promise.all([
       query(
@@ -323,13 +371,13 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
         u.role,
         u.status,
         u.profile_photo_url,
-        NULL::text AS department,
-        NULL::text AS designation,
+        u.updated_at AS last_login_time,
+        ${employeeMasterUserSelectSql(caps.userProfile)},
         uo.reporting_to,
         uo.primary_org_node_id,
         uo.secondary_org_node_ids,
         ${orgFvSelect},
-        NULL::text AS level,
+        ${employeeMasterMembershipSelectSql(caps.membershipProfile)},
         reporter.name as reporting_to_name,
         u.created_at
        FROM users u
@@ -349,23 +397,7 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
 
     res.json({
       success: true,
-      data: result.rows.map((row: any) => {
-        const primaryNode = row.primary_org_node_id ? nodeById.get(row.primary_org_node_id) : null;
-        const secondaryNodeIds = Array.isArray(row.secondary_org_node_ids) ? row.secondary_org_node_ids : [];
-        const secondaryNodes = secondaryNodeIds
-          .map((nodeId: string) => nodeById.get(nodeId))
-          .filter(Boolean);
-
-        return {
-          ...row,
-          primary_org_node_id: row.primary_org_node_id,
-          secondary_org_node_ids: secondaryNodeIds,
-          primary_org_path: primaryNode?.pathDisplay || null,
-          primary_org_node_name: primaryNode?.name || null,
-          primary_org_level_label: primaryNode?.levelLabel || null,
-          secondary_org_paths: secondaryNodes.map((node: any) => node?.pathDisplay),
-        };
-      }),
+      data: result.rows.map((row: any) => mapEmployeeRow(row, nodeById)),
     });
   } catch (error: any) {
     console.error('Error getting employees:', error);
@@ -384,6 +416,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response) => {
     const organizationId = req.user?.organizationId;
     const { id } = req.params;
     const { name, reportingTo, status, primaryOrgNodeId, secondaryOrgNodeIds, orgFieldValues } = req.body;
+    const masterPayload = parseEmployeeMasterPayload(req.body);
 
     if (!organizationId) {
       return res.status(403).json({
@@ -414,11 +447,22 @@ export const updateEmployee = async (req: AuthRequest, res: Response) => {
     }
 
     if (status) {
+      const normalizedStatus = status === 'inactive' ? 'inactive' : 'active';
       await query(
         'UPDATE users SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-        [status, id]
+        [normalizedStatus, id]
       );
     }
+
+    if (masterPayload.userRole === 'admin' || masterPayload.userRole === 'employee') {
+      await query(
+        'UPDATE users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [masterPayload.userRole, id]
+      );
+    }
+
+    await applyUserProfileFields(id, masterPayload);
+    await applyMembershipProfileFields(id, organizationId, masterPayload);
 
     const primaryOrgNodeIdProvided = primaryOrgNodeId !== undefined || orgFieldValues !== undefined;
     const secondaryOrgNodeIdsProvided = secondaryOrgNodeIds !== undefined;
@@ -510,33 +554,32 @@ export const updateEmployee = async (req: AuthRequest, res: Response) => {
       );
     }
 
+    const caps = await getEmployeeMasterColumnCaps();
     const orgFvSelect = hasOrgFvColumn
       ? 'uo.org_field_values'
       : `'{}'::jsonb AS org_field_values`;
 
     const result = await query(
       `SELECT
-         u.id,
-         u.mobile,
-         u.name,
-         u.role,
-         u.status,
-         NULL::text AS department,
-         NULL::text AS designation,
-         uo.reporting_to,
-         uo.primary_org_node_id,
-         uo.secondary_org_node_ids,
+         u.id, u.mobile, u.name, u.role, u.status, u.updated_at AS last_login_time,
+         ${employeeMasterUserSelectSql(caps.userProfile)},
+         uo.reporting_to, uo.primary_org_node_id, uo.secondary_org_node_ids,
          ${orgFvSelect},
-         NULL::text AS level
+         ${employeeMasterMembershipSelectSql(caps.membershipProfile)}
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
        WHERE u.id = $1 AND uo.organization_id = $2`,
       [id, organizationId]
     );
+    const orgTree = await getOrganizationStructureTree(organizationId, {
+      includeArchived: true,
+      includeInactive: true,
+    });
+    const nodeById = new Map(orgTree.nodes.map((n) => [n.id, n]));
 
     res.json({
       success: true,
-      data: result.rows[0],
+      data: mapEmployeeRow(result.rows[0], nodeById),
     });
   } catch (error: any) {
     console.error('Error updating employee:', error);

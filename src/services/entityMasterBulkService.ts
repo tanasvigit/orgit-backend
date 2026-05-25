@@ -162,10 +162,23 @@ function buildEmployeeSheetColumns(levels: OrganizationStructureLevel[]) {
     width: Math.min(28, def.header.length + 4),
   }));
   return [
-    { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 30 },
-    { header: 'MOBILE NUMBER', key: 'mobile', width: 18 },
+    { header: 'EMPLOYEE ID', key: 'employee_code', width: 14 },
+    { header: 'NAME OF THE EMPLOYEE', key: 'name', width: 28 },
+    { header: 'MOBILE NUMBER', key: 'mobile', width: 16 },
+    { header: 'EMAIL ID', key: 'email', width: 24 },
+    { header: 'DOB', key: 'dob', width: 12 },
+    { header: 'GENDER', key: 'gender', width: 12 },
+    { header: 'ADDRESS', key: 'address', width: 32 },
+    { header: 'PAN NUMBER', key: 'pan_number', width: 14 },
+    { header: 'DATE OF JOINING', key: 'date_of_joining', width: 14 },
+    { header: 'EMPLOYMENT TYPE', key: 'employment_type', width: 14 },
+    { header: 'EMPLOYEE STATUS', key: 'status', width: 12 },
+    { header: 'DESIGNATION', key: 'designation', width: 20 },
     { header: 'REPORTING TO', key: 'reporting_to_mobile', width: 18 },
+    { header: 'WORK LOCATION', key: 'work_location', width: 24 },
     ...levelCols,
+    { header: 'SECONDARY ORG UNITS', key: 'secondary_org_units', width: 28 },
+    { header: 'USER ROLE', key: 'user_role', width: 10 },
     { header: 'ORG STRUCTURE NODE ID', key: 'primary_org_node', width: 24 },
   ];
 }

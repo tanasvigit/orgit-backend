@@ -30,12 +30,19 @@ import {
   getTaskCompliances,
 } from '../controllers/taskComplianceController';
 import { authenticate } from '../middleware/authMiddleware';
+import {
+  requireModule,
+  requireTaskRight,
+  requireGeneralRight,
+  requireCloseTaskIfCompleting,
+} from '../middleware/employeePermissionMiddleware';
 import { body, query as queryValidator } from 'express-validator';
 
 const router = Router();
 
 // All routes require authentication
 router.use(authenticate);
+router.use(requireModule('Tasks'));
 
 // Get all tasks - matching message-backend
 router.get(
@@ -63,6 +70,7 @@ router.post(
     body('recurrence_day_of_month').optional().isInt({ min: 1, max: 31 }),
     body('specific_weekday').optional().isInt({ min: 0, max: 6 }),
   ],
+  requireTaskRight('createTask'),
   createTask
 );
 
@@ -82,14 +90,15 @@ router.patch(
   [
     body('status').isIn(['pending', 'todo', 'active', 'in_progress', 'pending_verification', 'completed', 'rejected', 'deleted']),
   ],
+  requireCloseTaskIfCompleting,
   updateTaskStatus
 );
 
 // Update task - matching message-backend
-router.patch('/:id', updateTask);
+router.patch('/:id', requireGeneralRight('edit'), updateTask);
 
 // Delete task
-router.delete('/:id', deleteTask);
+router.delete('/:id', requireGeneralRight('delete'), deleteTask);
 router.post('/:id/request-delete', [body('reason').trim().isLength({ min: 1 })], requestTaskDelete);
 router.post('/:id/approve-delete-request', approveTaskDeleteRequest);
 router.post('/:id/deny-delete-request', denyTaskDeleteRequest);
@@ -101,26 +110,32 @@ router.get('/:id/assignees', getTaskAssignees);
 router.post(
   '/:id/assignees',
   [body('assignee_ids').isArray().notEmpty()],
+  requireTaskRight('assignTask'),
   addTaskAssignees
 );
 
 // Mark member task as complete (user marks their own completion)
-router.post('/:id/members/:userId/complete', markMemberComplete);
+router.post('/:id/members/:userId/complete', requireTaskRight('closeTask'), markMemberComplete);
 
 // Verify member completion (creator verifies member's completion)
 router.post('/:id/members/:userId/verify', verifyMemberCompletion);
 
 // Reassign member work (send back from completed to in-progress)
-router.post('/:id/members/:userId/reassign', reassignMember);
-router.post('/:id/complete', completeTaskForVerification);
-router.post('/:id/verify', verifyTaskCompletion);
-router.post('/:id/owner-complete', ownerCompleteTask);
+router.post('/:id/members/:userId/reassign', requireTaskRight('reassignTask'), reassignMember);
+router.post('/:id/complete', requireTaskRight('closeTask'), completeTaskForVerification);
+router.post('/:id/verify', requireTaskRight('closeTask'), verifyTaskCompletion);
+router.post('/:id/owner-complete', requireTaskRight('closeTask'), ownerCompleteTask);
 router.post(
   '/:id/reject-completion',
   [body('reason').trim().isLength({ min: 10 })],
   rejectTaskCompletion
 );
-router.post('/:id/exit-request', [body('comment').trim().isLength({ min: 1 })], createExitRequest);
+router.post(
+  '/:id/exit-request',
+  [body('comment').trim().isLength({ min: 1 })],
+  requireTaskRight('escalateTask'),
+  createExitRequest
+);
 router.post('/:id/exit-request/:requestId/approve', approveExitRequest);
 router.post('/:id/exit-request/:requestId/reject', rejectExitRequest);
 

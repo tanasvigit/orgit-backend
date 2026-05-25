@@ -42,7 +42,7 @@ async function normalizeClientOrgAssignment(
       includeInactive: false,
     });
     const levelsBelowGroup = tree.levels.filter((l) => l.levelNumber > 1 && l.isActive !== false);
-    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup);
+    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup, tree.nodes);
   }
 
   if (orgStructureNodeId) {

@@ -1,16 +1,29 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyToken, JWTPayload } from '../utils/jwt';
 import { query } from '../config/database';
+import {
+  EmployeePermissions,
+  EmployeeNotificationSettings,
+} from '../services/employeeMasterCatalog';
+import { loadMembershipContext } from '../services/employeePermissionService';
 
 export interface AuthRequest extends Request {
   user?: JWTPayload & {
     organizationId?: string;
+    employeePermissions?: EmployeePermissions;
+    notificationSettings?: EmployeeNotificationSettings;
   };
 }
 
 // In-memory cache to avoid hitting DB on every request (reduces load and timeouts under heavy chat traffic)
 const ORG_CACHE_TTL_MS = parseInt(process.env.ORG_CACHE_TTL_MS || '300000', 10); // 5 minutes
-const orgCache = new Map<string, { organizationId?: string; expiresAt: number }>();
+type MembershipCacheEntry = {
+  organizationId?: string;
+  employeePermissions?: EmployeePermissions;
+  notificationSettings?: EmployeeNotificationSettings;
+  expiresAt: number;
+};
+const orgCache = new Map<string, MembershipCacheEntry>();
 
 /**
  * Authentication middleware
@@ -40,20 +53,31 @@ export const authenticate = async (
     const cached = orgCache.get(decoded.userId);
     let organizationId: string | undefined = undefined;
 
+    let employeePermissions: EmployeePermissions | undefined;
+    let notificationSettings: EmployeeNotificationSettings | undefined;
+
     if (cached && cached.expiresAt > now) {
       organizationId = cached.organizationId;
+      employeePermissions = cached.employeePermissions;
+      notificationSettings = cached.notificationSettings;
     } else {
       try {
-        const orgResult = await query(
-          `SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1`,
-          [decoded.userId]
-        );
-        organizationId = orgResult.rows.length > 0 ? orgResult.rows[0].organization_id : undefined;
-        orgCache.set(decoded.userId, { organizationId, expiresAt: now + ORG_CACHE_TTL_MS });
+        const membership = await loadMembershipContext(decoded.userId);
+        organizationId = membership.organizationId;
+        employeePermissions = membership.employeePermissions;
+        notificationSettings = membership.notificationSettings;
+        orgCache.set(decoded.userId, {
+          organizationId,
+          employeePermissions,
+          notificationSettings,
+          expiresAt: now + ORG_CACHE_TTL_MS,
+        });
       } catch (dbErr) {
         // If DB lookup fails but we have a stale cached value, prefer using it to avoid 401 spam
         if (cached) {
           organizationId = cached.organizationId;
+          employeePermissions = cached.employeePermissions;
+          notificationSettings = cached.notificationSettings;
         } else {
           throw dbErr;
         }
@@ -64,6 +88,8 @@ export const authenticate = async (
     req.user = {
       ...decoded,
       organizationId,
+      employeePermissions,
+      notificationSettings,
     };
 
     next();

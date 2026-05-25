@@ -1,12 +1,14 @@
 import { Router } from 'express';
 import { getDashboard, getStatistics, getMonthlyCalendar, getDashboardEvents, postDashboardEvent } from '../controllers/dashboardController';
 import { authenticate } from '../middleware/authMiddleware';
+import { requireModule } from '../middleware/employeePermissionMiddleware';
 import { query as queryValidator } from 'express-validator';
 
 const router = Router();
 
 // All routes require authentication
 router.use(authenticate);
+router.use(requireModule('Dashboard'));
 
 router.get(
   '/',

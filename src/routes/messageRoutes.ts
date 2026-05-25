@@ -23,6 +23,7 @@ import {
   uploadVoiceNote,
 } from '../controllers/messageController';
 import { authenticate } from '../middleware/authMiddleware';
+import { requireModule } from '../middleware/employeePermissionMiddleware';
 import { body, query as queryValidator, param } from 'express-validator';
 import { imageUpload, videoUpload, audioUpload, documentUpload, voiceNoteUpload } from '../services/mediaUploadService';
 
@@ -30,6 +31,7 @@ const router = Router();
 
 // All routes require authentication
 router.use(authenticate);
+router.use(requireModule('Messaging'));
 
 router.post(
   '/send',

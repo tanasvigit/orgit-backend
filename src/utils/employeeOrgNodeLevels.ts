@@ -80,9 +80,30 @@ export async function validateOrgNodeByLevelChain(
   }
 }
 
+function resolveDeepestFromSelectedNodeIds(
+  nodes: Array<{ id: string; stageOrder?: number | null; levelNumber?: number | null }>,
+  orgNodeByLevel: Record<string, string>
+): string | null {
+  const ids = [...new Set(Object.values(orgNodeByLevel).map((id) => id?.trim()).filter(Boolean))] as string[];
+  if (ids.length === 0) return null;
+
+  let bestId: string | null = null;
+  let bestOrder = -1;
+  for (const id of ids) {
+    const node = nodes.find((n) => n.id === id);
+    const order = node?.stageOrder ?? node?.levelNumber ?? 0;
+    if (order >= bestOrder) {
+      bestOrder = order;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
 export function resolvePrimaryFromOrgNodeByLevel(
   orgNodeByLevel: Record<string, string>,
-  levelsBelowGroup?: Array<{ levelNumber: number; levelLabel: string }>
+  levelsBelowGroup?: Array<{ levelNumber: number; levelLabel: string }>,
+  treeNodes?: Array<{ id: string; stageOrder?: number | null; levelNumber?: number | null }>
 ): string | null {
   if (Object.keys(orgNodeByLevel).length === 0) return null;
 
@@ -94,7 +115,6 @@ export function resolvePrimaryFromOrgNodeByLevel(
         orgNodeByLevel[level.levelLabel] || orgNodeByLevel[String(level.levelNumber)];
       if (nodeId) return nodeId;
     }
-    return null;
   }
 
   const numericKeys = Object.keys(orgNodeByLevel)
@@ -103,6 +123,10 @@ export function resolvePrimaryFromOrgNodeByLevel(
     .sort((a, b) => a - b);
   if (numericKeys.length > 0) {
     return orgNodeByLevel[String(numericKeys[numericKeys.length - 1])] || null;
+  }
+
+  if (treeNodes?.length) {
+    return resolveDeepestFromSelectedNodeIds(treeNodes, orgNodeByLevel);
   }
 
   return Object.values(orgNodeByLevel).find((id) => Boolean(id?.trim())) || null;
