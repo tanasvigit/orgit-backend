@@ -2,7 +2,15 @@ import ExcelJS from 'exceljs';
 import { getClient } from '../config/database';
 import { createHash } from 'crypto';
 import { resolveInitialAssigneeStatus } from './userTaskLifecycle';
-import { calculateNextCycleStartDate } from './cycleStartRecurrence';
+import {
+  loadOrganizationAccountingYearStart,
+  resolveBulkRecurrenceSchedule,
+  setupRecurringTemplateForTask,
+  formatBulkDateOnly,
+  serializeBulkRecurrenceCursor,
+  parseBulkDateOnlyToInstant,
+  normalizeBulkNextRecurrenceForInsert,
+} from './recurringTemplateSetup';
 import { resolveNodeReference } from './organizationStructureService';
 
 /** Bulk upload limits and safety */
@@ -288,8 +296,8 @@ export function applyTaskBulkSheetValidations(sheet: ExcelJS.Worksheet): void {
   addTaskBulkSheetListValidation(
     sheet,
     'recurrence',
-    ['Weekly', 'Monthly', 'Quarterly', 'Yearly'],
-    'Select Weekly, Monthly, Quarterly, or Yearly.'
+    ['Weekly', 'Monthly', 'Quarterly', 'Yearly', 'Daily'],
+    'Select Daily, Weekly, Monthly, Quarterly, or Yearly.'
   );
   addTaskBulkSheetListValidation(sheet, 'auto_escalate', ['Yes', 'No'], 'Select Yes or No.');
   addTaskBulkSheetListValidation(
@@ -374,6 +382,8 @@ export interface TaskBulkJobPayload {
   targetDate: string | null;
   dueDate: string;
   frequency: string | null;
+  recurrenceType: string | null;
+  recurrenceInterval: number;
   specificWeekday: number | null;
   nextRecurrenceDate: string | null;
   taskRolloutType: string | null;
@@ -419,6 +429,8 @@ export async function createTaskFromPayload(
     targetDate,
     dueDate,
     frequency,
+    recurrenceType,
+    recurrenceInterval,
     specificWeekday,
     nextRecurrenceDate,
     taskRolloutType,
@@ -488,6 +500,17 @@ export async function createTaskFromPayload(
     }
   }
 
+  const isRecurring = taskType === 'recurring';
+  const taskTypeForInsert = isRecurring ? 'recurring_instance' : taskType;
+  const startDateForInsert =
+    isRecurring && recurrenceType === 'daily' && startDate
+      ? parseBulkDateOnlyToInstant(startDate)?.toISOString() ?? startDate
+      : startDate;
+  const nextRecurrenceForInsert = normalizeBulkNextRecurrenceForInsert(
+    nextRecurrenceDate,
+    recurrenceType
+  );
+
   const columnCheck = await client.query(
     `SELECT column_name FROM information_schema.columns
      WHERE table_name = 'tasks'
@@ -511,7 +534,13 @@ export async function createTaskFromPayload(
        'recurrence_end_date',
        'recurrence_after_occurrences',
        'escalation_trigger',
-       'escalation_days_before'
+       'escalation_days_before',
+       'recurrence_type',
+       'recurrence_interval',
+       'recurrence_template_id',
+       'parent_task_id',
+       'recurrence_instance_no',
+       'category'
      )`
   );
   const hasCreatedBy = columnCheck.rows.some((c: any) => c.column_name === 'created_by');
@@ -534,6 +563,12 @@ export async function createTaskFromPayload(
   const hasRecurrenceAfterOccurrences = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_after_occurrences');
   const hasEscalationTrigger = columnCheck.rows.some((c: any) => c.column_name === 'escalation_trigger');
   const hasEscalationDaysBefore = columnCheck.rows.some((c: any) => c.column_name === 'escalation_days_before');
+  const hasRecurrenceType = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_type');
+  const hasRecurrenceInterval = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_interval');
+  const hasRecurrenceTemplateId = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_template_id');
+  const hasParentTaskId = columnCheck.rows.some((c: any) => c.column_name === 'parent_task_id');
+  const hasRecurrenceInstanceNo = columnCheck.rows.some((c: any) => c.column_name === 'recurrence_instance_no');
+  const hasCategory = columnCheck.rows.some((c: any) => c.column_name === 'category');
 
   let insertCols = [
     'title',
@@ -551,14 +586,14 @@ export async function createTaskFromPayload(
   let insertVals: any[] = [
     title,
     description,
-    taskType,
+    taskTypeForInsert,
     organizationId,
-    startDate || null,
+    startDateForInsert || null,
     targetDate || null,
     dueDate,
     frequency,
     specificWeekday,
-    nextRecurrenceDate || null,
+    nextRecurrenceForInsert || null,
     'pending',
   ];
 
@@ -644,12 +679,36 @@ export async function createTaskFromPayload(
     insertCols.push('escalation_days_before');
     insertVals.push(escalationDaysBefore);
   }
+  if (isRecurring && hasRecurrenceType && recurrenceType) {
+    insertCols.push('recurrence_type');
+    insertVals.push(recurrenceType);
+  }
+  if (isRecurring && hasRecurrenceInterval) {
+    insertCols.push('recurrence_interval');
+    insertVals.push(recurrenceInterval || 1);
+  }
+  if (isRecurring && hasCategory) {
+    insertCols.push('category');
+    insertVals.push('general');
+  }
+  if (isRecurring && hasParentTaskId) {
+    insertCols.push('parent_task_id');
+    insertVals.push(null);
+  }
+  if (isRecurring && hasRecurrenceTemplateId) {
+    insertCols.push('recurrence_template_id');
+    insertVals.push(null);
+  }
+  if (isRecurring && hasRecurrenceInstanceNo) {
+    insertCols.push('recurrence_instance_no');
+    insertVals.push(1);
+  }
 
   const placeholders = insertVals.map((_, i) => `$${i + 1}`).join(', ');
   const taskResult = await client.query(
     `INSERT INTO tasks (${insertCols.join(', ')})
      VALUES (${placeholders})
-     RETURNING id`,
+     RETURNING *`,
     insertVals
   );
   const task = taskResult.rows[0];
@@ -743,7 +802,7 @@ export async function createTaskFromPayload(
     let msgVals: any[] = [
       conversationId,
       taskCreatorId,
-      `Task group auto-created by ${creatorName}`,
+      `Task created by ${creatorName}`,
       'text',
     ];
     if (hasSenderOrgId && organizationId) {
@@ -795,6 +854,27 @@ export async function createTaskFromPayload(
         );
       }
     }
+  }
+
+  if (isRecurring && recurrenceType && nextRecurrenceForInsert) {
+    await setupRecurringTemplateForTask(client, {
+      task,
+      organizationId,
+      title,
+      description,
+      category: 'general',
+      creatorId: taskCreatorId,
+      reportingMemberId: reportingMemberId || null,
+      recurrenceType,
+      recurrenceInterval: recurrenceInterval || 1,
+      specificWeekday,
+      nextRecurrenceDate: nextRecurrenceForInsert,
+      recurrenceEndType,
+      recurrenceEndDate,
+      recurrenceAfterOccurrences,
+      assigneeIds: effectiveAssigneeIds,
+      escalationContactIds,
+    });
   }
 
   return { taskId: task.id, inserted: true };
@@ -903,6 +983,8 @@ export async function parseAndApply(
       });
     }
 
+    let accountingYearStartForOrg: string | null | undefined = undefined;
+
     for (let r = 2; r <= maxRow; r++) {
     try {
       const row = tasksSheet.getRow(r);
@@ -954,7 +1036,7 @@ export async function parseAndApply(
       const recurrenceEndTypeRaw = getCellStr(row, recurrenceEndTypeCol).toLowerCase();
       const recurrenceEndType = recurrenceEndTypeRaw || null;
       const recurrenceEndDateParsed = parseDate(getCellStr(row, recurrenceEndDateCol));
-      const recurrenceEndDate = recurrenceEndDateParsed ? toLocalDateOnlyString(recurrenceEndDateParsed) : null;
+      const recurrenceEndDate = recurrenceEndDateParsed ? formatBulkDateOnly(recurrenceEndDateParsed) : null;
       const recurrenceAfterOccurrencesRaw = getCellStr(row, recurrenceAfterOccurrencesCol);
       const recurrenceAfterOccurrences = recurrenceAfterOccurrencesRaw
         ? Number.parseInt(recurrenceAfterOccurrencesRaw, 10) || null
@@ -1035,31 +1117,40 @@ export async function parseAndApply(
     }
 
       let frequency: string | null = null;
+      let recurrenceType: string | null = null;
+      let recurrenceInterval = 1;
       let specificWeekday: number | null = null;
       let nextRecurrenceDate: Date | null = null;
       const recurrenceRaw = getCellStr(row, recurrenceCol).toLowerCase();
-      if (taskType === 'recurring' && recurrenceRaw) {
-        const map: Record<string, string> = {
-          weekly: 'specific_weekday',
-          monthly: 'monthly',
-          quarterly: 'quarterly',
-          yearly: 'yearly',
-        };
-        frequency = map[recurrenceRaw] || null;
-        if (recurrenceRaw === 'weekly') {
-          specificWeekday = dueDate.getDay();
-        } else if (recurrenceRaw === 'monthly') {
-          specificWeekday = null;
+      if (taskType === 'recurring') {
+        if (!recurrenceRaw) {
+          pushError({ sheet: tasksSheet.name, row: r, message: 'Recurrence is required for recurring tasks' });
+          continue;
         }
-        if (frequency) {
-          const cycleAnchorDate = startDate || dueDate;
-          nextRecurrenceDate = calculateNextCycleStartDate(
-            recurrenceRaw,
-            1,
-            specificWeekday,
-            cycleAnchorDate
-          );
+        if (
+          (recurrenceRaw === 'yearly' || recurrenceRaw === 'annually') &&
+          accountingYearStartForOrg === undefined
+        ) {
+          accountingYearStartForOrg = await loadOrganizationAccountingYearStart(client, organizationId);
         }
+        const schedule = resolveBulkRecurrenceSchedule(recurrenceRaw, {
+          startDate,
+          dueDate,
+          recurrenceInterval,
+          accountingYearStart: accountingYearStartForOrg,
+        });
+        if (!schedule) {
+          pushError({
+            sheet: tasksSheet.name,
+            row: r,
+            message: `Invalid recurrence: ${recurrenceRaw}. Use Daily, Weekly, Monthly, Quarterly, or Yearly.`,
+          });
+          continue;
+        }
+        frequency = schedule.frequency;
+        recurrenceType = schedule.recurrenceType;
+        specificWeekday = schedule.specificWeekday;
+        nextRecurrenceDate = schedule.nextRecurrenceDate;
       }
 
       const allAssigneeIds = new Set<string>(assigneeIds);
@@ -1104,12 +1195,14 @@ export async function parseAndApply(
         clientEntityId,
         description,
         taskType,
-        startDate: startDate ? toLocalDateOnlyString(startDate) : null,
-        targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
-        dueDate: toLocalDateOnlyString(dueDate),
+        startDate: startDate ? formatBulkDateOnly(startDate) : null,
+        targetDate: targetDate ? formatBulkDateOnly(targetDate) : null,
+        dueDate: formatBulkDateOnly(dueDate),
         frequency,
+        recurrenceType,
+        recurrenceInterval,
         specificWeekday,
-        nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+        nextRecurrenceDate: nextRecurrenceDate ? serializeBulkRecurrenceCursor(nextRecurrenceDate) : null,
         taskRolloutType,
         recurrenceEndType,
         recurrenceEndDate,
@@ -1140,12 +1233,14 @@ export async function parseAndApply(
               description,
               tagsText,
               taskType,
-              startDate: startDate ? toLocalDateOnlyString(startDate) : null,
-              targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
-              dueDate: toLocalDateOnlyString(dueDate),
+              startDate: startDate ? formatBulkDateOnly(startDate) : null,
+              targetDate: targetDate ? formatBulkDateOnly(targetDate) : null,
+              dueDate: formatBulkDateOnly(dueDate),
               frequency,
               specificWeekday,
-              nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+              nextRecurrenceDate: nextRecurrenceDate
+                ? serializeBulkRecurrenceCursor(nextRecurrenceDate)
+                : null,
               taskRolloutType,
               recurrenceEndType,
               recurrenceEndDate,

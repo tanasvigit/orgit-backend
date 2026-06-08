@@ -51,6 +51,35 @@ export const processTaskFieldEscalations = async (): Promise<void> => {
     ? `COALESCE(t.escalation_days_before, NULLIF(TRIM(t.escalation_rules->>'days_before'), '')::int, 0)`
     : `COALESCE(NULLIF(TRIM(t.escalation_rules->>'days_before'), '')::int, 0)`;
 
+  const whenExpr = `COALESCE(NULLIF(LOWER(TRIM(t.escalation_rules->>'when')), ''), 'before')`;
+  const offsetExpr = `COALESCE(
+    NULLIF(TRIM(t.escalation_rules->>'offset_days'), '')::int,
+    CASE WHEN ${whenExpr} = 'on' THEN 0 ELSE ${daysExpr} END,
+    0
+  )`;
+
+  const scheduleDueExpr = `(
+    ${whenExpr} = 'after'
+    AND CURRENT_DATE >= (t.due_date::date + (${offsetExpr} * INTERVAL '1 day'))
+  ) OR (
+    ${whenExpr} = 'on'
+    AND CURRENT_DATE >= t.due_date::date
+  ) OR (
+    ${whenExpr} NOT IN ('after', 'on')
+    AND CURRENT_DATE >= (t.due_date::date - (${offsetExpr} * INTERVAL '1 day'))
+  )`;
+
+  const scheduleTargetExpr = `(
+    ${whenExpr} = 'after'
+    AND CURRENT_DATE >= (t.target_date::date + (${offsetExpr} * INTERVAL '1 day'))
+  ) OR (
+    ${whenExpr} = 'on'
+    AND CURRENT_DATE >= t.target_date::date
+  ) OR (
+    ${whenExpr} NOT IN ('after', 'on')
+    AND CURRENT_DATE >= (t.target_date::date - (${offsetExpr} * INTERVAL '1 day'))
+  )`;
+
   const result = await query(
     `SELECT
        t.id,
@@ -72,12 +101,12 @@ export const processTaskFieldEscalations = async (): Promise<void> => {
          (
            ${triggerExpr} = 'target_date'
            AND t.target_date IS NOT NULL
-           AND CURRENT_DATE >= (t.target_date::date - (${daysExpr} * INTERVAL '1 day'))
+           AND (${scheduleTargetExpr})
          )
          OR (
            ${triggerExpr} <> 'target_date'
            AND t.due_date IS NOT NULL
-           AND CURRENT_DATE >= (t.due_date::date - (${daysExpr} * INTERVAL '1 day'))
+           AND (${scheduleDueExpr})
          )
        )
        AND EXISTS (
@@ -95,10 +124,10 @@ export const processTaskFieldEscalations = async (): Promise<void> => {
   );
 
   for (const row of result.rows as TaskEscalationCandidate[]) {
-    const { trigger, daysBefore } = resolveTaskEscalationConfig(row);
+    const { trigger, when, offsetDays } = resolveTaskEscalationConfig(row);
     const anchor =
       trigger === 'target_date' ? row.target_date : row.due_date;
-    const anchorLabel = trigger === 'target_date' ? 'target date' : 'due date';
+    const anchorLabel = trigger === 'target_date' ? 'Target Date' : 'Due Date';
     const anchorDay =
       anchor instanceof Date
         ? anchor.toISOString().slice(0, 10)
@@ -106,10 +135,12 @@ export const processTaskFieldEscalations = async (): Promise<void> => {
           ? String(anchor).slice(0, 10)
           : '';
 
-    const reason =
-      daysBefore > 0
-        ? `Auto escalation: ${daysBefore} day(s) before ${anchorLabel}${anchorDay ? ` (${anchorDay})` : ''}`
-        : `Auto escalation: ${anchorLabel} threshold reached${anchorDay ? ` (${anchorDay})` : ''}`;
+    const whenLabel = when === 'on' ? 'on' : when === 'after' ? 'After' : 'Before';
+    const dayPart =
+      when === 'on'
+        ? 'on'
+        : `${offsetDays} day${offsetDays === 1 ? '' : 's'}`;
+    const reason = `Auto escalation: ${whenLabel} ${dayPart} of ${anchorLabel}${anchorDay ? ` (${anchorDay})` : ''}`;
 
     await escalateTask(row.id, reason);
   }

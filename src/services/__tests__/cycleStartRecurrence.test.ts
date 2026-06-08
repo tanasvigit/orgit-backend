@@ -38,6 +38,21 @@ describe('cycleStartRecurrence', () => {
     expect(nextCycleStart.toDateString()).toBe(new Date(2024, 0, 8).toDateString());
   });
 
+  it('advances daily cycles by one UTC calendar day', () => {
+    const currentCycleStart = new Date('2026-05-31T22:00:00.000Z');
+    const nextCycleStart = calculateNextCycleStartDate('daily', 1, null, currentCycleStart);
+
+    expect(nextCycleStart.toISOString()).toBe('2026-06-01T00:00:00.000Z');
+  });
+
+  it('does not treat daily as weekly (+7 days)', () => {
+    const cursor = new Date('2026-05-31T22:00:00.000Z');
+    const daily = calculateNextCycleStartDate('daily', 1, null, cursor);
+    const weekly = calculateNextCycleStartDate('weekly', 1, null, cursor);
+    expect(daily.toISOString()).not.toBe(weekly.toISOString());
+    expect(weekly.toISOString()).toBe('2026-06-07T22:00:00.000Z');
+  });
+
   it('moves yearly cycles to the next accounting year start', () => {
     const currentCycleStart = new Date(2026, 4, 13, 3, 30, 0, 0);
     const nextCycleStart = calculateNextFinancialYearStart(

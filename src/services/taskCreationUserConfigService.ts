@@ -1,10 +1,37 @@
 import { query } from '../config/database';
 
+export const TASK_CARD_DISPLAY_FIELD_KEYS = [
+  'title',
+  'statusIcon',
+  'tagOrClient',
+  'dueDate',
+  'frequency',
+  'taskUnit',
+  'unreadBadge',
+  'overdueBadge',
+] as const;
+
+export type TaskCardDisplayFieldKey = (typeof TASK_CARD_DISPLAY_FIELD_KEYS)[number];
+
+export type TaskCardDisplayConfig = Record<TaskCardDisplayFieldKey, boolean>;
+
+export const DEFAULT_TASK_CARD_DISPLAY: TaskCardDisplayConfig = {
+  title: true,
+  statusIcon: true,
+  tagOrClient: true,
+  dueDate: true,
+  frequency: true,
+  taskUnit: true,
+  unreadBadge: true,
+  overdueBadge: true,
+};
+
 export type TaskCreationUserConfigPayload = {
   dueDaysFromStart: number;
   targetDaysBeforeDue: number;
   autoEscalateTrigger: 'target_date' | 'due_date';
   taskUnitPreference: 'org_unit';
+  taskCardDisplay: TaskCardDisplayConfig;
 };
 
 export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = {
@@ -12,7 +39,19 @@ export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = 
   targetDaysBeforeDue: 3,
   autoEscalateTrigger: 'target_date',
   taskUnitPreference: 'org_unit',
+  taskCardDisplay: { ...DEFAULT_TASK_CARD_DISPLAY },
 };
+
+export function mergeTaskCardDisplayConfig(stored: unknown): TaskCardDisplayConfig {
+  const base = { ...DEFAULT_TASK_CARD_DISPLAY };
+  if (!isPlainObject(stored)) return base;
+  for (const key of TASK_CARD_DISPLAY_FIELD_KEYS) {
+    if (typeof stored[key] === 'boolean') {
+      base[key] = stored[key];
+    }
+  }
+  return base;
+}
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -47,6 +86,8 @@ export function mergeTaskCreationUserConfig(
   if (base.targetDaysBeforeDue > base.dueDaysFromStart) {
     base.targetDaysBeforeDue = Math.min(base.targetDaysBeforeDue, base.dueDaysFromStart);
   }
+
+  base.taskCardDisplay = mergeTaskCardDisplayConfig(stored.taskCardDisplay);
 
   return base;
 }
@@ -88,6 +129,9 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
       taskUnitPreference === 'org_unit' || taskUnitPreference === 'org_node'
         ? 'org_unit'
         : DEFAULT_TASK_CREATION_USER_CONFIG.taskUnitPreference,
+    taskCardDisplay: mergeTaskCardDisplayConfig(
+      isPlainObject(body) ? body.taskCardDisplay : undefined
+    ),
   };
 }
 

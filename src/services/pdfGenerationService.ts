@@ -1,4 +1,3 @@
-import puppeteer from 'puppeteer';
 import fs from 'fs/promises';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
@@ -7,6 +6,8 @@ import { getOrganizationData, formatOrganizationDataForTemplate } from './entity
 import { mergeHeaderAndBody } from './templateService';
 import { renderDocumentFromState } from './builderRendererService';
 import { isConfigured as isS3Configured, upload as s3Upload } from './s3StorageService';
+import { injectGstInvoicePdfLayoutLock } from './gstInvoicePdfLayoutLock';
+import { getSharedPdfBrowser } from './pdfBrowserPool';
 
 const PDF_OUTPUT_DIR = process.env.PDF_OUTPUT_DIR || './uploads/document-pdfs';
 
@@ -34,27 +35,13 @@ export async function generatePDFFromHTML(
   html: string,
   options: PDFOptions = {}
 ): Promise<Buffer> {
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-  const extraArgs = process.env.PUPPETEER_ARGS
-    ? process.env.PUPPETEER_ARGS.split(',').map(s => s.trim()).filter(Boolean)
-    : [];
+  const preparedHtml = injectGstInvoicePdfLayoutLock(html);
 
   let browser: any;
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: executablePath || undefined,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--font-render-hinting=medium',
-        ...extraArgs,
-      ],
-    });
+    browser = await getSharedPdfBrowser();
   } catch (err: any) {
     const msg = err?.message || String(err);
-    // Common in minimal Linux containers (missing GTK/ATK libs).
     if (msg.includes('error while loading shared libraries') || msg.includes('libatk-1.0.so.0')) {
       const error = new Error('PDF generation unavailable: Chromium dependencies missing');
       (error as any).code = 'PDF_GENERATION_UNAVAILABLE';
@@ -64,24 +51,26 @@ export async function generatePDFFromHTML(
     throw err;
   }
 
+  const page = await browser.newPage();
   try {
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.setViewport({ width: 1200, height: 1697, deviceScaleFactor: 1 });
+    await page.setContent(preparedHtml, { waitUntil: 'load', timeout: 15000 });
 
     const pdfBuffer = await page.pdf({
       format: options.format || 'A4',
       margin: options.margin || {
-        top: '20mm',
-        right: '20mm',
-        bottom: '20mm',
-        left: '20mm',
+        top: '14mm',
+        right: '14mm',
+        bottom: '14mm',
+        left: '14mm',
       },
       printBackground: options.printBackground !== false,
+      preferCSSPageSize: true,
     });
 
     return pdfBuffer;
   } finally {
-    await browser.close();
+    await page.close().catch(() => undefined);
   }
 }
 
@@ -98,6 +87,7 @@ export async function generatePDFFromTemplate(
   organizationId: string
 ): Promise<{ pdfBuffer: Buffer; pdfUrl: string }> {
   let completeHTML = '';
+  let pdfOptions: PDFOptions = {};
 
   // Case 1: Document Builder State (Modern)
   // Check if filledData looks like a DocumentBuilder state
@@ -122,10 +112,12 @@ export async function generatePDFFromTemplate(
     // Fetch template
     const templateResult = await query(
       `SELECT 
+        type,
         header_template,
         body_template,
         template_schema,
-        auto_fill_fields
+        auto_fill_fields,
+        pdf_settings
       FROM document_templates
       WHERE id = $1 AND status = 'active'`,
       [templateId]
@@ -138,13 +130,27 @@ export async function generatePDFFromTemplate(
     const template = templateResult.rows[0];
     const headerTemplate = template.header_template || '';
     const bodyTemplate = template.body_template || '';
+    const isGstInvoiceTemplate =
+      /gst-inv-page|gst-inv-root/i.test(bodyTemplate) ||
+      template.type === 'gst_invoice_figma';
 
-    // Fetch organization data for auto-fill
-    const orgData = await getOrganizationData(organizationId);
-    const headerData = formatOrganizationDataForTemplate(orgData);
+    const rawSettings = template.pdf_settings;
+    if (rawSettings) {
+      try {
+        pdfOptions =
+          typeof rawSettings === 'string' ? JSON.parse(rawSettings) : { ...rawSettings };
+      } catch {
+        pdfOptions = {};
+      }
+    }
+
+    // GST invoice uses user-filled data only — skip org DB fetch for faster PDF.
+    const headerData = isGstInvoiceTemplate
+      ? {}
+      : formatOrganizationDataForTemplate(await getOrganizationData(organizationId));
 
     // Prepare body data - merge user-filled data with any additional formatting
-    const bodyData = {
+    const bodyData: Record<string, any> = {
       ...filledData,
       // Add common formatting helpers
       formatCurrency: (amount: number) => {
@@ -178,8 +184,7 @@ export async function generatePDFFromTemplate(
     }
   }
 
-  // Generate PDF from the final HTML
-  const pdfBuffer = await generatePDFFromHTML(completeHTML);
+  const pdfBuffer = await generatePDFFromHTML(completeHTML, pdfOptions);
 
   let pdfUrl: string;
   if (isS3Configured()) {

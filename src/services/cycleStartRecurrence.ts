@@ -1,4 +1,5 @@
 export type CycleRecurrenceFrequency =
+  | 'daily'
   | 'weekly'
   | 'monthly'
   | 'quarterly'
@@ -23,6 +24,34 @@ export const startOfCalendarMonth = (date: Date): Date => {
   const next = new Date(date.getFullYear(), date.getMonth(), 1);
   next.setHours(date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
   return next;
+};
+
+export const startOfCalendarDay = (date: Date): Date => {
+  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  next.setHours(0, 0, 0, 0);
+  return next;
+};
+
+/** UTC calendar day at 00:00:00.000Z — used for daily recurrence (create, job, SQL). */
+export const startOfUtcCalendarDay = (date: Date): Date =>
+  new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+
+export const addUtcCalendarDays = (date: Date, days: number): Date => {
+  const next = startOfUtcCalendarDay(date);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next;
+};
+
+/** Apply anchor task/template time-of-day (UTC) onto a UTC calendar day. */
+export const applyRecurrenceTimeOfDay = (calendarDayUtc: Date, timeSource: Date): Date => {
+  const out = startOfUtcCalendarDay(calendarDayUtc);
+  out.setUTCHours(
+    timeSource.getUTCHours(),
+    timeSource.getUTCMinutes(),
+    timeSource.getUTCSeconds(),
+    timeSource.getUTCMilliseconds()
+  );
+  return out;
 };
 
 const parseAccountingYearStart = (
@@ -75,7 +104,7 @@ export const normalizeCycleRecurrenceFrequency = (
   specificWeekday: number | null | undefined
 ): CycleRecurrenceFrequency => {
   const normalized = String(recurrenceType || '').toLowerCase().trim();
-  if (normalized === 'daily') return 'weekly';
+  if (normalized === 'daily') return 'daily';
   if (normalized === 'weekly') {
     return specificWeekday === null || specificWeekday === undefined ? 'weekly' : 'specific_weekday';
   }
@@ -97,6 +126,8 @@ export const calculateNextCycleStartDate = (
   const base = new Date(currentCycleStart);
 
   switch (frequency) {
+    case 'daily':
+      return addUtcCalendarDays(base, interval);
     case 'weekly':
     case 'specific_weekday': {
       const next = new Date(base);

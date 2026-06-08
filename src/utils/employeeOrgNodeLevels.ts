@@ -2,6 +2,7 @@ import {
   getOrganizationStructureTree,
   resolveNodeReference,
 } from '../services/organizationStructureService';
+import { getAssignmentSectionsFromTree } from './orgStructureAssignmentUtils';
 
 export const EMPLOYEE_ORG_NODE_BY_LEVEL_KEY = 'orgNodeByLevel';
 
@@ -24,20 +25,6 @@ export function stripOrgNodeByLevel(raw: Record<string, unknown>): Record<string
   return next;
 }
 
-function resolveLevelForKey(
-  key: string,
-  levelsBelowGroup: Array<{ levelNumber: number; levelLabel: string }>
-): { levelNumber: number; levelLabel: string } | undefined {
-  const byLabel = levelsBelowGroup.find((l) => l.levelLabel.toLowerCase() === key.toLowerCase());
-  if (byLabel) return byLabel;
-
-  const asNumber = Number(key);
-  if (Number.isFinite(asNumber)) {
-    return levelsBelowGroup.find((l) => l.levelNumber === asNumber);
-  }
-  return undefined;
-}
-
 export async function validateOrgNodeByLevelChain(
   organizationId: string,
   orgNodeByLevel: Record<string, string>
@@ -54,28 +41,39 @@ export async function validateOrgNodeByLevelChain(
     throw new Error('Organisation group (root) is not configured');
   }
 
-  const levelsBelowGroup = tree.levels
-    .filter((l) => l.levelNumber > 1 && l.isActive !== false)
-    .sort((a, b) => a.levelNumber - b.levelNumber);
+  const assignmentSections = getAssignmentSectionsFromTree(tree, orgNodeByLevel);
+  const sectionLabels = new Set(
+    assignmentSections.map((l) => l.levelLabel.trim().toLowerCase())
+  );
 
   for (const [key, nodeId] of Object.entries(orgNodeByLevel)) {
-    const level = resolveLevelForKey(key, levelsBelowGroup);
-    if (!level) {
-      throw new Error(`Unknown organisation section "${key}"`);
-    }
-
     await resolveNodeReference(organizationId, nodeId, { activeOnly: false });
     const node = tree.nodes.find((n) => n.id === nodeId);
     if (!node) {
-      throw new Error(`Organisation node for "${level.levelLabel}" not found`);
+      throw new Error(`Organisation node for "${key}" not found`);
     }
-    if ((node.levelLabel || '').trim().toLowerCase() !== level.levelLabel.trim().toLowerCase()) {
-      throw new Error(`Selected node does not belong to section "${level.levelLabel}"`);
+
+    const keyNorm = key.trim().toLowerCase();
+    const nodeLabelNorm = (node.levelLabel || '').trim().toLowerCase();
+    const numericKey = Number(key);
+    const numericMatch =
+      Number.isFinite(numericKey) && node.levelNumber === numericKey;
+
+    if (nodeLabelNorm !== keyNorm && !numericMatch) {
+      throw new Error(`Selected node does not belong to section "${key}"`);
+    }
+
+    if (
+      node.levelNumber > 1 &&
+      sectionLabels.size > 0 &&
+      !sectionLabels.has(nodeLabelNorm)
+    ) {
+      throw new Error(`"${node.levelLabel}" is not used on your organisation chart`);
     }
 
     const pathIds = node.pathIds || [];
     if (!pathIds.includes(rootId)) {
-      throw new Error(`"${level.levelLabel}" selection must be under the organisation group`);
+      throw new Error(`"${node.levelLabel || key}" selection must be under the organisation group`);
     }
   }
 }
@@ -102,15 +100,21 @@ function resolveDeepestFromSelectedNodeIds(
 
 export function resolvePrimaryFromOrgNodeByLevel(
   orgNodeByLevel: Record<string, string>,
-  levelsBelowGroup?: Array<{ levelNumber: number; levelLabel: string }>,
+  assignmentSections?: Array<{ levelNumber: number; levelLabel: string; stageOrder?: number | null }>,
   treeNodes?: Array<{ id: string; stageOrder?: number | null; levelNumber?: number | null }>
 ): string | null {
   if (Object.keys(orgNodeByLevel).length === 0) return null;
 
-  if (levelsBelowGroup && levelsBelowGroup.length > 0) {
-    const sorted = [...levelsBelowGroup].sort((a, b) => a.levelNumber - b.levelNumber);
-    for (let i = sorted.length - 1; i >= 0; i -= 1) {
-      const level = sorted[i];
+  if (treeNodes?.length) {
+    const deepest = resolveDeepestFromSelectedNodeIds(treeNodes, orgNodeByLevel);
+    if (deepest) return deepest;
+  }
+
+  if (assignmentSections && assignmentSections.length > 0) {
+    const sorted = [...assignmentSections].sort(
+      (a, b) => (b.stageOrder ?? b.levelNumber) - (a.stageOrder ?? a.levelNumber)
+    );
+    for (const level of sorted) {
       const nodeId =
         orgNodeByLevel[level.levelLabel] || orgNodeByLevel[String(level.levelNumber)];
       if (nodeId) return nodeId;
@@ -123,10 +127,6 @@ export function resolvePrimaryFromOrgNodeByLevel(
     .sort((a, b) => a - b);
   if (numericKeys.length > 0) {
     return orgNodeByLevel[String(numericKeys[numericKeys.length - 1])] || null;
-  }
-
-  if (treeNodes?.length) {
-    return resolveDeepestFromSelectedNodeIds(treeNodes, orgNodeByLevel);
   }
 
   return Object.values(orgNodeByLevel).find((id) => Boolean(id?.trim())) || null;

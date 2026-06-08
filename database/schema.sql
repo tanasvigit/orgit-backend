@@ -285,7 +285,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     start_date TIMESTAMP,
     target_date TIMESTAMP,
     due_date TIMESTAMP,
-    frequency VARCHAR(50) CHECK (frequency IN ('weekly', 'monthly', 'quarterly', 'yearly', 'specific_weekday')),
+    frequency VARCHAR(50) CHECK (frequency IN ('daily', 'weekly', 'monthly', 'quarterly', 'yearly', 'specific_weekday')),
     specific_weekday INTEGER CHECK (specific_weekday BETWEEN 0 AND 6), -- 0=Sunday, 6=Saturday
     next_recurrence_date TIMESTAMP,
     category VARCHAR(100) DEFAULT 'general',

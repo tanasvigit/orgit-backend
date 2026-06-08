@@ -24,6 +24,24 @@ const toDayStartMs = (input?: string | Date | null): number | null => {
   return date.getTime();
 };
 
+/** Calendar-day comparison: true when today is strictly before start_date's day. */
+export const isBeforeStartDateCalendarDay = (
+  startDate?: string | Date | null,
+  now?: Date
+): boolean => {
+  const todayMs = toDayStartMs(now ?? new Date());
+  const startMs = toDayStartMs(startDate);
+  if (startMs == null || todayMs == null) return false;
+  return todayMs < startMs;
+};
+
+export const parseDueSoonDays = (value: unknown): number => {
+  const n = Number(
+    (value as { dueSoonDays?: number })?.dueSoonDays ?? value
+  );
+  return Number.isFinite(n) && n >= 1 && n <= 30 ? Math.floor(n) : 3;
+};
+
 const isExplicitInProgressStatus = (status: string | null | undefined): boolean => {
   const normalized = String(status || '').toLowerCase().trim();
   return (
@@ -98,6 +116,7 @@ export const resolveUserLifecycleCategory = (
   const startMs = toDayStartMs(input.startDate);
   const targetMs = toDayStartMs(input.targetDate);
   const dueMs = toDayStartMs(input.dueDate);
+  // Overdue after due_date when set; otherwise after target_date only.
   const overdueMs = dueMs ?? targetMs;
   const dueSoonDays = input.dueSoonDays ?? 3;
   const rawAssigneeStatus = input.assigneeStatus;
@@ -127,7 +146,7 @@ export const resolveUserLifecycleCategory = (
     return 'inprogress';
   }
 
-  if (isDueSoonEligible(todayMs, startMs, targetMs, dueMs, dueSoonDays)) {
+  if (todayMs != null && isDueSoonEligible(todayMs, startMs, targetMs, dueMs, dueSoonDays)) {
     return 'duesoon';
   }
 

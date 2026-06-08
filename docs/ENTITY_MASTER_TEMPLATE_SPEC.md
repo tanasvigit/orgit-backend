@@ -1,119 +1,72 @@
-# Entity Master Template: OrgIt Settings
+# Entity Master Template: OrgIt Master Bulk
 
-Single source of truth for the **OrgIt Settings** Excel template: workbook name, sheet order, column names, and their mapping to database/API.
+Single source of truth for the unified **OrgIt Master Bulk** Excel workbook: sheet order, column names, and mapping to database/API.
 
-- **Workbook name:** OrgIt Settings
-- **Download filename:** `OrgIt_Settings_template.xlsx`
+- **Workbook name:** OrgIt Master Bulk
+- **Download filename:** `OrgIt_Master_Bulk.xlsx`
+- **Download / upload:** Settings only (`GET /api/admin/entity-master/template` with no query params)
 
-## Combined vs organisation-only
+Partial templates (`?only=organisation-structure`, `?only=employees`, etc.) and the standalone task template API are **deprecated**. Use the master workbook from Settings.
 
-| Workbook | Sheets | Updates |
-|----------|--------|--------|
-| **OrgIt Settings** (`OrgIt_Settings_template.xlsx`) | Structure + assignments only | Hierarchy, clients, services, employees, tasks — **not** the `organizations` profile row |
-| **Entity Master template** (`?only=organisation`, `Entity_Master_template.xlsx`) | Organisation profile sheet only | `organizations` (legal/contact master) |
+## Out of scope (web only)
 
-If a file contains **Entity Master Data (Org)** together with Organisation Structure / Entity List / Service List / Tasks / Employees, upload is rejected with a clear error (organisation profile must be uploaded alone).
+| Data | Where to edit |
+|------|----------------|
+| Organisation legal profile (GST, registered address, constitution) | Admin → Entity Master |
+| Employee module access, task/document permission matrices | Admin → Employees (edit user) |
+| Password for new users | Add-user flow on web |
 
 ## Breaking changes (legacy templates)
 
-The following are **no longer supported**. Uploads containing them fail with an explicit error:
+Uploads containing these fail with an explicit error:
 
 - **Sheets:** Cost Centres, Branches, Depot, Depots, Warehouse, Warehouses, Client Entity Services
-- **Entity List columns:** Cost Centre, Depot, Warehouse, Org Unit Name (use per-level columns instead)
-- **Employees:** DESIGNATON, LEVEL, DEPARTMENT columns are ignored if present in old files
-- **Structure Reference** sheet (removed) — use **Org Node Lookups** dropdowns instead of copying UUIDs
+- **Client List columns:** Cost Centre, Depot, Warehouse, Org Unit Name (use per-level columns)
+- **Structure Reference** sheet (removed) — use **Org Node Lookups**
 
-Download a fresh template from Settings or the relevant admin screen before bulk upload.
+Legacy sheet name **Entity List** is still accepted on upload; the template uses **Client List**.
 
-## Sheet order (full OrgIt Settings workbook)
+## Sheet order
 
-1. **Instructions** – fill order and notes (not imported)
-2. **Org Node Lookups** – dropdown source for Entity List / Employees (not imported)
-3. **Organisation Structure** – hierarchy nodes with **web-matching** fields (`organization_structure_nodes`)
-4. **Entity List** – client entities + compliance frequencies
-5. **Service List** – task services (`task_services`)
-6. **Tasks** – convenience sheet (processed by task bulk parser on full upload)
-7. **Employees** – users + org assignments (`user_organizations`)
+1. **Instructions** – fill order (not imported)
+2. **Organisation Structure** – hierarchy nodes (`organization_structure_nodes`)
+3. **Org Node Lookups** – dropdown source (formula-driven; not imported)
+4. **Service List** – `task_services`
+5. **Client List** – `client_entities` + compliance matrix
+6. **Employees** – users + `user_organizations`
+7. **Tasks** – bulk task create
 
-**Recommended fill order:** Organisation Structure → Service List → Entity List → Employees → Tasks (as needed).
+**Recommended fill order:** Organisation Structure → Service List → Client List → Employees → Tasks.
 
----
-
-## Organisation profile (organisation-only template)
-
-Use **Admin → Entity Master → Download template** (`Entity_Master_template.xlsx`). Sheet: **Entity Master Data (Org)**.
-
-Vertical layout: column A = labels, column B = values.
-
-| Label | DB field | Required |
-|-------|----------|----------|
-| Name of the Organisation | name | Yes |
-| Short Name /Trade Name/ Business Name | short_name | No |
-| Phone Number | phone_number | No |
-| E Mail ID | email | No |
-| Web Site | website | No |
-| Entity Type | org_constitution | No (dropdown) |
-| Country | country_id (resolved by name) | No |
-| State | state_id | No |
-| City | city_id | No |
-| Pin Code | pin_code | No |
-| Address Line 1 | address_line1 | No |
-| Address Line 2 | address_line2 | No |
-| GST Number | gst | No |
-| PAN of the Entity | pan | No |
-| Registration Number of the Entity | cin | No |
-
-Parser also accepts legacy vertical labels and horizontal layout with row 1 headers.
-
-Upload this file **by itself** (no other assignment/structure sheets).
-
----
-
-## Sheet: Instructions
-
-Read-only guidance. Matches web flow: Org Definition first, then assignments. Organisation profile is edited in Admin → Entity Master, not this workbook.
-
----
-
-## Sheet: Org Node Lookups
-
-Read-only. One column per active org section (L2+). Each cell is a dropdown option in the same format as the web UI: `Name (EntityType)` when entity type differs from the section label.
-
-Entity List and Employees section columns use Excel list validation pointing at this sheet. Users should **pick from dropdowns**, not paste node UUIDs.
+After adding Structure rows, save the file or press F9 so Excel recalculates **Org Node Lookups** and Client/Employee org dropdowns (Excel 365 `FILTER`/`UNIQUE` over table `OrgStructureNodes`).
 
 ---
 
 ## Sheet: Organisation Structure
 
-Columns mirror the **web Org Definition node form** (dynamic per level from field schema).
+Fixed columns (in order):
 
 | Column | Required | Notes |
 |--------|----------|--------|
-| LEVEL | Yes | Section label (e.g. Region) or level number 1–11 — dropdown from defined levels |
-| PARENT_NAME | Yes for L2+ | Parent node **name** (same as shown in web / Lookups); blank for Group root |
-| ENTITY_TYPE | No | Entity type for this level — dropdown; validated per level on upload |
-| *{Dynamic fields}* | Per schema | e.g. Name, Code, Registered Name, address fields — same keys as `meta_json.fieldValues` on web |
+| Section | Yes | Dropdown: Group, Entity, Department, … |
+| Field Type | No | Section-dependent dropdown (validated on upload) |
+| Field Name | Yes | Stored as `organization_structure_nodes.name` |
+| Short Code | No | Stored as `code` |
+| Parent Name | Root only blank | Dropdown from Org Node Lookups; parent rows before children |
+| Display Label | Auto (formula) | Same format as web dropdowns: `Name (Type)` when type ≠ section |
+| *{Dynamic fields}* | Per schema | Address, PAN, etc. — keys in `meta_json.fieldValues` |
 
-Rows are processed in level order. Existing nodes match on `(level, parent, name)` and update `meta_json` (entityType + fieldValues) and `code` when provided.
+**Legacy headers** accepted one release: `SECTION`, `ENTITY_TYPE`, `PARENT_NAME`, `Name`.
+
+Excel table name: `OrgStructureNodes`.
 
 ---
 
-## Sheet: Entity List
+## Sheet: Org Node Lookups
 
-Fixed columns (in order):
+One column per active org section (L2+). Pre-seeded from existing DB nodes; appended rows use `UNIQUE(FILTER(OrgStructureNodes[Display Label], …))` so new Structure rows appear in dropdowns after recalc.
 
-| Column | Maps to |
-|--------|---------|
-| NAME OF THE CLIENT | name |
-| ENTITY TYPE | entity_type |
-| STATUS | status (Active / Inactive) |
-| *{Level labels}* | `org_field_values.orgNodeByLevel` — one column per active org level (L2+); **dropdown** from Org Node Lookups |
-| ORG STRUCTURE NODE ID | Optional advanced override for `org_structure_node_id` (UUID or label) |
-| PAN | pan |
-| REPORTING PARTNER | reporting_partner_mobile |
-| *{Service titles}* | `client_entity_services.frequency` — dynamic from recurring `task_services` |
-
-Primary org node = deepest filled level column, unless ORG STRUCTURE NODE ID is set.
+Client List and Employees section columns validate against `'Org Node Lookups'!$Col$2:$Col$5000`.
 
 ---
 
@@ -122,43 +75,68 @@ Primary org node = deepest filled level column, unless ORG STRUCTURE NODE ID is 
 | Column | Notes |
 |--------|--------|
 | RECURRING TASK TITLE/SERVICE LIST | Recurring service title |
-| FREQUENCY | Dropdown: Daily, Weekly, … |
+| FREQUENCY | Dropdown |
 | TASK ROLL OUT | End of Period / 1 Month Before Period End |
 | ONE TIME TASK LIST | One-time service title |
 
 ---
 
-## Sheet: Tasks
+## Sheet: Client List
 
-Same columns as `Task_template.xlsx`. Processed by `taskBulkService.parseAndApply` when included in a full settings upload.
+| Column | Maps to |
+|--------|---------|
+| NAME OF THE CLIENT | name |
+| ENTITY TYPE | entity_type |
+| STATUS | status |
+| *{Level labels}* | `org_field_values.orgNodeByLevel` — dropdown from Lookups |
+| ORG STRUCTURE NODE ID | Optional `org_structure_node_id` override |
+| PAN | pan |
+| REPORTING PARTNER | reporting_partner_mobile |
+| *{Service titles}* | `client_entity_services.frequency` |
 
 ---
 
 ## Sheet: Employees
 
+Aligns with the Add Employee web form (HR + org mapping). Permission matrices are **not** in Excel.
+
 | Column | Maps to |
 |--------|---------|
+| EMPLOYEE ID | employee_code |
 | NAME OF THE EMPLOYEE | users.name |
-| MOBILE NUMBER | users.mobile (normalized +91…) |
-| REPORTING TO | reporting_to (manager mobile) |
-| *{Level labels}* | `user_organizations.org_field_values.orgNodeByLevel` — **dropdown** from Org Node Lookups |
-| ORG STRUCTURE NODE ID | Optional advanced override for `primary_org_node_id` |
+| MOBILE NUMBER | users.mobile |
+| EMAIL ID | email |
+| DOB | date_of_birth |
+| GENDER | gender |
+| ADDRESS | address |
+| PAN NUMBER | pan_number |
+| DATE OF JOINING | date_of_joining |
+| EMPLOYMENT TYPE | employment_type |
+| EMPLOYEE STATUS | status |
+| DESIGNATION | designation |
+| REPORTING TO | reporting_to_mobile |
+| WORK LOCATION | work_location (resolved to org node) |
+| *{Level labels}* | `org_field_values.orgNodeByLevel` |
+| SECONDARY ORG UNITS | secondary org assignments |
+| USER ROLE | user role |
+| ORG STRUCTURE NODE ID | Optional `primary_org_node_id` override |
 
 ---
 
-## Single-sheet templates
+## Sheet: Tasks
 
-| Query `?only=` | Filename | Extra sheets |
-|----------------|----------|----------------|
-| organisation | Entity_Master_template.xlsx (organisation profile only) | — |
-| organisation-structure | Org_Structure_template.xlsx | Instructions, Org Node Lookups |
-| entity-list | Entity_List_template.xlsx | Instructions, Org Node Lookups |
-| service-list | Service_List_template.xlsx | — |
-| employees | Employee_template.xlsx | Instructions, Org Node Lookups |
-| (none) | OrgIt_Settings_template.xlsx | All sheets above |
+Same columns as the former standalone task template. Processed by `taskBulkService.parseAndApply` on full upload.
+
+---
 
 ## API
 
-- `GET /api/admin/entity-master/template`
-- `POST /api/admin/entity-master/upload`
-- `GET /api/admin/entity-master/status/:uploadId`
+| Method | Path | Notes |
+|--------|------|--------|
+| GET | `/api/admin/entity-master/template` | Master workbook only |
+| POST | `/api/admin/entity-master/upload` | Full or single-sheet upload |
+| GET | `/api/admin/entity-master/status/:uploadId` | Poll progress |
+
+Task-only template: `GET /api/admin/tasks/bulk/template` returns **400** with redirect message to Settings.
+
+Import order in worker: Structure → Service List → Client List → Employees → Tasks.

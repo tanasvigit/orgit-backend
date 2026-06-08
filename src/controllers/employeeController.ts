@@ -15,6 +15,7 @@ import {
   stripOrgNodeByLevel,
   validateOrgNodeByLevelChain,
 } from '../utils/employeeOrgNodeLevels';
+import { getAssignmentSectionsFromTree } from '../utils/orgStructureAssignmentUtils';
 import {
   DEFAULT_EMPLOYEE_PERMISSIONS,
   DEFAULT_NOTIFICATION_SETTINGS,
@@ -51,8 +52,8 @@ async function normalizeEmployeeOrgAssignment(
       includeArchived: false,
       includeInactive: false,
     });
-    const levelsBelowGroup = tree.levels.filter((l) => l.levelNumber > 1 && l.isActive !== false);
-    primaryOrgNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup, tree.nodes);
+    const assignmentSections = getAssignmentSectionsFromTree(tree, orgNodeByLevel);
+    primaryOrgNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, assignmentSections, tree.nodes);
   }
 
   if (primaryOrgNodeId) {

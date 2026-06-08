@@ -12,6 +12,7 @@ import {
   type OrganizationStructureNode,
   type OrganizationStructureTree,
 } from './organizationStructureService';
+import { getAssignmentSectionsFromTree } from '../utils/orgStructureAssignmentUtils';
 import {
   buildStructureSheetPlan,
   formatNodeDisplayLabel,
@@ -52,8 +53,19 @@ export function getSectionStorageKey(level: OrganizationStructureLevel): string 
   return level.levelLabel.trim();
 }
 
-export function getActiveLevelsFromL2(levels: OrganizationStructureLevel[]): OrganizationStructureLevel[] {
-  return [...levels]
+export function getActiveLevelsFromL2(
+  levelsOrTree: OrganizationStructureLevel[] | OrganizationStructureTree
+): OrganizationStructureLevel[] {
+  if (!Array.isArray(levelsOrTree)) {
+    if (levelsOrTree?.nodes?.length) {
+      return getAssignmentSectionsFromTree(levelsOrTree);
+    }
+    const levels = levelsOrTree?.levels ?? levelsOrTree?.catalogLevels ?? [];
+    return levels
+      .filter((l) => l.levelNumber > 1 && l.isActive !== false)
+      .sort((a, b) => a.levelNumber - b.levelNumber);
+  }
+  return levelsOrTree
     .filter((l) => l.levelNumber > 1 && l.isActive !== false)
     .sort((a, b) => a.levelNumber - b.levelNumber);
 }
@@ -78,6 +90,42 @@ export function getDeepestSelectedNodeId(
 export function buildOrgFieldValuesPayload(orgNodeByLevel: OrgNodeByLevel): Record<string, unknown> | null {
   if (Object.keys(orgNodeByLevel).length === 0) return null;
   return { [EMPLOYEE_ORG_NODE_BY_LEVEL_KEY]: orgNodeByLevel };
+}
+
+/** Normalize Excel cell text for header matching and bulk parsing. */
+export function normalizeBulkCellText(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === 'object' && value !== null) {
+    if ('result' in value && (value as { result?: unknown }).result != null && (value as { result?: unknown }).result !== '') {
+      return normalizeBulkCellText((value as { result?: unknown }).result);
+    }
+    if ('text' in value) return String((value as { text?: string }).text ?? '').trim();
+    if ('richText' in value && Array.isArray((value as { richText: { text: string }[] }).richText)) {
+      return (value as { richText: { text: string }[] }).richText.map((t) => t.text).join('').trim();
+    }
+  }
+  return String(value).trim();
+}
+
+/** 1-based column index per header label (reads row 1 via eachCell — reliable with Excel tables). */
+export function buildBulkSheetHeaderColMap(sheet: ExcelJS.Worksheet): Map<string, number> {
+  const map = new Map<string, number>();
+  sheet.getRow(1).eachCell({ includeEmpty: false }, (cell, col) => {
+    const h = normalizeBulkCellText(cell.value);
+    if (h) map.set(h.toLowerCase(), col);
+  });
+  return map;
+}
+
+function colFromHeaderMap(headerMap: Map<string, number>, ...names: string[]): number {
+  for (const name of names) {
+    const col = headerMap.get(name.toLowerCase());
+    if (col != null) return col;
+  }
+  return -1;
 }
 
 export function findDeprecatedSheets(workbook: ExcelJS.Workbook): string[] {
@@ -178,9 +226,11 @@ export async function loadTreeForBulk(organizationId: string): Promise<Organizat
 
 export type LevelColumnDef = { header: string; level: OrganizationStructureLevel; colIndex?: number };
 
-export function buildLevelColumnDefs(levels: OrganizationStructureLevel[]): LevelColumnDef[] {
-  return getActiveLevelsFromL2(levels).map((level) => ({
-    header: level.levelLabel.trim(),
+export function buildLevelColumnDefs(
+  levelsOrTree: OrganizationStructureLevel[] | OrganizationStructureTree
+): LevelColumnDef[] {
+  return getActiveLevelsFromL2(levelsOrTree).map((level) => ({
+    header: `ORG UNIT - ${level.levelLabel.trim()}`,
     level,
   }));
 }
@@ -192,12 +242,20 @@ export function findLevelColumnIndices(
   const defs = buildLevelColumnDefs(levels);
   return defs.map((def) => {
     const label = def.header.toLowerCase();
+    const plainLabel = def.level.levelLabel.trim().toLowerCase();
     let colIndex = -1;
     for (let i = 1; i < (headers?.length ?? 0); i++) {
       const h = String(headers[i] ?? '')
         .trim()
         .toLowerCase();
-      if (h === label || h === String(def.level.levelNumber)) {
+      if (
+        h === label ||
+        h === plainLabel ||
+        h === String(def.level.levelNumber) ||
+        h === `org unit ${plainLabel}` ||
+        h === `org unit - ${plainLabel}` ||
+        h === `org unit: ${plainLabel}`
+      ) {
         colIndex = i;
         break;
       }
@@ -232,6 +290,15 @@ export async function resolveOrgStructureNodeFromHint(
     for (const node of nodes) {
       if (node.status === 'active' && node.name.toLowerCase() === trimmed.toLowerCase()) {
         return node.id;
+      }
+    }
+    const displayLabelMatch = trimmed.match(/^(.+?)\s*\([^)]+\)\s*$/);
+    if (displayLabelMatch) {
+      const innerName = displayLabelMatch[1].trim().toLowerCase();
+      for (const node of nodes) {
+        if (node.status === 'active' && node.name.toLowerCase() === innerName) {
+          return node.id;
+        }
       }
     }
   }
@@ -324,6 +391,15 @@ async function processBulkRowsInParentOrder(
             nodes
           );
           if (!parentNodeId) {
+            const parentLower = item.parentName.trim().toLowerCase();
+            for (const node of nodes) {
+              if (node.status === 'active' && node.name.trim().toLowerCase() === parentLower) {
+                parentNodeId = node.id;
+                break;
+              }
+            }
+          }
+          if (!parentNodeId) {
             nextPending.push(item);
             continue;
           }
@@ -333,7 +409,7 @@ async function processBulkRowsInParentOrder(
             pushError({
               sheet: sheetName,
               row: item.rowNumber,
-              message: 'PARENT_NAME is required (root already exists). Use parent name from Org Node Lookups.',
+              message: 'PARENT_NAME is required (root already exists). Use parent label from Organisation Structure values.',
             });
             continue;
           }
@@ -414,7 +490,7 @@ async function processBulkRowsInParentOrder(
         pushError({
           sheet: sheetName,
           row: item.rowNumber,
-          message: `Parent not found: ${item.parentName}. Add parent row above or check Org Node Lookups.`,
+          message: `Parent not found: ${item.parentName}. Add parent row above or check Organisation Structure values.`,
         });
       }
       break;
@@ -438,7 +514,7 @@ export async function parseOrganizationStructureSheet(
     includeArchived: false,
     includeInactive: false,
   });
-  const levels = [...tree.levels];
+  const levels = [...(tree.catalogLevels ?? tree.levels)];
   if (levels.length === 0 && !tree.summary?.hasRootNode) {
     pushError({
       sheet: sheet.name,
@@ -447,52 +523,57 @@ export async function parseOrganizationStructureSheet(
   }
 
   const plan = buildStructureSheetPlan(tree, levels);
-  const headers = sheet.getRow(1).values as unknown[];
+  const headerMap = buildBulkSheetHeaderColMap(sheet);
 
-  const colIndex = (...names: string[]): number => {
-    for (const name of names) {
-      const i = (headers || []).findIndex(
-        (h) => String(h ?? '').trim().toLowerCase() === name.toLowerCase()
-      );
-      if (i >= 0) return i;
-    }
-    return -1;
-  };
-  const sectionIdx = colIndex('section', 'level');
-  const parentIdx = colIndex('parent_name', 'parent name');
-  const entityTypeIdx = colIndex('entity_type', 'entity type');
+  const sectionIdx = colFromHeaderMap(headerMap, 'section', 'level');
+  const parentIdx = colFromHeaderMap(headerMap, 'parent name', 'parent_name');
+  const entityTypeIdx = colFromHeaderMap(headerMap, 'field type', 'entity_type', 'entity type');
+  let fieldNameIdx = colFromHeaderMap(headerMap, 'field name');
+  if (fieldNameIdx < 0) fieldNameIdx = colFromHeaderMap(headerMap, 'registered name');
+  if (fieldNameIdx < 0) fieldNameIdx = colFromHeaderMap(headerMap, 'name');
+  const shortCodeIdx = colFromHeaderMap(headerMap, 'short code', 'code');
+
+  const reservedHeaders = new Set([
+    'section',
+    'level',
+    'parent name',
+    'parent_name',
+    'field type',
+    'entity_type',
+    'entity type',
+    'field name',
+    'short code',
+    'display label',
+    'name',
+    'code',
+  ]);
 
   const fieldColByKey = new Map<string, number>();
-  for (let i = 1; i < (headers?.length ?? 0); i++) {
-    const h = String(headers[i] ?? '').trim().toLowerCase();
-    if (
-      !h ||
-      ['section', 'level', 'parent_name', 'parent name', 'entity_type', 'entity type'].includes(h)
-    ) {
-      continue;
-    }
+  if (fieldNameIdx >= 0) fieldColByKey.set('name', fieldNameIdx);
+  if (shortCodeIdx >= 0) fieldColByKey.set('code', shortCodeIdx);
+
+  headerMap.forEach((col, h) => {
+    if (!h || reservedHeaders.has(h)) return;
     const key = plan.headerToFieldKey.get(h);
-    if (key) fieldColByKey.set(key, i);
-  }
+    if (key && !fieldColByKey.has(key)) fieldColByKey.set(key, col);
+  });
 
   if (sectionIdx < 0) {
-    pushError({ sheet: sheet.name, message: 'Missing required column: SECTION (or legacy LEVEL)' });
+    pushError({ sheet: sheet.name, message: 'Missing required column: Section (or legacy SECTION / LEVEL)' });
     return 0;
   }
   if (!fieldColByKey.has('name')) {
-    pushError({ sheet: sheet.name, message: 'Missing required field column: Name (or Registered Name)' });
+    pushError({
+      sheet: sheet.name,
+      message: 'Missing required column: Field Name (or legacy Name / Registered Name)',
+    });
     return 0;
   }
 
   const getCell = (row: ExcelJS.Row, idx: number): string => {
     if (idx < 0) return '';
     try {
-      const v = row.getCell(idx).value;
-      if (v == null) return '';
-      if (typeof v === 'string') return v.trim();
-      if (typeof v === 'object' && v !== null && 'text' in v) return String((v as { text?: string }).text).trim();
-      if (v instanceof Date) return v.toISOString().slice(0, 10);
-      return String(v).trim();
+      return normalizeBulkCellText(row.getCell(idx).value);
     } catch {
       return '';
     }
@@ -530,7 +611,7 @@ export async function parseOrganizationStructureSheet(
       pushError({
         sheet: sheet.name,
         row: r,
-        message: `Invalid ENTITY_TYPE for section ${sectionRaw}. Examples: ${allowedTypes.slice(0, 5).join(', ')}…`,
+        message: `Invalid Field Type for section ${sectionRaw}. Examples: ${allowedTypes.slice(0, 5).join(', ')}…`,
       });
       continue;
     }

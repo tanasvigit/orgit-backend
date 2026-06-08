@@ -6,6 +6,7 @@ import {
   resolveNodeReference,
   validateOrgFieldValuesForNode,
 } from '../services/organizationStructureService';
+import { getAssignmentSectionsFromTree } from '../utils/orgStructureAssignmentUtils';
 import { clientEntitiesHasOrgFieldValues } from '../utils/orgFieldValuesColumn';
 import {
   EMPLOYEE_ORG_NODE_BY_LEVEL_KEY,
@@ -41,8 +42,8 @@ async function normalizeClientOrgAssignment(
       includeArchived: false,
       includeInactive: false,
     });
-    const levelsBelowGroup = tree.levels.filter((l) => l.levelNumber > 1 && l.isActive !== false);
-    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, levelsBelowGroup, tree.nodes);
+    const assignmentSections = getAssignmentSectionsFromTree(tree, orgNodeByLevel);
+    orgStructureNodeId = resolvePrimaryFromOrgNodeByLevel(orgNodeByLevel, assignmentSections, tree.nodes);
   }
 
   if (orgStructureNodeId) {

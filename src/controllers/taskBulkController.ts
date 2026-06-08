@@ -1,7 +1,6 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/authMiddleware';
 import { query } from '../config/database';
-import * as taskBulkService from '../services/taskBulkService';
 import * as taskBulkQueueService from '../services/taskBulkQueueService';
 
 /**
@@ -9,18 +8,11 @@ import * as taskBulkQueueService from '../services/taskBulkQueueService';
  * Returns Excel template for tasks bulk upload.
  */
 export async function getTemplate(req: AuthRequest, res: Response): Promise<void> {
-  try {
-    const buffer = await taskBulkService.buildTaskTemplate();
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename=Task_template.xlsx');
-    res.send(Buffer.from(buffer));
-  } catch (error: any) {
-    console.error('Error generating task template:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to generate template',
-    });
-  }
+  res.status(400).json({
+    success: false,
+    error:
+      'Task-only Excel templates are deprecated. Download OrgIt_Master_Bulk.xlsx from Settings and use the Tasks sheet, then upload via Settings → Bulk upload.',
+  });
 }
 
 /**

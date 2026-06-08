@@ -23,6 +23,7 @@
     "migrate:repair-client-entities": "node scripts/run-repair-client-entities-columns.js",
     "migrate:all": "node scripts/run-all-migrations.js",
     "test:recurrence-flow": "tsx scripts/test-recurring-flow.ts",
+    "generate:bulk-sample": "tsx scripts/generateExactBulkSample.ts",
     "reset-password": "node scripts/reset-user-password.js",
     "db:bootstrap": "node scripts/bootstrap-db.js",
     "db:all-in-one": "node scripts/bootstrap-db.js",

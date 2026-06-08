@@ -4,26 +4,23 @@ import { query } from '../config/database';
 import * as entityMasterBulkService from '../services/entityMasterBulkService';
 import * as entityMasterBulkQueueService from '../services/entityMasterBulkQueueService';
 
+const MASTER_BULK_FILENAME = 'OrgIt_Master_Bulk.xlsx';
+const DEPRECATED_ONLY_MSG =
+  'Partial Excel templates are no longer available. Download the master bulk workbook from Settings.';
+
 /**
  * GET /api/admin/entity-master/template
- * Returns Excel template. Query ?only=organisation returns single-sheet Entity Master template.
+ * Returns the unified OrgIt Master Bulk Excel workbook.
  */
 export async function getTemplate(req: AuthRequest, res: Response): Promise<void> {
   try {
-    const only = req.query?.only as string;
-    const onlyOrganisation = only === 'organisation';
-    const onlyOrganisationStructure = only === 'organisation-structure';
-    const onlyEmployees = only === 'employees';
-    const onlyServiceList = only === 'service-list';
-    const onlyEntityList = only === 'entity-list';
-    console.log('[EntityMasterTemplate] GET template', {
-      only,
-      onlyOrganisation,
-      onlyOrganisationStructure,
-      onlyEmployees,
-      onlyServiceList,
-      onlyEntityList,
-    });
+    const only = req.query?.only as string | undefined;
+    if (only) {
+      return void res.status(400).json({
+        success: false,
+        error: DEPRECATED_ONLY_MSG,
+      });
+    }
 
     let organizationId = req.user?.organizationId || null;
     if (!organizationId && req.user?.userId) {
@@ -40,29 +37,9 @@ export async function getTemplate(req: AuthRequest, res: Response): Promise<void
       });
     }
 
-    let buffer: Buffer;
-    let filename: string;
-    if (onlyOrganisation) {
-      buffer = await entityMasterBulkService.buildEntityMasterOnlyTemplate();
-      filename = 'Entity_Master_template.xlsx';
-    } else if (onlyOrganisationStructure) {
-      buffer = await entityMasterBulkService.buildOrgStructureOnlyTemplate(organizationId);
-      filename = 'Org_Structure_template.xlsx';
-    } else if (onlyEmployees) {
-      buffer = await entityMasterBulkService.buildEmployeeOnlyTemplate(organizationId);
-      filename = 'Employee_template.xlsx';
-    } else if (onlyServiceList) {
-      buffer = await entityMasterBulkService.buildServiceListOnlyTemplate();
-      filename = 'Service_List_template.xlsx';
-    } else if (onlyEntityList) {
-      buffer = await entityMasterBulkService.buildEntityListOnlyTemplate(organizationId);
-      filename = 'Entity_List_template.xlsx';
-    } else {
-      buffer = await entityMasterBulkService.buildTemplateWorkbook(organizationId);
-      filename = 'OrgIt_Settings_template.xlsx';
-    }
+    const buffer = await entityMasterBulkService.buildTemplateWorkbook(organizationId);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.setHeader('Content-Disposition', `attachment; filename=${MASTER_BULK_FILENAME}`);
     res.send(Buffer.from(buffer));
   } catch (error: any) {
     console.error('Error generating entity master template:', error);

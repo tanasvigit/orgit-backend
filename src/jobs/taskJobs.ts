@@ -103,8 +103,8 @@ export const updateTaskStatuses = async (io?: any): Promise<void> => {
      WHERE task_type IN ('recurring', 'recurring_instance')
        AND due_date IS NOT NULL
        AND status NOT IN ('completed', 'rejected')
-       AND (due_date::date - INTERVAL '3 days') = CURRENT_DATE`,
-    []
+       AND due_date::date = CURRENT_DATE + $1::int`,
+    [dueSoonDays]
   );
 
 };
@@ -123,10 +123,10 @@ export const setupTaskJobs = (io?: any): void => {
     }
   });
 
-  cron.schedule('*/15 * * * *', async () => {
+  cron.schedule('* * * * *', async () => {
     console.log('Running recurring task generation job...');
     try {
-      await generateNextRecurrence();
+      await generateNextRecurrence(io);
     } catch (error) {
       console.error('Error in recurring task generation job:', error);
     }

@@ -33,7 +33,7 @@ export interface EntityMasterBulkUploadStatus {
   };
 }
 
-const ROW_LEVEL_SHEET_NAMES = ['Employees', 'Service List', 'Entity List', 'Client Entities'];
+const ROW_LEVEL_SHEET_NAMES = ['Employees', 'Service List', 'Client List', 'Entity List', 'Client Entities'];
 
 /**
  * Enqueue an Entity Master bulk upload. For single-sheet Employees/Service List/Entity List, enqueues row-level jobs (checkpoint); otherwise stores file for file-level processing.
@@ -96,7 +96,7 @@ export async function enqueueEntityMasterBulkUpload(
           totalRows = list.length;
           uploadType = 'service_list';
           list.forEach((p) => payloads.push({ job_type: 'service_list', payload: p }));
-        } else if (sheetName === 'Entity List' || sheetName === 'Client Entities') {
+        } else if (sheetName === 'Client List' || sheetName === 'Entity List' || sheetName === 'Client Entities') {
           const list = await buildEntityListPayloadsFromSheet(workbook, client, organizationId, isSuperAdmin);
           totalRows = list.length;
           uploadType = 'entity_list';

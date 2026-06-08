@@ -1,4 +1,5 @@
 import Handlebars from 'handlebars';
+import { GST_INVOICE_PDF_LAYOUT_LOCK_CSS } from './gstInvoicePdfLayoutLock';
 
 // Helpers used by system (locked) templates.
 // Safe to register multiple times; Handlebars will overwrite with same implementation.
@@ -34,6 +35,43 @@ export function replaceTemplateVariables(
  * @param bodyData - Data for body placeholders
  * @returns Complete HTML document
  */
+function isSelfContainedSystemTemplate(bodyTemplate: string): boolean {
+  const probe = bodyTemplate || '';
+  return (
+    /gst-inv-root|gst-inv-page/i.test(probe) ||
+    (/\<style[\s>]/i.test(probe) && /gst-inv-|systemTemplateKey/i.test(probe))
+  );
+}
+
+/**
+ * System templates (e.g. GST Invoice Figma) ship a full <style> block + layout markup.
+ * Do not wrap them in the legacy generic document shell — it breaks table layout in PDF.
+ */
+function wrapSelfContainedTemplate(renderedHeader: string, renderedBody: string): string {
+  const styleMatch = renderedBody.match(/<style[^>]*>[\s\S]*?<\/style>/i);
+  const styles = styleMatch ? styleMatch[0] : '';
+  const content = styleMatch ? renderedBody.replace(styleMatch[0], '').trim() : renderedBody.trim();
+  const headerHtml = renderedHeader.trim() ? `${renderedHeader.trim()}\n` : '';
+
+  const layoutLock = `<style id="gst-inv-pdf-layout-lock">${GST_INVOICE_PDF_LAYOUT_LOCK_CSS}</style>`;
+  const wrappedContent = /gst-inv-root/i.test(content)
+    ? content
+    : `<div class="gst-inv-root">${content}</div>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1200">
+  ${styles}
+  ${layoutLock}
+</head>
+<body class="gst-inv-pdf-render" style="margin:0;padding:0;background:#fff;">
+${headerHtml}${wrappedContent}
+</body>
+</html>`.trim();
+}
+
 export function mergeHeaderAndBody(
   headerTemplate: string,
   bodyTemplate: string,
@@ -43,7 +81,11 @@ export function mergeHeaderAndBody(
   const renderedHeader = replaceTemplateVariables(headerTemplate || '', headerData);
   const renderedBody = replaceTemplateVariables(bodyTemplate || '', bodyData);
 
-  // Wrap in a complete HTML document with basic styling
+  if (isSelfContainedSystemTemplate(bodyTemplate)) {
+    return wrapSelfContainedTemplate(renderedHeader, renderedBody);
+  }
+
+  // Legacy templates: generic HTML shell
   return `
 <!DOCTYPE html>
 <html>

@@ -2,7 +2,12 @@ import ExcelJS from 'exceljs';
 import { createHash } from 'crypto';
 import { getClient } from '../config/database';
 import type { TaskBulkJobPayload } from './taskBulkService';
-import { calculateNextCycleStartDate } from './cycleStartRecurrence';
+import {
+  formatBulkDateOnly,
+  loadOrganizationAccountingYearStart,
+  resolveBulkRecurrenceSchedule,
+  serializeBulkRecurrenceCursor,
+} from './recurringTemplateSetup';
 
 const MAX_ROWS_PER_SHEET = 500;
 const MAX_ERRORS_REPORTED = 100;
@@ -183,47 +188,6 @@ function toLocalDateOnlyString(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-const addMonthsClamped = (date: Date, monthsToAdd: number): Date => {
-  const year = date.getFullYear();
-  const month = date.getMonth();
-  const day = date.getDate();
-  const target = new Date(year, month + monthsToAdd, 1);
-  const daysInTargetMonth = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
-  const clampedDay = Math.min(day, daysInTargetMonth);
-  const next = new Date(target.getFullYear(), target.getMonth(), clampedDay);
-  next.setHours(date.getHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds());
-  return next;
-};
-
-function calculateNextRecurrenceDate(
-  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly' | 'specific_weekday',
-  specificWeekday: number | null,
-  baseDate: Date
-): Date {
-  const base = new Date(baseDate);
-  const next = new Date(base);
-  switch (frequency) {
-    case 'weekly':
-      next.setDate(next.getDate() + 7);
-      return next;
-    case 'monthly':
-      return addMonthsClamped(base, 1);
-    case 'quarterly':
-      return addMonthsClamped(base, 3);
-    case 'yearly':
-      return addMonthsClamped(base, 12);
-    case 'specific_weekday': {
-      if (specificWeekday == null) return next;
-      const current = next.getDay();
-      const daysUntilNext = (specificWeekday - current + 7) % 7 || 7;
-      next.setDate(next.getDate() + daysUntilNext);
-      return next;
-    }
-    default:
-      return next;
-  }
-}
-
 function getCellStr(row: ExcelJS.Row, colIdx: number): string {
   if (colIdx < 0) return '';
   const cell = row.getCell(colIdx);
@@ -295,8 +259,18 @@ export async function enqueueTaskBulkUpload(
     const taskOwnerCol = col('task owner|task_owner');
     const financialValueCol = col('financial value|financial_value');
     const descCol = col('description');
-    // Optional (template may omit); keep for backward compatibility with older files.
     const autoEscalateCol = col('auto escalate|auto_escalate');
+    const taskRolloutTypeCol = col('task roll out|task rollout|task_rollout_type');
+    const recurrenceEndTypeCol = col('recurrence end type|recurrence_end_type');
+    const recurrenceEndDateCol = col('recurrence end date|recurrence_end_date');
+    const recurrenceAfterOccurrencesCol = col(
+      'recurrence after occurrences|recurrence_after_occurrences'
+    );
+    const escalationTriggerCol = col('escalation trigger|escalation_trigger');
+    const escalationDaysBeforeCol = col('escalation days before|escalation_days_before');
+    const escalationContactsCol = col(
+      'escalation contacts|escalation_contact_ids|escalation contacts ids'
+    );
 
     if (titleCol < 0 || dueDateCol < 0) {
       throw new Error('Missing required columns: Title and Due Date');
@@ -304,6 +278,7 @@ export async function enqueueTaskBulkUpload(
 
     const maxRow = Math.min(tasksSheet.rowCount ?? 0, MAX_ROWS_PER_SHEET + 1);
     const jobs: { row_index: number; payload: TaskBulkJobPayload }[] = [];
+    let accountingYearStartForOrg: string | null | undefined = undefined;
 
     for (let r = 2; r <= maxRow; r++) {
       try {
@@ -340,6 +315,30 @@ export async function enqueueTaskBulkUpload(
 
         const autoEscalateStr = autoEscalateCol >= 0 ? getCellStr(row, autoEscalateCol).toLowerCase() : '';
         const autoEscalate = autoEscalateStr === 'yes' || autoEscalateStr === 'true' || autoEscalateStr === '1';
+        const taskRolloutTypeRaw =
+          taskRolloutTypeCol >= 0 ? getCellStr(row, taskRolloutTypeCol).toLowerCase() : '';
+        const taskRolloutType = taskRolloutTypeRaw || (taskType === 'recurring' ? 'cycle_start' : null);
+        const recurrenceEndTypeRaw =
+          recurrenceEndTypeCol >= 0 ? getCellStr(row, recurrenceEndTypeCol).toLowerCase() : '';
+        const recurrenceEndType = recurrenceEndTypeRaw || null;
+        const recurrenceEndDateParsed =
+          recurrenceEndDateCol >= 0 ? parseDate(getCellStr(row, recurrenceEndDateCol)) : null;
+        const recurrenceEndDate = recurrenceEndDateParsed
+          ? formatBulkDateOnly(recurrenceEndDateParsed)
+          : null;
+        const recurrenceAfterOccurrencesRaw =
+          recurrenceAfterOccurrencesCol >= 0 ? getCellStr(row, recurrenceAfterOccurrencesCol) : '';
+        const recurrenceAfterOccurrences = recurrenceAfterOccurrencesRaw
+          ? Number.parseInt(recurrenceAfterOccurrencesRaw, 10) || null
+          : null;
+        const escalationTriggerRaw =
+          escalationTriggerCol >= 0 ? getCellStr(row, escalationTriggerCol).toLowerCase() : '';
+        const escalationTrigger = escalationTriggerRaw || null;
+        const escalationDaysBeforeRaw =
+          escalationDaysBeforeCol >= 0 ? getCellStr(row, escalationDaysBeforeCol) : '';
+        const escalationDaysBefore = escalationDaysBeforeRaw
+          ? Number.parseInt(escalationDaysBeforeRaw, 10)
+          : null;
 
         const assigneesStr = getCellStr(row, assignedToCol);
         const { userIds: assigneeIds, errors: assigneeErrors } = await resolveAssignees(
@@ -351,6 +350,27 @@ export async function enqueueTaskBulkUpload(
         if (assigneeErrors.length > 0) {
           validationErrors.push({ sheet: tasksSheet.name, row: r, message: assigneeErrors.join('; ') });
           continue;
+        }
+
+        let escalationContactIds: string[] = [];
+        const escalationContactsStr =
+          escalationContactsCol >= 0 ? getCellStr(row, escalationContactsCol) : '';
+        if (escalationContactsStr) {
+          const { userIds, errors: escalationErrors } = await resolveAssignees(
+            client,
+            organizationId,
+            escalationContactsStr,
+            assigneeCache
+          );
+          if (escalationErrors.length > 0) {
+            validationErrors.push({
+              sheet: tasksSheet.name,
+              row: r,
+              message: escalationErrors.join('; '),
+            });
+            continue;
+          }
+          escalationContactIds = userIds;
         }
 
         let taskCreatorId = userId;
@@ -394,31 +414,44 @@ export async function enqueueTaskBulkUpload(
           }
         }
         let frequency: string | null = null;
+        let recurrenceType: string | null = null;
+        let recurrenceInterval = 1;
         let specificWeekday: number | null = null;
         let nextRecurrenceDate: Date | null = null;
         const recurrenceRaw = getCellStr(row, recurrenceCol).toLowerCase();
-        if (taskType === 'recurring' && recurrenceRaw) {
-          const map: Record<string, string> = {
-            weekly: 'specific_weekday',
-            monthly: 'monthly',
-            quarterly: 'quarterly',
-            yearly: 'yearly',
-          };
-          frequency = map[recurrenceRaw] || null;
-          if (recurrenceRaw === 'weekly') {
-            specificWeekday = dueDate.getDay();
-          } else if (recurrenceRaw === 'monthly') {
-            specificWeekday = null;
+        if (taskType === 'recurring') {
+          if (!recurrenceRaw) {
+            validationErrors.push({
+              sheet: tasksSheet.name,
+              row: r,
+              message: 'Recurrence is required for recurring tasks',
+            });
+            continue;
           }
-          if (frequency) {
-            const cycleAnchorDate = startDate || dueDate;
-            nextRecurrenceDate = calculateNextCycleStartDate(
-              recurrenceRaw,
-              1,
-              specificWeekday,
-              cycleAnchorDate
-            );
+          if (
+            (recurrenceRaw === 'yearly' || recurrenceRaw === 'annually') &&
+            accountingYearStartForOrg === undefined
+          ) {
+            accountingYearStartForOrg = await loadOrganizationAccountingYearStart(client, organizationId);
           }
+          const schedule = resolveBulkRecurrenceSchedule(recurrenceRaw, {
+            startDate,
+            dueDate,
+            recurrenceInterval,
+            accountingYearStart: accountingYearStartForOrg,
+          });
+          if (!schedule) {
+            validationErrors.push({
+              sheet: tasksSheet.name,
+              row: r,
+              message: `Invalid recurrence: ${recurrenceRaw}. Use Daily, Weekly, Monthly, Quarterly, or Yearly.`,
+            });
+            continue;
+          }
+          frequency = schedule.frequency;
+          recurrenceType = schedule.recurrenceType;
+          specificWeekday = schedule.specificWeekday;
+          nextRecurrenceDate = schedule.nextRecurrenceDate;
         }
 
         const allAssigneeIds = new Set<string>(assigneeIds);
@@ -429,6 +462,15 @@ export async function enqueueTaskBulkUpload(
         }
 
         let escalationRules: object | null = autoEscalate ? { enabled: true } : null;
+        if (autoEscalate && escalationTrigger) {
+          escalationRules = { ...(escalationRules || {}), trigger: escalationTrigger };
+        }
+        if (autoEscalate && escalationDaysBefore != null) {
+          escalationRules = { ...(escalationRules || {}), days_before: escalationDaysBefore };
+        }
+        if (autoEscalate && escalationContactIds.length > 0) {
+          escalationRules = { ...(escalationRules || {}), contact_ids: escalationContactIds };
+        }
         if (isDifferentOwner && escalationRules) {
           escalationRules = {
             ...escalationRules,
@@ -445,18 +487,31 @@ export async function enqueueTaskBulkUpload(
           clientEntityId,
           description,
           taskType,
-          startDate: startDate ? toLocalDateOnlyString(startDate) : null,
-          targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
-          dueDate: toLocalDateOnlyString(dueDate),
+          startDate: startDate ? formatBulkDateOnly(startDate) : null,
+          targetDate: targetDate ? formatBulkDateOnly(targetDate) : null,
+          dueDate: formatBulkDateOnly(dueDate),
           frequency,
+          recurrenceType,
+          recurrenceInterval,
           specificWeekday,
-          nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+          nextRecurrenceDate: nextRecurrenceDate
+            ? serializeBulkRecurrenceCursor(nextRecurrenceDate)
+            : null,
+          taskRolloutType,
+          recurrenceEndType,
+          recurrenceEndDate,
+          recurrenceAfterOccurrences,
           assigneeIds,
           taskCreatorId,
           reportingMemberId,
           parsedFinancialValue,
           autoEscalate,
+          escalationTrigger,
+          escalationDaysBefore,
+          escalationContactIds,
           escalationRules,
+          complianceId: null,
+          documentInstanceId: null,
           allAssigneeIds: Array.from(allAssigneeIds),
           isDifferentOwner,
           sourceRowIndex: r,
@@ -471,16 +526,25 @@ export async function enqueueTaskBulkUpload(
                 clientEntityId,
                 description,
                 taskType,
-                startDate: startDate ? toLocalDateOnlyString(startDate) : null,
-                targetDate: targetDate ? toLocalDateOnlyString(targetDate) : null,
-                dueDate: toLocalDateOnlyString(dueDate),
+                startDate: startDate ? formatBulkDateOnly(startDate) : null,
+                targetDate: targetDate ? formatBulkDateOnly(targetDate) : null,
+                dueDate: formatBulkDateOnly(dueDate),
                 frequency,
                 specificWeekday,
-                nextRecurrenceDate: nextRecurrenceDate ? toLocalDateOnlyString(nextRecurrenceDate) : null,
+                nextRecurrenceDate: nextRecurrenceDate
+                  ? serializeBulkRecurrenceCursor(nextRecurrenceDate)
+                  : null,
+                taskRolloutType,
+                recurrenceEndType,
+                recurrenceEndDate,
+                recurrenceAfterOccurrences,
                 taskCreatorId,
                 reportingMemberId,
                 parsedFinancialValue,
                 autoEscalate,
+                escalationTrigger,
+                escalationDaysBefore,
+                escalationContactIds: [...escalationContactIds].sort(),
                 allAssigneeIds: Array.from(allAssigneeIds).sort(),
               })
             )

@@ -30,6 +30,8 @@ export interface TaskCategoryGroup {
 }
 
 export interface DashboardData {
+  /** Platform reminder setting used for due-soon bucketing on this response. */
+  dueSoonDays: number;
   selfTasks: {
     general: TaskCategoryGroup;
     documentManagement: TaskCategoryGroup;
@@ -376,6 +378,7 @@ export const getDashboardData = async (
   const assignedCategorized = categorizeTasks(assignedTasks);
   const events = await getDashboardEventsForUser(userId, 14);
   return {
+    dueSoonDays,
     selfTasks: selfCategorized,
     assignedTasks: assignedCategorized,
     events,

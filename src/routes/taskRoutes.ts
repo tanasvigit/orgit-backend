@@ -9,6 +9,7 @@ import {
   updateTask,
   deleteTask,
   addTaskAssignees,
+  bulkAddTaskAssignees,
   getTaskAssignees,
   markMemberComplete,
   verifyMemberCompletion,
@@ -43,6 +44,17 @@ const router = Router();
 // All routes require authentication
 router.use(authenticate);
 router.use(requireModule('Tasks'));
+
+// Bulk add assignees to multiple tasks (task dashboard)
+router.post(
+  '/bulk-assignees',
+  [
+    body('task_ids').isArray({ min: 1 }),
+    body('assignee_ids').isArray({ min: 1 }),
+  ],
+  requireTaskRight('assignTask'),
+  bulkAddTaskAssignees
+);
 
 // Get all tasks - matching message-backend
 router.get(

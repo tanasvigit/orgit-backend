@@ -13,12 +13,30 @@ import {
   isValidTransition,
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
-import { extractBaseTitle, formatRecurringTitle } from '../services/recurringTaskService';
-import { calculateNextCycleStartDate } from '../services/cycleStartRecurrence';
+import {
+  extractBaseTitle,
+  formatRecurringTitle,
+} from '../services/recurringTaskService';
+import {
+  setupRecurringTemplateForTask,
+  loadOrganizationAccountingYearStart,
+} from '../services/recurringTemplateSetup';
+import {
+  applyRecurrenceTimeOfDay,
+  calculateNextCycleStartDate,
+  startOfCalendarDay,
+  startOfUtcCalendarDay,
+} from '../services/cycleStartRecurrence';
+import {
+  buildRecurrenceEndFieldsForStorage,
+  parseRecurrenceEndPolicy,
+  validateRecurrenceEndPolicyInput,
+} from '../services/recurrenceEndPolicy';
 import {
   resolveNodeReference,
   resolveOrganizationIdForUser,
 } from '../services/organizationStructureService';
+import { deriveTaskUnitFromOrgPath, enrichTaskDisplayFields } from '../utils/taskDisplayFields';
 import {
   buildEscalationRulesFromRequest,
   normalizeEscalationDaysBefore,
@@ -158,6 +176,9 @@ const normalizeTaskRecurrenceForClient = (task: any) => {
   };
 };
 
+/** Prefer user-entered client_name over linked entity display name in list/detail queries. */
+const TASK_CLIENT_NAME_SQL = `COALESCE(NULLIF(TRIM(MAX(t.client_name)), ''), MAX(ce.name)) as client_name`;
+
 /** System message for task group chat; older DBs may lack messages.metadata. */
 const insertSystemMessageOptionalMetadata = async (
   client: { query: (text: string, values?: any[]) => Promise<any> },
@@ -228,20 +249,8 @@ const addMonthsClamped = (date: Date, monthsToAdd: number): Date => {
   return next;
 };
 
-const buildIntervalLiteralFromDates = (
-  startInput?: string | Date | null,
-  dueInput?: string | Date | null
-): string => {
-  if (!startInput || !dueInput) return '0 seconds';
-  const start = new Date(startInput);
-  const due = new Date(dueInput);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(due.getTime())) return '0 seconds';
-  const diffMs = Math.max(0, due.getTime() - start.getTime());
-  return `${Math.floor(diffMs / 1000)} seconds`;
-};
-
 const buildTaskWithDerivedStatus = (task: any) => {
-  const normalizedTask = normalizeTaskRecurrenceForClient(task);
+  const normalizedTask = enrichTaskDisplayFields(normalizeTaskRecurrenceForClient(task));
   const computedStatus = getComputedStatus({
     id: String(normalizedTask.id),
     status: normalizedTask.status,
@@ -275,7 +284,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     let querySQL = `
       SELECT 
         t.*,
-        COALESCE(MAX(ce.name), MAX(t.client_name)) as client_name,
+        ${TASK_CLIENT_NAME_SQL},
         (
           SELECT COALESCE(
             MAX(ta2.verified_at),
@@ -363,32 +372,12 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
       );
       params.push('recurring_instance', 'recurring');
 
-      // Recurring visibility: show only tasks within the due-soon window (today..today+dueSoonDays),
-      // unless explicitly requested to include all. Default 3 days from reminder settings.
-      if (!includeAll) {
-        const reminderConfig = await getReminderConfig();
-        const dueSoonDays = Number(reminderConfig?.dueSoonDays ?? 3);
-        const safeDueSoonDays = Number.isFinite(dueSoonDays) ? Math.max(0, Math.min(60, dueSoonDays)) : 3;
-        conditions.push(
-          `(t.due_date IS NULL OR (t.due_date >= CURRENT_DATE AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval))`
-        );
-        params.push(safeDueSoonDays);
-      }
+      // Recurring list uses the same lifecycle visibility as the dashboard (no due-date-only window).
     } else if (type === 'one_time') {
       // Show one-time tasks: explicitly marked as one_time OR (no type set AND no recurrence)
       conditions.push(`(t.task_type = $${params.length + 1} OR (t.task_type IS NULL AND t.recurrence_type IS NULL))`);
       params.push('one_time');
-      // Show tasks due within due-soon window OR created by/assigned to user in last 30 days (so newly created tasks are visible)
-      if (!includeAll) {
-        const reminderConfig = await getReminderConfig();
-        const dueSoonDays = Number(reminderConfig?.dueSoonDays ?? 3);
-        const safeDueSoonDays = Number.isFinite(dueSoonDays) ? Math.max(0, Math.min(60, dueSoonDays)) : 3;
-        conditions.push(
-          `(t.due_date IS NULL OR (t.due_date IS NOT NULL AND t.due_date <= CURRENT_DATE + ($${params.length + 1} || ' days')::interval)` +
-          ` OR t.created_at >= CURRENT_TIMESTAMP - INTERVAL '30 days')`
-        );
-        params.push(safeDueSoonDays);
-      }
+      // One-time list aligns with dashboard lifecycle (no due-date-only window).
     } else if (type === 'recurring_instance' || type === 'recurring_template') {
       conditions.push(`t.task_type = $${params.length + 1}`);
       params.push(type);
@@ -438,17 +427,6 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
         !row.due_date &&
         Number.isFinite(totalAssignees) &&
         totalAssignees === 0;
-      // Optional helper flag so clients can easily hide lifecycle status
-      // before the configured start_date of the task.
-      let isBeforeStartDate: boolean | null = null;
-      if (row.start_date) {
-        try {
-          const start = new Date(row.start_date as any);
-          isBeforeStartDate = !Number.isNaN(start.getTime()) && new Date() < start;
-        } catch {
-          isBeforeStartDate = null;
-        }
-      }
       const currentUserAssignee = assignees.find((a: any) => {
         const assigneeId = a?.id || a?.user_id || a?.userId;
         return assigneeId != null && String(assigneeId) === String(userId);
@@ -473,7 +451,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
       };
     });
 
-    res.json({ tasks: rowsWithStatus });
+    res.json({ tasks: rowsWithStatus, dueSoonDays });
   } catch (error: any) {
     console.error('Get tasks error:', error);
     res.status(500).json({ error: 'Failed to fetch tasks' });
@@ -519,7 +497,7 @@ export const getTask = async (req: AuthRequest, res: Response) => {
     const taskResult = await query(
       `SELECT 
         t.*,
-        COALESCE(MAX(ce.name), MAX(t.client_name)) as client_name,
+        ${TASK_CLIENT_NAME_SQL},
         (
           SELECT COALESCE(
             MAX(ta2.verified_at),
@@ -636,7 +614,7 @@ export const getTask = async (req: AuthRequest, res: Response) => {
     (taskWithDerived as any).current_user_lifecycle_status = currentUserLifecycleStatus;
     (taskWithDerived as any).is_before_start_date = currentUserLifecycleStatus === 'scheduled';
 
-    res.json({ task: taskWithDerived });
+    res.json({ task: taskWithDerived, dueSoonDays: reminderConfig.dueSoonDays });
   } catch (error: any) {
     console.error('Get task error:', error);
     res.status(500).json({ error: 'Failed to fetch task' });
@@ -669,6 +647,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       auto_escalate,
       escalation_rules,
       escalation_trigger,
+      escalation_when,
+      escalation_offset_days,
       escalation_days_before,
       escalation_contact_ids,
       compliance_id,
@@ -686,6 +666,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       client_entity_id,
       end_date,
       org_structure_node_id,
+      task_unit,
+      recurrence_end_type,
+      recurrence_end_date,
+      recurrence_after_occurrences,
     } = req.body;
 
     if (!userId) {
@@ -743,10 +727,41 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    const recurrenceEndPolicy = parseRecurrenceEndPolicy({
+      recurrence_end_type,
+      recurrence_end_date,
+      recurrence_after_occurrences,
+    });
+    if (createRecurringTemplate) {
+      const endValidation = validateRecurrenceEndPolicyInput(recurrenceEndPolicy);
+      if (!endValidation.valid) {
+        return res.status(400).json({ error: endValidation.error });
+      }
+      if (
+        recurrenceEndPolicy.endType === 'specific_date' &&
+        recurrenceEndPolicy.endDate &&
+        (start_date || finalDueDate || target_date)
+      ) {
+        const anchor = new Date((start_date || finalDueDate || target_date) as string);
+        if (startOfCalendarDay(recurrenceEndPolicy.endDate).getTime() < startOfCalendarDay(anchor).getTime()) {
+          return res.status(400).json({
+            error: 'Recurrence end date cannot be before the first task cycle start date.',
+          });
+        }
+      }
+    }
+    const recurrenceEndStorage = buildRecurrenceEndFieldsForStorage(
+      recurrenceEndPolicy.endType,
+      recurrence_end_date,
+      recurrenceEndPolicy.maxOccurrences
+    );
+
     let finalEscalationRules = buildEscalationRulesFromRequest({
       auto_escalate,
       escalation_rules,
       escalation_trigger,
+      escalation_when,
+      escalation_offset_days,
       escalation_days_before,
       escalation_contact_ids,
     });
@@ -837,6 +852,21 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       });
     }
 
+    let orgStructurePathForInsert: string | null = orgStructureReference?.path
+      ? JSON.stringify(orgStructureReference.path)
+      : null;
+    let orgStructureNodeIdForInsert: string | null = orgStructureReference?.nodeId || null;
+    let orgStructureLevelKeyForInsert: string | null = orgStructureReference?.levelKey || null;
+
+    // Free-text task unit when no org node is linked (legacy column removed; store minimal path JSON).
+    if (
+      !orgStructureNodeIdForInsert &&
+      typeof task_unit === 'string' &&
+      task_unit.trim()
+    ) {
+      orgStructurePathForInsert = JSON.stringify([{ name: task_unit.trim() }]);
+    }
+
     // Validate reporting_member_id if provided
     if (reporting_member_id) {
       // Ensure assignee_ids is provided and reporting_member_id is in the list
@@ -922,7 +952,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
            'escalation_rules',
            'escalation_status',
            'escalation_trigger',
-           'escalation_days_before'
+           'escalation_days_before',
+           'recurrence_end_type',
+           'recurrence_end_date',
+           'recurrence_after_occurrences'
          )`
     );
     const hasCreatedBy = columnCheck.rows.some((r: any) => r.column_name === 'created_by');
@@ -953,6 +986,11 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const hasEscalationDaysBefore = columnCheck.rows.some(
       (r: any) => r.column_name === 'escalation_days_before'
     );
+    const hasRecurrenceEndType = columnCheck.rows.some((r: any) => r.column_name === 'recurrence_end_type');
+    const hasRecurrenceEndDate = columnCheck.rows.some((r: any) => r.column_name === 'recurrence_end_date');
+    const hasRecurrenceAfterOccurrences = columnCheck.rows.some(
+      (r: any) => r.column_name === 'recurrence_after_occurrences'
+    );
 
     const normalizedRecurrenceType =
       typeof recurrence_type === 'string' ? recurrence_type.toLowerCase() : null;
@@ -960,7 +998,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       normalizedRecurrenceType === 'yearly' ? 'annually' : normalizedRecurrenceType;
     // Weekly schedules are day-of-week based, so we store them as specific_weekday frequency.
     const frequency =
-      normalizedRecurrenceType === 'weekly'
+      normalizedRecurrenceType === 'daily'
+        ? 'daily'
+        : normalizedRecurrenceType === 'weekly'
         ? 'specific_weekday'
         : normalizedRecurrenceType === 'monthly' ||
           normalizedRecurrenceType === 'quarterly' ||
@@ -976,15 +1016,8 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       organizationId &&
       (normalizedRecurrenceType === 'yearly' || normalizedRecurrenceType === 'annually')
     ) {
-      const organizationResult = await client.query(
-        `SELECT accounting_year_start::text AS accounting_year_start
-         FROM organizations
-         WHERE id = $1
-         LIMIT 1`,
-        [organizationId]
-      );
       accountingYearStart =
-        organizationResult.rows[0]?.accounting_year_start?.split?.('T')?.[0] || '2000-04-01';
+        (await loadOrganizationAccountingYearStart(client, organizationId)) || '2000-04-01';
     }
     const normalizedSpecificWeekdayRaw =
       typeof specific_weekday === 'number'
@@ -1012,14 +1045,22 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       start_date || finalDueDate || target_date
         ? new Date((start_date || finalDueDate || target_date) as string)
         : null;
+    const normalizedCycleAnchorDate =
+      normalizedRecurrenceType === 'daily' && cycleAnchorDate
+        ? startOfUtcCalendarDay(cycleAnchorDate)
+        : cycleAnchorDate;
     const nextRecurrenceDate =
-      createRecurringTemplate && frequency && cycleAnchorDate
+      createRecurringTemplate &&
+      normalizedCycleAnchorDate &&
+      normalizedRecurrenceType
         ? calculateNextCycleStartDate(
-            recurrence_type || frequency,
+            recurrenceTypeForStorage || normalizedRecurrenceType,
             recurrence_interval || 1,
             specificWeekdayValue,
-            cycleAnchorDate,
-            frequency === 'yearly' ? accountingYearStart : null
+            normalizedCycleAnchorDate,
+            normalizedRecurrenceType === 'yearly' || normalizedRecurrenceType === 'annually'
+              ? accountingYearStart
+              : null
           )
         : null;
 
@@ -1045,7 +1086,15 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     
     // Build INSERT statement with both columns if they exist
     let insertColumns = ['title', 'description', 'task_type'];
-    let insertValues = [title, description, taskTypeForInsert];
+    const instanceTitle =
+      createRecurringTemplate && normalizedCycleAnchorDate
+        ? formatRecurringTitle(
+            recurringBaseTitle,
+            normalizedCycleAnchorDate,
+            recurrenceTypeForStorage || normalizedRecurrenceType
+          )
+        : title;
+    let insertValues = [instanceTitle, description, taskTypeForInsert];
     let paramIndex = 4;
 
     // If tasks table has a status column, set initial status for recurring tasks
@@ -1098,8 +1147,15 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     }
     
     // Add remaining columns
+    const normalizedStartDateForInsert =
+      createRecurringTemplate && normalizedRecurrenceType === 'daily' && start_date
+        ? applyRecurrenceTimeOfDay(
+            startOfUtcCalendarDay(new Date(start_date as string)),
+            new Date(start_date as string)
+          ).toISOString()
+        : start_date || null;
     insertColumns.push('start_date', 'target_date', 'due_date');
-    insertValues.push(start_date || null, target_date || null, finalDueDate || null);
+    insertValues.push(normalizedStartDateForInsert, target_date || null, finalDueDate || null);
 
     if (hasFrequency) {
       insertColumns.push('frequency');
@@ -1141,6 +1197,18 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     if (hasTaskRolloutType && createRecurringTemplate) {
       insertColumns.push('task_rollout_type');
       insertValues.push('cycle_start');
+    }
+    if (createRecurringTemplate && hasRecurrenceEndType) {
+      insertColumns.push('recurrence_end_type');
+      insertValues.push(recurrenceEndStorage.recurrence_end_type);
+    }
+    if (createRecurringTemplate && hasRecurrenceEndDate) {
+      insertColumns.push('recurrence_end_date');
+      insertValues.push(recurrenceEndStorage.recurrence_end_date);
+    }
+    if (createRecurringTemplate && hasRecurrenceAfterOccurrences) {
+      insertColumns.push('recurrence_after_occurrences');
+      insertValues.push(recurrenceEndStorage.recurrence_after_occurrences);
     }
 
     // Add financial fields if corresponding columns exist
@@ -1197,17 +1265,17 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     if (hasOrgStructureNodeId) {
       insertColumns.push('org_structure_node_id');
-      insertValues.push(orgStructureReference?.nodeId || null);
+      insertValues.push(orgStructureNodeIdForInsert);
     }
 
     if (hasOrgStructureLevelKey) {
       insertColumns.push('org_structure_level_key');
-      insertValues.push(orgStructureReference?.levelKey || null);
+      insertValues.push(orgStructureLevelKeyForInsert);
     }
 
     if (hasOrgStructurePath) {
       insertColumns.push('org_structure_path');
-      insertValues.push(orgStructureReference?.path ? JSON.stringify(orgStructureReference.path) : null);
+      insertValues.push(orgStructurePathForInsert);
     }
 
     if (hasEndDate && end_date) {
@@ -1244,10 +1312,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       insertValues
     );
 
-    const task = {
+    const task = enrichTaskDisplayFields({
       ...taskResult.rows[0],
-      task_unit: orgStructureReference?.pathDisplay || null,
-    };
+      task_unit:
+        deriveTaskUnitFromOrgPath(orgStructureReference?.path) ||
+        (typeof task_unit === 'string' && task_unit.trim() ? task_unit.trim() : null),
+    });
 
     // Assign task to users.
     // IMPORTANT: If no assignee_ids are provided, we keep the task unassigned (no task_assignees rows).
@@ -1307,153 +1377,6 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     }
 
     // Recurring templates: persist immutable schedule controller and link this row as first instance.
-    if (createRecurringTemplate) {
-      const templatesTableCheck = await client.query(
-        `SELECT to_regclass('public.task_recurrence_templates') AS exists`
-      );
-      const templateAssigneesTableCheck = await client.query(
-        `SELECT to_regclass('public.task_template_assignees') AS exists`
-      );
-      const templatesTableExists = !!templatesTableCheck.rows[0]?.exists;
-      const templateAssigneesTableExists = !!templateAssigneesTableCheck.rows[0]?.exists;
-
-      if (templatesTableExists) {
-        const templateColumnCheck = await client.query(
-          `SELECT column_name
-           FROM information_schema.columns
-           WHERE table_name = 'task_recurrence_templates'
-             AND column_name IN ('base_target_offset')`
-        );
-        const hasBaseTargetOffset = templateColumnCheck.rows.some(
-          (r: any) => r.column_name === 'base_target_offset'
-        );
-        const recurrenceDate = task.start_date || task.created_at || new Date().toISOString();
-        const baseTargetOffset =
-          task.start_date && task.target_date
-            ? buildIntervalLiteralFromDates(task.start_date, task.target_date)
-            : null;
-        const baseDueOffset = buildIntervalLiteralFromDates(task.start_date, task.due_date);
-        const templateResult = hasBaseTargetOffset
-          ? await client.query(
-              `INSERT INTO task_recurrence_templates (
-                task_id,
-                organization_id,
-                title,
-                description,
-                category,
-                creator_id,
-                reporting_member_id,
-                recurrence_type,
-                recurrence_interval,
-                recurrence_day_of_month,
-                specific_weekday,
-                base_start_date,
-                base_target_offset,
-                base_due_offset,
-                last_generated_at,
-                next_recurrence_date,
-                status
-              ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,$14::interval,NOW(),$15,'active'
-              )
-              RETURNING id`,
-              [
-                task.id,
-                organizationId || null,
-                recurringBaseTitle,
-                description || null,
-                category || null,
-                taskCreatorId,
-                reporting_member_id || null,
-                recurrenceTypeForStorage || null,
-                recurrence_interval || 1,
-                recurrence_day_of_month || null,
-                specificWeekdayValue || null,
-                recurrenceDate,
-                baseTargetOffset,
-                baseDueOffset,
-                nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
-              ]
-            )
-          : await client.query(
-              `INSERT INTO task_recurrence_templates (
-                task_id,
-                organization_id,
-                title,
-                description,
-                category,
-                creator_id,
-                reporting_member_id,
-                recurrence_type,
-                recurrence_interval,
-                recurrence_day_of_month,
-                specific_weekday,
-                base_start_date,
-                base_due_offset,
-                last_generated_at,
-                next_recurrence_date,
-                status
-              ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::interval,NOW(),$14,'active'
-              )
-              RETURNING id`,
-              [
-                task.id,
-                organizationId || null,
-                recurringBaseTitle,
-                description || null,
-                category || null,
-                taskCreatorId,
-                reporting_member_id || null,
-                recurrenceTypeForStorage || null,
-                recurrence_interval || 1,
-                recurrence_day_of_month || null,
-                specificWeekdayValue || null,
-                recurrenceDate,
-                baseDueOffset,
-                nextRecurrenceDate ? nextRecurrenceDate.toISOString() : null,
-              ]
-            );
-        const templateId = templateResult.rows[0]?.id;
-        if (templateId) {
-          if (hasParentTaskId || hasRecurrenceTemplateId) {
-            const updates: string[] = [];
-            const updateValues: any[] = [];
-            let pIdx = 1;
-            if (hasParentTaskId) {
-              updates.push(`parent_task_id = $${pIdx++}`);
-              updateValues.push(templateId);
-            }
-            if (hasRecurrenceTemplateId) {
-              updates.push(`recurrence_template_id = $${pIdx++}`);
-              updateValues.push(templateId);
-            }
-            updateValues.push(task.id);
-            await client.query(
-              `UPDATE tasks SET ${updates.join(', ')} WHERE id = $${pIdx}`,
-              updateValues
-            );
-          }
-
-          if (templateAssigneesTableExists) {
-            for (const assigneeId of allAssigneeIds.size > 0 ? allAssigneeIds : new Set<string>([String(taskCreatorId)])) {
-              const role =
-                String(assigneeId) === String(taskCreatorId)
-                  ? 'creator'
-                  : reporting_member_id && String(assigneeId) === String(reporting_member_id)
-                  ? 'reporting_member'
-                  : 'member';
-              await client.query(
-                `INSERT INTO task_template_assignees (template_id, user_id, role)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (template_id, user_id) DO NOTHING`,
-                [templateId, assigneeId, role]
-              );
-            }
-          }
-        }
-      }
-    }
 
     // Create task activity log
     const initialStatus = 'pending';
@@ -1529,6 +1452,29 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    if (createRecurringTemplate) {
+      await setupRecurringTemplateForTask(client, {
+        task,
+        organizationId: organizationId || null,
+        title: recurringBaseTitle,
+        description: description || null,
+        category: category || null,
+        creatorId: taskCreatorId,
+        reportingMemberId: reporting_member_id || null,
+        recurrenceType: recurrenceTypeForStorage || null,
+        recurrenceInterval: recurrence_interval || 1,
+        recurrenceDayOfMonth: recurrence_day_of_month || null,
+        specificWeekday: specificWeekdayValue || null,
+        nextRecurrenceDate,
+        recurrenceEndType: recurrenceEndStorage.recurrence_end_type,
+        recurrenceEndDate: recurrenceEndStorage.recurrence_end_date,
+        recurrenceAfterOccurrences: recurrenceEndStorage.recurrence_after_occurrences,
+        assigneeIds:
+          allAssigneeIds.size > 0 ? allAssigneeIds : new Set<string>([String(taskCreatorId)]),
+        escalationContactIds,
+      });
+    }
+
     // Create auto-generated message in task group
     // Check which columns exist in messages table
     const messageColumnCheck = await client.query(
@@ -1597,7 +1543,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           type: 'MESSAGE_RECEIVED',
           recipientIds: autoMessageRecipientIds,
           title: 'New task message',
-          body: `Task group auto-created by ${creatorName}`,
+          body: `Task created by ${creatorName}`,
           refId: conversation.id,
           refType: 'conversation',
           io,
@@ -1611,7 +1557,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     const fullTaskResult = await query(
       `SELECT 
         t.*,
-        COALESCE(MAX(ce.name), MAX(t.client_name)) as client_name,
+        ${TASK_CLIENT_NAME_SQL},
         json_agg(
           DISTINCT jsonb_build_object(
             'id', u.id,
@@ -1632,7 +1578,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       [conversation.id, task.id]
     );
 
-    res.status(201).json({ task: normalizeTaskRecurrenceForClient(fullTaskResult.rows[0]) });
+    res.status(201).json({ task: buildTaskWithDerivedStatus(fullTaskResult.rows[0]) });
   } catch (error: any) {
     await client.query('ROLLBACK');
     console.error('Create task error:', error);
@@ -2056,13 +2002,7 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     res.json({
-      task: {
-        ...result.rows[0],
-        task_unit:
-          orgStructureReference !== undefined
-            ? orgStructureReference?.pathDisplay || null
-            : result.rows[0]?.task_unit ?? null,
-      },
+      task: buildTaskWithDerivedStatus(result.rows[0]),
     });
   } catch (error: any) {
     console.error('Update task error:', error);
@@ -3630,6 +3570,158 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
   } finally {
     client.release();
   }
+};
+
+/**
+ * Add the same assignee(s) to multiple tasks (task dashboard bulk assign).
+ */
+export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
+  const userId = req.user?.userId;
+  const { task_ids: taskIdsRaw, assignee_ids: assigneeIdsRaw } = req.body || {};
+
+  if (!userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  if (!Array.isArray(taskIdsRaw) || taskIdsRaw.length === 0) {
+    return res.status(400).json({ error: 'task_ids array is required' });
+  }
+  if (!Array.isArray(assigneeIdsRaw) || assigneeIdsRaw.length === 0) {
+    return res.status(400).json({ error: 'assignee_ids array is required' });
+  }
+
+  const taskIds = [...new Set(taskIdsRaw.map((id: unknown) => String(id).trim()).filter(Boolean))].slice(
+    0,
+    100
+  );
+  const assigneeIds = [
+    ...new Set(assigneeIdsRaw.map((id: unknown) => String(id).trim()).filter(Boolean)),
+  ].slice(0, 50);
+
+  if (taskIds.length === 0 || assigneeIds.length === 0) {
+    return res.status(400).json({ error: 'Valid task_ids and assignee_ids are required' });
+  }
+
+  const results: Array<{
+    task_id: string;
+    success: boolean;
+    added_count?: number;
+    error?: string;
+  }> = [];
+
+  for (const taskId of taskIds) {
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+
+      const taskResult = await client.query(
+        `SELECT id, created_by, creator_id, start_date FROM tasks WHERE id = $1`,
+        [taskId]
+      );
+
+      if (taskResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        results.push({ task_id: taskId, success: false, error: 'Task not found' });
+        continue;
+      }
+
+      const task = taskResult.rows[0];
+      const taskCreatorId = task.created_by || task.creator_id;
+
+      const assigneeCheck = await client.query(
+        `SELECT 1 FROM task_assignees WHERE task_id = $1 AND user_id = $2`,
+        [taskId, userId]
+      );
+
+      if (
+        assigneeCheck.rows.length === 0 &&
+        String(taskCreatorId ?? '') !== String(userId)
+      ) {
+        await client.query('ROLLBACK');
+        results.push({
+          task_id: taskId,
+          success: false,
+          error: 'You must be assigned to this task to add assignees',
+        });
+        continue;
+      }
+
+      const existingAssigneesResult = await client.query(
+        `SELECT user_id FROM task_assignees WHERE task_id = $1`,
+        [taskId]
+      );
+      const existingAssigneeIds = new Set(
+        existingAssigneesResult.rows.map((r: { user_id: string }) => String(r.user_id))
+      );
+      const newAssigneeIds = assigneeIds.filter((aid) => !existingAssigneeIds.has(aid));
+
+      if (newAssigneeIds.length === 0) {
+        await client.query('COMMIT');
+        results.push({ task_id: taskId, success: true, added_count: 0 });
+        continue;
+      }
+
+      const assigneeStatus = resolveInitialAssigneeStatus({ startDate: task.start_date });
+      for (const assigneeId of newAssigneeIds) {
+        await client.query(
+          `INSERT INTO task_assignees (task_id, user_id, status, role)
+           VALUES ($1, $2, $3, 'member')
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET status = EXCLUDED.status`,
+          [taskId, assigneeId, assigneeStatus]
+        );
+      }
+
+      const conversationResult = await client.query(
+        `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
+        [taskId]
+      );
+      if (conversationResult.rows.length > 0) {
+        const conversationId = conversationResult.rows[0].id;
+        for (const assigneeId of newAssigneeIds) {
+          await client.query(
+            `INSERT INTO conversation_members (conversation_id, user_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+            [conversationId, assigneeId]
+          );
+        }
+      }
+
+      await client.query(
+        `INSERT INTO task_activities (task_id, user_id, activity_type, message)
+         VALUES ($1, $2, 'assignees_added', $3)`,
+        [taskId, userId, `Added ${newAssigneeIds.length} new assignee(s) to the task`]
+      );
+
+      await client.query('COMMIT');
+      results.push({ task_id: taskId, success: true, added_count: newAssigneeIds.length });
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      console.error('Bulk add assignees error for task', taskId, error);
+      results.push({
+        task_id: taskId,
+        success: false,
+        error: error?.message || 'Failed to add assignees',
+      });
+    } finally {
+      client.release();
+    }
+  }
+
+  const succeeded = results.filter((r) => r.success).length;
+  const failed = results.filter((r) => !r.success).length;
+  const totalAdded = results.reduce((sum, r) => sum + (r.added_count || 0), 0);
+
+  return res.json({
+    success: failed === 0,
+    results,
+    summary: {
+      tasks_requested: taskIds.length,
+      tasks_succeeded: succeeded,
+      tasks_failed: failed,
+      assignees_added_total: totalAdded,
+    },
+  });
 };
 
 /**

@@ -15,6 +15,7 @@ import {
   resolveStageOrderForNodeCreate,
   type OrganizationStructureStage,
 } from './organizationStructureStages';
+import { filterLevelsUsedOnTree } from '../utils/orgStructureAssignmentUtils';
 
 export type { OrganizationStructureStage } from './organizationStructureStages';
 
@@ -99,12 +100,16 @@ export interface OrganizationStructureNode {
 
 export interface OrganizationStructureTree {
   stages: OrganizationStructureStage[];
+  /** Levels referenced by at least one org node (not the full preset catalog). */
   levels: OrganizationStructureLevel[];
+  /** Full level catalog from DB — for org-definition admin only. */
+  catalogLevels?: OrganizationStructureLevel[];
   nodes: OrganizationStructureNode[];
   rootNode: OrganizationStructureNode | null;
   summary: {
     totalStages: number;
     totalLevels: number;
+    catalogLevelCount?: number;
     totalNodes: number;
     activeNodes: number;
     archivedNodes: number;
@@ -878,7 +883,7 @@ async function resolveTargetLevelForNodeCreate(
   actorUserId: string,
   levels: OrganizationStructureLevel[],
   input: CreateOrganizationStructureNodeInput,
-  relation: CreateOrganizationStructureNodeInput['relation']
+  _relation: CreateOrganizationStructureNodeInput['relation']
 ): Promise<OrganizationStructureLevel> {
   if (input.targetLevelId) {
     const level = await getLevelByIdInternal(client, organizationId, input.targetLevelId);
@@ -1046,7 +1051,11 @@ export async function resolveNodeReference(
 }
 
 export async function getOrganizationStructureLevels(organizationId: string): Promise<OrganizationStructureLevel[]> {
-  return withClient(async (client) => getLevelsInternal(client, organizationId, true));
+  const tree = await getOrganizationStructureTree(organizationId, {
+    includeArchived: true,
+    includeInactive: true,
+  });
+  return tree.levels;
 }
 
 export async function updateOrganizationStructureLevel(
@@ -1198,15 +1207,18 @@ export async function getOrganizationStructureTree(
     }
     const nodes = await getNodesInternal(client, organizationId, options);
     const rootNode = nodes.find((node) => !node.parentNodeId) || null;
+    const levelsInUse = filterLevelsUsedOnTree(levels, nodes);
 
     return {
       stages,
-      levels,
+      levels: levelsInUse,
+      catalogLevels: levels,
       nodes,
       rootNode,
       summary: {
         totalStages: stages.length,
-        totalLevels: levels.length,
+        totalLevels: levelsInUse.length,
+        catalogLevelCount: levels.length,
         totalNodes: nodes.length,
         activeNodes: nodes.filter((node) => node.status === 'active').length,
         archivedNodes: nodes.filter((node) => node.status === 'archived').length,
@@ -1686,7 +1698,7 @@ async function collectNodeSubtreeIds(
     [nodeId, organizationId]
   );
 
-  return subtreeResult.rows.map((row) => row.id as string);
+  return subtreeResult.rows.map((row: { id: string }) => row.id);
 }
 
 export async function deleteOrganizationStructureNode(
