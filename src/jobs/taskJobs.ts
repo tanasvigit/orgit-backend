@@ -5,6 +5,7 @@ import { query } from '../config/database';
 import { getReminderConfig } from '../services/platformSettingsService';
 import { processTaskBulkQueue } from './taskBulkWorker';
 import { processEntityMasterBulkQueue } from './entityMasterBulkWorker';
+import { processTaskPushDigests } from '../services/taskPushDigestService';
 
 /**
  * Keep per-user assignee status aligned with task start/due dates.
@@ -138,6 +139,14 @@ export const setupTaskJobs = (io?: any): void => {
       await processEntityMasterBulkQueue();
     } catch (error) {
       console.error('Error in bulk upload worker:', error);
+    }
+  });
+
+  cron.schedule('* * * * *', async () => {
+    try {
+      await processTaskPushDigests(io);
+    } catch (error) {
+      console.error('Error in task push digest job:', error);
     }
   });
 

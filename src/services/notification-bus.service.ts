@@ -77,9 +77,12 @@ function buildPushData(input: DispatchNotificationInput): Record<string, string>
     data.type = 'message';
     data.isGroup = 'false';
   }
-  if (input.refType === 'task') {
+  if (input.refType === 'task' && input.type === 'MESSAGE_RECEIVED') {
     data.isTaskGroup = 'true';
     data.isGroup = 'true';
+  } else if (input.refType === 'task' && input.refId) {
+    data.isTaskGroup = 'false';
+    data.isGroup = 'false';
   }
   return data;
 }

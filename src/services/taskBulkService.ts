@@ -738,11 +738,11 @@ export async function createTaskFromPayload(
     );
   }
 
-  const createdSuffix = ` with assignees${idempotencyKey ? ` [bulk_key:${idempotencyKey}]` : ''}`;
+  const createdSuffix = idempotencyKey ? ` [bulk_key:${idempotencyKey}]` : '';
   await client.query(
     `INSERT INTO task_activities (task_id, user_id, activity_type, new_value, message)
      VALUES ($1, $2, 'created', 'pending', $3)`,
-    [task.id, userId, `Task "${title}" created${createdSuffix}`]
+    [task.id, userId, `Task "${title}" is created${createdSuffix}`]
   );
 
   const convCheck = await client.query(

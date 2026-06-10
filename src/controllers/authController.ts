@@ -9,6 +9,7 @@ import {
   getTaskCreationUserConfigForUser,
   updateTaskCreationUserConfigForUser,
   parseAndValidateTaskCreationUserConfigBody,
+  toClientTaskCreationUserConfig,
 } from '../services/taskCreationUserConfigService';
 import {
   loadMembershipContext,
@@ -1299,7 +1300,7 @@ export const getTaskCreationUserConfig = async (req: Request, res: Response) => 
       return res.status(401).json({ success: false, error: 'Unauthorized' });
     }
     const config = await getTaskCreationUserConfigForUser(userId);
-    return res.json({ success: true, data: config });
+    return res.json({ success: true, data: toClientTaskCreationUserConfig(config) });
   } catch (error: any) {
     console.error('getTaskCreationUserConfig error:', error);
     return res.status(500).json({

@@ -26,12 +26,22 @@ export const DEFAULT_TASK_CARD_DISPLAY: TaskCardDisplayConfig = {
   overdueBadge: true,
 };
 
+export const DEFAULT_TASK_PUSH_NOTIFICATION_TIME = '09:00';
+export const DEFAULT_TASK_PUSH_TIMEZONE = 'Asia/Kolkata';
+
 export type TaskCreationUserConfigPayload = {
   dueDaysFromStart: number;
   targetDaysBeforeDue: number;
   autoEscalateTrigger: 'target_date' | 'due_date';
   taskUnitPreference: 'org_unit';
   taskCardDisplay: TaskCardDisplayConfig;
+  /** Local HH:mm when daily task digest push is sent (e.g. 09:00). */
+  taskPushNotificationTime: string;
+  taskPushNotificationsEnabled: boolean;
+  /** IANA timezone for scheduling digest pushes. */
+  timezone: string;
+  /** Server-managed ISO timestamp of last digest push; preserved across user saves. */
+  lastTaskPushDigestAt?: string | null;
 };
 
 export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = {
@@ -40,7 +50,31 @@ export const DEFAULT_TASK_CREATION_USER_CONFIG: TaskCreationUserConfigPayload = 
   autoEscalateTrigger: 'target_date',
   taskUnitPreference: 'org_unit',
   taskCardDisplay: { ...DEFAULT_TASK_CARD_DISPLAY },
+  taskPushNotificationTime: DEFAULT_TASK_PUSH_NOTIFICATION_TIME,
+  taskPushNotificationsEnabled: true,
+  timezone: DEFAULT_TASK_PUSH_TIMEZONE,
+  lastTaskPushDigestAt: null,
 };
+
+function normalizeTaskPushTime(raw: unknown): string {
+  const s = String(raw ?? '').trim();
+  const match = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return DEFAULT_TASK_PUSH_NOTIFICATION_TIME;
+  const hour = Math.min(23, Math.max(0, Number.parseInt(match[1], 10)));
+  const minute = Math.min(59, Math.max(0, Number.parseInt(match[2], 10)));
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function normalizeTimezone(raw: unknown): string {
+  const tz = String(raw ?? '').trim();
+  if (!tz) return DEFAULT_TASK_PUSH_TIMEZONE;
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return tz;
+  } catch {
+    return DEFAULT_TASK_PUSH_TIMEZONE;
+  }
+}
 
 export function mergeTaskCardDisplayConfig(stored: unknown): TaskCardDisplayConfig {
   const base = { ...DEFAULT_TASK_CARD_DISPLAY };
@@ -89,7 +123,24 @@ export function mergeTaskCreationUserConfig(
 
   base.taskCardDisplay = mergeTaskCardDisplayConfig(stored.taskCardDisplay);
 
+  base.taskPushNotificationTime = normalizeTaskPushTime(stored.taskPushNotificationTime);
+  if (typeof stored.taskPushNotificationsEnabled === 'boolean') {
+    base.taskPushNotificationsEnabled = stored.taskPushNotificationsEnabled;
+  }
+  base.timezone = normalizeTimezone(stored.timezone);
+  if (typeof stored.lastTaskPushDigestAt === 'string' && stored.lastTaskPushDigestAt.trim()) {
+    base.lastTaskPushDigestAt = stored.lastTaskPushDigestAt.trim();
+  }
+
   return base;
+}
+
+/** Strip server-only fields before returning config to clients. */
+export function toClientTaskCreationUserConfig(
+  config: TaskCreationUserConfigPayload
+): Omit<TaskCreationUserConfigPayload, 'lastTaskPushDigestAt'> {
+  const { lastTaskPushDigestAt: _omit, ...client } = config;
+  return client;
 }
 
 export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskCreationUserConfigPayload {
@@ -121,6 +172,13 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
     throw new Error('taskUnitPreference must be org_unit');
   }
 
+  const taskPushNotificationTime = normalizeTaskPushTime(body.taskPushNotificationTime);
+  const taskPushNotificationsEnabled =
+    typeof body.taskPushNotificationsEnabled === 'boolean'
+      ? body.taskPushNotificationsEnabled
+      : DEFAULT_TASK_CREATION_USER_CONFIG.taskPushNotificationsEnabled;
+  const timezone = normalizeTimezone(body.timezone);
+
   return {
     dueDaysFromStart: Math.round(dueDaysFromStart),
     targetDaysBeforeDue: Math.round(targetDaysBeforeDue),
@@ -132,6 +190,9 @@ export function parseAndValidateTaskCreationUserConfigBody(body: unknown): TaskC
     taskCardDisplay: mergeTaskCardDisplayConfig(
       isPlainObject(body) ? body.taskCardDisplay : undefined
     ),
+    taskPushNotificationTime,
+    taskPushNotificationsEnabled,
+    timezone,
   };
 }
 
@@ -148,11 +209,16 @@ export async function getTaskCreationUserConfigForUser(userId: string): Promise<
 
 export async function updateTaskCreationUserConfigForUser(
   userId: string,
-  config: TaskCreationUserConfigPayload
-): Promise<TaskCreationUserConfigPayload> {
+  config: Omit<TaskCreationUserConfigPayload, 'lastTaskPushDigestAt'>
+): Promise<Omit<TaskCreationUserConfigPayload, 'lastTaskPushDigestAt'>> {
+  const existing = await getTaskCreationUserConfigForUser(userId);
+  const payload: TaskCreationUserConfigPayload = {
+    ...config,
+    lastTaskPushDigestAt: existing.lastTaskPushDigestAt ?? null,
+  };
   await query(
     `UPDATE users SET task_creation_user_config = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
-    [JSON.stringify(config), userId]
+    [JSON.stringify(payload), userId]
   );
-  return config;
+  return toClientTaskCreationUserConfig(payload);
 }

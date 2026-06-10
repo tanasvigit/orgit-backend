@@ -324,7 +324,7 @@ router.post('/', authenticateToken, async (req, res) => {
     await client.query(
       `INSERT INTO task_activities (task_id, user_id, activity_type, new_value, message)
        VALUES ($1, $2, 'created', $3, $4)`,
-      [task.id, userId, initialStatus, `Task "${title}" created${hasAssignees ? ' with assignees - Pending acceptance' : ''}`]
+      [task.id, userId, initialStatus, `Task "${title}" is created`]
     );
 
     // Auto-create task group conversation

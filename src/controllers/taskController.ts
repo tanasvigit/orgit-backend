@@ -1380,15 +1380,12 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     // Create task activity log
     const initialStatus = 'pending';
-    const createdActivitySuffix = hasAssignees
-      ? ' with assignees'
-      : '';
     await logTaskActivity(client, {
       taskId: task.id,
       userId,
       activityType: 'created',
       newValue: initialStatus,
-      message: `Task "${task.title}" created${createdActivitySuffix}`,
+      message: `Task "${task.title}" is created`,
     });
 
     // Auto-create task group conversation
