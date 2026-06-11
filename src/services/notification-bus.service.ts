@@ -1,4 +1,9 @@
 import { query } from '../config/database';
+import {
+  DEFAULT_NOTIFICATION_SETTINGS,
+  EmployeeNotificationSettings,
+  normalizeNotificationSettings,
+} from './employeeMasterCatalog';
 import { sendPushToUserIds } from './firebasePushService';
 
 export type NotificationChannel = 'in_app' | 'push' | 'email';
@@ -25,6 +30,10 @@ type DispatchNotificationInput = {
   body?: string;
   refId?: string | null;
   refType?: string | null;
+  /** Task group chat message — sets isTaskGroup on FCM data payload */
+  isTaskGroup?: boolean;
+  /** Conversation UUID for chat push deep links */
+  conversationId?: string | null;
   /** Defaults to in_app + push */
   channels?: NotificationChannel[];
   io?: any;
@@ -70,14 +79,20 @@ function buildPushData(input: DispatchNotificationInput): Record<string, string>
   };
   if (input.refType) data.refType = String(input.refType);
   if (input.refId) data.refId = String(input.refId);
-  if (input.refType === 'conversation' && input.refId) {
-    data.conversationId = String(input.refId);
+  const conversationId =
+    input.conversationId ||
+    (input.refType === 'conversation' && input.refId ? input.refId : null);
+  if (conversationId) {
+    data.conversationId = String(conversationId);
   }
   if (input.type === 'MESSAGE_RECEIVED') {
     data.type = 'message';
-    data.isGroup = 'false';
+    data.isGroup = input.isTaskGroup ? 'true' : 'false';
   }
-  if (input.refType === 'task' && input.type === 'MESSAGE_RECEIVED') {
+  if (input.isTaskGroup) {
+    data.isTaskGroup = 'true';
+    data.isGroup = 'true';
+  } else if (input.refType === 'task' && input.type === 'MESSAGE_RECEIVED') {
     data.isTaskGroup = 'true';
     data.isGroup = 'true';
   } else if (input.refType === 'task' && input.refId) {
@@ -87,22 +102,105 @@ function buildPushData(input: DispatchNotificationInput): Record<string, string>
   return data;
 }
 
+const TASK_REMINDER_TYPES: NotificationBusType[] = [
+  'TASK_ASSIGNED',
+  'TASK_STATUS_CHANGED',
+  'TASK_COMPLETE_PENDING',
+  'TASK_VERIFIED',
+  'TASK_COMPLETION_REJECTED',
+  'TASK_DELETED',
+];
+
+async function loadNotificationSettingsForUsers(
+  userIds: string[]
+): Promise<Map<string, EmployeeNotificationSettings>> {
+  const map = new Map<string, EmployeeNotificationSettings>();
+  if (userIds.length === 0) return map;
+
+  const result = await query(
+    `SELECT uo.user_id, uo.notification_settings
+     FROM user_organizations uo
+     WHERE uo.user_id = ANY($1::uuid[])`,
+    [userIds]
+  );
+
+  for (const row of result.rows) {
+    map.set(
+      String(row.user_id),
+      normalizeNotificationSettings(row.notification_settings)
+    );
+  }
+
+  for (const id of userIds) {
+    if (!map.has(id)) {
+      map.set(id, normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS));
+    }
+  }
+
+  return map;
+}
+
+function isNotificationTypeEnabled(
+  type: NotificationBusType,
+  settings: EmployeeNotificationSettings
+): boolean {
+  if (type === 'TASK_ESCALATED') {
+    return settings.escalationAlerts;
+  }
+  if (TASK_REMINDER_TYPES.includes(type)) {
+    return settings.taskReminders;
+  }
+  return settings.inApp;
+}
+
+function resolveChannelsForRecipient(
+  requestedChannels: NotificationChannel[],
+  settings: EmployeeNotificationSettings,
+  type: NotificationBusType
+): NotificationChannel[] {
+  if (!isNotificationTypeEnabled(type, settings)) {
+    return [];
+  }
+
+  return requestedChannels.filter((channel) => {
+    if (channel === 'in_app' || channel === 'push') return settings.inApp;
+    if (channel === 'email') return settings.email;
+    return true;
+  });
+}
+
 export const dispatchNotification = async (
   input: DispatchNotificationInput
 ): Promise<{ sent: number }> => {
   const recipients = Array.from(new Set((input.recipientIds || []).filter(Boolean)));
-  const channels =
+  const requestedChannels =
     input.channels && input.channels.length > 0 ? input.channels : ['in_app', 'push'];
 
   if (recipients.length === 0) {
     return { sent: 0 };
   }
 
+  const settingsByUser = await loadNotificationSettingsForUsers(recipients);
   const dbType = mapTypeToDbType(input.type);
   const pushData = buildPushData(input);
 
-  if (channels.includes('in_app')) {
-    for (const recipientId of recipients) {
+  const inAppRecipients: string[] = [];
+  const pushRecipients: string[] = [];
+  const emailRecipients: string[] = [];
+
+  for (const recipientId of recipients) {
+    const settings =
+      settingsByUser.get(recipientId) ??
+      normalizeNotificationSettings(DEFAULT_NOTIFICATION_SETTINGS);
+    const channels = resolveChannelsForRecipient(requestedChannels, settings, input.type);
+
+    if (channels.includes('in_app')) inAppRecipients.push(recipientId);
+    if (channels.includes('push')) pushRecipients.push(recipientId);
+    if (channels.includes('email')) emailRecipients.push(recipientId);
+  }
+
+  if (inAppRecipients.length > 0) {
+    for (const recipientId of inAppRecipients) {
       try {
         const result = await query(
           `INSERT INTO notifications (
@@ -132,19 +230,24 @@ export const dispatchNotification = async (
     }
   }
 
-  if (channels.includes('push')) {
+  if (pushRecipients.length > 0) {
     setImmediate(() => {
-      sendPushToUserIds(recipients, input.title, input.body || input.title, pushData).catch(
+      sendPushToUserIds(pushRecipients, input.title, input.body || input.title, pushData).catch(
         (err) => console.warn('[dispatchNotification] push failed:', err?.message || err)
       );
     });
   }
 
-  if (channels.includes('email')) {
+  if (emailRecipients.length > 0) {
     setImmediate(() => {
       // SMTP hook placeholder
     });
   }
 
-  return { sent: recipients.length };
+  const sentRecipientIds = new Set([
+    ...inAppRecipients,
+    ...pushRecipients,
+    ...emailRecipients,
+  ]);
+  return { sent: sentRecipientIds.size };
 };

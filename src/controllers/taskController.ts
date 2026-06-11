@@ -335,7 +335,17 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
           WHERE ta3.task_id = t.id AND ta3.user_id = $1
         ) as current_user_status,
         c.id as conversation_id,
-        c.name as conversation_name
+        c.name as conversation_name,
+        (
+          SELECT m.created_at
+          FROM messages m
+          WHERE c.id IS NOT NULL
+            AND CAST(m.conversation_id AS TEXT) = CAST(c.id AS TEXT)
+            AND m.is_deleted = FALSE
+            AND m.deleted_at IS NULL
+          ORDER BY m.created_at DESC
+          LIMIT 1
+        ) as last_message_time
       FROM tasks t
       LEFT JOIN task_assignees ta ON t.id = ta.task_id
       LEFT JOIN users u ON ta.user_id = u.id

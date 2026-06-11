@@ -185,15 +185,22 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
           NULL as other_members,
           NULL as last_message,
           NULL as last_message_time,
-          0 as unread_count,
+          COALESCE((
+            SELECT COUNT(*)::integer
+            FROM messages m
+            LEFT JOIN message_status ms ON m.id = ms.message_id AND ms.user_id = $1
+            WHERE CAST(m.conversation_id AS TEXT) = CAST(cm.conversation_id AS TEXT)
+              AND m.sender_id != $1
+              AND (ms.status IS NULL OR ms.status != 'read')
+              AND m.is_deleted = FALSE
+              AND m.deleted_at IS NULL
+          ), 0) as unread_count,
           COALESCE(c.created_at, NOW()) as sort_time
         FROM conversation_members cm
         LEFT JOIN conversations c ON CAST(c.id AS TEXT) = CAST(cm.conversation_id AS TEXT)
         WHERE cm.user_id = $1
         AND (
-          -- Non-task conversations (direct or non-task groups) are always included
           COALESCE(c.is_task_group, FALSE) = FALSE
-          -- Task-group conversations are only included when they are still linked to a task
           OR (
             COALESCE(c.is_task_group, FALSE) = TRUE
             AND c.task_id IS NOT NULL

@@ -729,6 +729,8 @@ export const setupMessageHandlers = (io: Server) => {
               body: notificationBody,
               refType: 'conversation',
               refId: actualConversationId || message.id,
+              conversationId: actualConversationId,
+              isTaskGroup: !!isTaskGroup,
               io,
             });
           }
@@ -895,6 +897,7 @@ export const setupMessageHandlers = (io: Server) => {
           io.to(conversationId).emit('conversation_messages_read', {
             conversationId,
             status: 'read',
+            userId,
           });
 
           // Also emit to each member's personal room - matching message-backend: user_${userId}
@@ -902,6 +905,7 @@ export const setupMessageHandlers = (io: Server) => {
             io.to(`user_${member.user_id}`).emit('conversation_messages_read', {
               conversationId,
               status: 'read',
+              userId,
             });
           }
 
@@ -951,6 +955,7 @@ export const setupMessageHandlers = (io: Server) => {
               messageId: msg.id,
               conversationId,
               status: 'read',
+              userId,
             });
 
             // Also emit to conversation room for real-time updates
