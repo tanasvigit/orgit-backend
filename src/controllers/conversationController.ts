@@ -3,6 +3,7 @@ import { AuthRequest } from '../middleware/authMiddleware';
 import { query, getClient } from '../config/database';
 import { resolveToUrl } from '../services/s3StorageService';
 import { resolveInitialAssigneeStatus } from '../services/userTaskLifecycle';
+import { notifyNewTaskAssignees } from '../services/taskAssigneeNotification.service';
 
 let tasksDeletedAtColumnExists: boolean | null = null;
 
@@ -620,12 +621,26 @@ export const addGroupMembersHandler = async (req: AuthRequest, res: Response) =>
       }
       for (const memberId of memberIds) {
         await query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, 'member')
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET status = EXCLUDED.status`,
+           SET status = EXCLUDED.status,
+               accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [taskId, memberId, assigneeStatus]
         );
+      }
+
+      try {
+        const io = (req.app as any).get('io');
+        await notifyNewTaskAssignees({
+          io,
+          taskId,
+          conversationId,
+          newAssigneeIds: memberIds,
+          addedByUserId: userId,
+        });
+      } catch (notifyError: any) {
+        console.warn('[addGroupMembers] notify failed:', notifyError?.message || notifyError);
       }
     }
 

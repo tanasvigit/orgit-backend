@@ -13,6 +13,7 @@ import {
   isValidTransition,
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
+import { notifyNewTaskAssignees } from '../services/taskAssigneeNotification.service';
 import {
   extractBaseTitle,
   formatRecurringTitle,
@@ -1366,10 +1367,11 @@ export const createTask = async (req: AuthRequest, res: Response) => {
             ? 'reporting_member'
             : 'member';
         await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, $4)
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET status = EXCLUDED.status`,
+           SET status = EXCLUDED.status,
+               accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [task.id, assigneeId, assigneeStatus, role]
         );
       }
@@ -1378,10 +1380,11 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       // Keep creator as assignee for no-assignee creates too.
       hasAssignees = true;
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'creator')
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, $3, 'creator', CURRENT_TIMESTAMP)
          ON CONFLICT (task_id, user_id) DO UPDATE
-         SET status = EXCLUDED.status`,
+         SET status = EXCLUDED.status,
+             accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
         [task.id, taskCreatorId, assigneeStatus]
       );
     }
@@ -1444,10 +1447,11 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       for (const escalationUserId of escalationContactIds) {
         if (!escalationUserId) continue;
         await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, 'escalation_contact')
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, 'escalation_contact', CURRENT_TIMESTAMP)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET role = 'escalation_contact'`,
+           SET role = 'escalation_contact',
+               accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [task.id, escalationUserId, assigneeStatus]
         );
         await client.query(
@@ -1537,27 +1541,28 @@ export const createTask = async (req: AuthRequest, res: Response) => {
 
     await client.query('COMMIT');
 
-    // Notify task members about the auto-generated task group message on creation.
-    // Exclude the sender (task creator) from "message received" notifications.
+    // Notify all assignees (same flow as addTaskAssignees): TASK_ASSIGNED + task group unread + socket refresh.
     try {
       const io = (req.app as any).get('io');
-      const autoMessageRecipientIds = Array.from(allAssigneeIds)
-        .map((id) => String(id))
-        .filter((id) => id && id !== String(taskCreatorId));
-
-      if (autoMessageRecipientIds.length > 0) {
-        await dispatchNotification({
-          type: 'MESSAGE_RECEIVED',
-          recipientIds: autoMessageRecipientIds,
-          title: 'New task message',
-          body: `Task created by ${creatorName}`,
-          refId: conversation.id,
-          refType: 'conversation',
-          io,
-        });
+      const notifyAssigneeIds = new Set<string>(
+        Array.from(allAssigneeIds).map((id) => String(id)).filter(Boolean)
+      );
+      if (auto_escalate) {
+        for (const escalationUserId of escalationContactIds) {
+          if (escalationUserId) notifyAssigneeIds.add(String(escalationUserId));
+        }
       }
+
+      await notifyNewTaskAssignees({
+        io,
+        taskId: task.id,
+        conversationId: conversation.id,
+        newAssigneeIds: Array.from(notifyAssigneeIds),
+        addedByUserId: taskCreatorId,
+        taskTitle: task.title,
+      });
     } catch (notifyError: any) {
-      console.warn('[createTask] Auto-message notification failed:', notifyError?.message || notifyError);
+      console.warn('[createTask] Assignee notification failed:', notifyError?.message || notifyError);
     }
 
     // Fetch full task with assignees
@@ -3464,7 +3469,7 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
 
     // Check if task exists
     const taskResult = await client.query(
-      `SELECT id, created_by, creator_id, start_date FROM tasks WHERE id = $1`,
+      `SELECT id, created_by, creator_id, start_date, title FROM tasks WHERE id = $1`,
       [id]
     );
 
@@ -3502,25 +3507,27 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'All provided users are already assigned to this task' });
     }
 
-    // Insert new assignees
+    // Insert new assignees — accepted immediately (no separate accept step).
     for (const assigneeId of newAssigneeIds) {
       const assigneeStatus = resolveInitialAssigneeStatus({ startDate: task.start_date });
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'member')
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
          ON CONFLICT (task_id, user_id) DO UPDATE
-         SET status = EXCLUDED.status`,
+         SET status = EXCLUDED.status,
+             accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
         [id, assigneeId, assigneeStatus]
       );
     }
 
     // Add new assignees to task group conversation immediately (no separate accept step).
+    let conversationId: string | null = null;
     const conversationResult = await client.query(
       `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
       [id]
     );
     if (conversationResult.rows.length > 0) {
-      const conversationId = conversationResult.rows[0].id;
+      conversationId = conversationResult.rows[0].id;
       for (const assigneeId of newAssigneeIds) {
         await client.query(
           `INSERT INTO conversation_members (conversation_id, user_id, role)
@@ -3539,6 +3546,20 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
     );
 
     await client.query('COMMIT');
+
+    try {
+      const io = (req.app as any).get('io');
+      await notifyNewTaskAssignees({
+        io,
+        taskId: id,
+        conversationId,
+        newAssigneeIds,
+        addedByUserId: userId,
+        taskTitle: task.title,
+      });
+    } catch (notifyError: any) {
+      console.warn('[addTaskAssignees] notify failed:', notifyError?.message || notifyError);
+    }
 
     // Fetch updated task with all assignees
     const updatedTaskResult = await client.query(
@@ -3621,7 +3642,7 @@ export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
       await client.query('BEGIN');
 
       const taskResult = await client.query(
-        `SELECT id, created_by, creator_id, start_date FROM tasks WHERE id = $1`,
+        `SELECT id, created_by, creator_id, start_date, title FROM tasks WHERE id = $1`,
         [taskId]
       );
 
@@ -3670,20 +3691,22 @@ export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
       const assigneeStatus = resolveInitialAssigneeStatus({ startDate: task.start_date });
       for (const assigneeId of newAssigneeIds) {
         await client.query(
-          `INSERT INTO task_assignees (task_id, user_id, status, role)
-           VALUES ($1, $2, $3, 'member')
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, $3, 'member', CURRENT_TIMESTAMP)
            ON CONFLICT (task_id, user_id) DO UPDATE
-           SET status = EXCLUDED.status`,
+           SET status = EXCLUDED.status,
+               accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
           [taskId, assigneeId, assigneeStatus]
         );
       }
 
+      let conversationId: string | null = null;
       const conversationResult = await client.query(
         `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
         [taskId]
       );
       if (conversationResult.rows.length > 0) {
-        const conversationId = conversationResult.rows[0].id;
+        conversationId = conversationResult.rows[0].id;
         for (const assigneeId of newAssigneeIds) {
           await client.query(
             `INSERT INTO conversation_members (conversation_id, user_id, role)
@@ -3701,6 +3724,21 @@ export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
       );
 
       await client.query('COMMIT');
+
+      try {
+        const io = (req.app as any).get('io');
+        await notifyNewTaskAssignees({
+          io,
+          taskId,
+          conversationId,
+          newAssigneeIds,
+          addedByUserId: userId,
+          taskTitle: task.title,
+        });
+      } catch (notifyError: any) {
+        console.warn('[bulkAddTaskAssignees] notify failed:', notifyError?.message || notifyError);
+      }
+
       results.push({ task_id: taskId, success: true, added_count: newAssigneeIds.length });
     } catch (error: any) {
       await client.query('ROLLBACK');
