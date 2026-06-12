@@ -129,12 +129,17 @@ const insertSystemMessage = async (
   }
 ): Promise<{ id: string; created_at: Date }> => {
   const hasMeta = await getMessagesMetadataColumnExists();
-  if (hasMeta && params.metadata) {
+  if (hasMeta) {
     const r = await client.query(
       `INSERT INTO messages (conversation_id, sender_id, content, message_type, metadata)
        VALUES ($1, $2, $3, 'system', $4::jsonb)
        RETURNING id, created_at`,
-      [params.conversationId, params.senderId, params.content, JSON.stringify(params.metadata)]
+      [
+        params.conversationId,
+        params.senderId,
+        params.content,
+        JSON.stringify(params.metadata ?? { display: 'center' }),
+      ]
     );
     return r.rows[0];
   }
@@ -192,12 +197,18 @@ export const postTaskUserActionMessage = async (
     reason: input.reason,
   });
 
+  const messageMetadata: Record<string, unknown> = {
+    display: 'center',
+    taskAction: input.action,
+    ...(input.metadata ?? {}),
+  };
+
   const db: DbClient = input.client || { query };
   const inserted = await insertSystemMessage(db, {
     conversationId,
     senderId: input.actorUserId,
     content,
-    metadata: input.metadata ?? null,
+    metadata: messageMetadata,
   });
 
   await db.query(
@@ -225,7 +236,7 @@ export const postTaskUserActionMessage = async (
       status: 'sent',
       is_task_group: true,
       isTaskGroup: true,
-      metadata: input.metadata ?? undefined,
+      metadata: messageMetadata,
     };
     emitNewMessageToMembers(io, memberIds, payload);
 
