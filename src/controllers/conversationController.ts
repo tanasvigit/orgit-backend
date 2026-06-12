@@ -632,12 +632,15 @@ export const addGroupMembersHandler = async (req: AuthRequest, res: Response) =>
 
       try {
         const io = (req.app as any).get('io');
+        const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const actorName = actorResult.rows[0]?.name || 'User';
         await notifyNewTaskAssignees({
           io,
           taskId,
           conversationId,
           newAssigneeIds: memberIds,
           addedByUserId: userId,
+          actorName,
         });
       } catch (notifyError: any) {
         console.warn('[addGroupMembers] notify failed:', notifyError?.message || notifyError);

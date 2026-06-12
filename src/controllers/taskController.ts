@@ -14,6 +14,7 @@ import {
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
 import { notifyNewTaskAssignees } from '../services/taskAssigneeNotification.service';
+import { postTaskUserActionMessage } from '../services/taskActionMessage.service';
 import {
   extractBaseTitle,
   formatRecurringTitle,
@@ -1560,6 +1561,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         newAssigneeIds: Array.from(notifyAssigneeIds),
         addedByUserId: taskCreatorId,
         taskTitle: task.title,
+        actorName: creatorName,
       });
     } catch (notifyError: any) {
       console.warn('[createTask] Assignee notification failed:', notifyError?.message || notifyError);
@@ -1871,15 +1873,18 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
       computedAt: new Date().toISOString(),
     });
 
-    const taskAssignees = await query(`SELECT user_id FROM task_assignees WHERE task_id = $1`, [id]);
-    await dispatchNotification({
-      type: 'TASK_STATUS_CHANGED',
-      recipientIds: taskAssignees.rows.map((r: any) => r.user_id),
-      title: 'Task status updated',
-      body: `Task moved to ${status}`,
-      refId: id,
-      refType: 'task',
+    const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const actorName = actorResult.rows[0]?.name || 'User';
+    const statusAction =
+      String(status).toLowerCase() === 'completed' ? 'task_completed' : 'status_changed';
+
+    await postTaskUserActionMessage({
       io,
+      taskId: id,
+      actorUserId: userId,
+      action: statusAction,
+      actorName,
+      status,
     });
 
     res.json({ task: buildTaskWithDerivedStatus(result.rows[0]) });
@@ -2172,14 +2177,14 @@ export const completeTaskForVerification = async (req: AuthRequest, res: Respons
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'TASK_COMPLETE_PENDING',
-      recipientIds: [task.owner_id],
-      title: 'Task awaiting verification',
-      body: `${task.title} was marked complete and needs your verification.`,
-      refId: taskId,
-      refType: 'task',
+    const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const actorName = actorResult.rows[0]?.name || 'User';
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'member_completion_pending',
+      actorName,
     });
     io?.to(`task_${taskId}`).emit('task:status_changed', {
       taskId,
@@ -2248,20 +2253,16 @@ export const verifyTaskCompletion = async (req: AuthRequest, res: Response) => {
       message: 'Owner verified task completion',
     });
 
-    const recipientsResult = await client.query(
-      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
-      [taskId]
-    );
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'TASK_VERIFIED',
-      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
-      title: 'Task verified',
-      body: `${task.title} was verified by the owner.`,
-      refId: taskId,
-      refType: 'task',
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'task_completed',
+      actorName: ownerName,
     });
 
     io?.to(`task_${taskId}`).emit('task:status_changed', {
@@ -2373,22 +2374,17 @@ export const ownerCompleteTask = async (req: AuthRequest, res: Response) => {
       message: 'Owner completed the task for all members',
     });
 
-    const recipientsResult = await client.query(
-      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
-      [taskId]
-    );
-
     await client.query('COMMIT');
 
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'TASK_VERIFIED',
-      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
-      title: 'Task completed',
-      body: `${task.title} was marked completed by the owner.`,
-      refId: taskId,
-      refType: 'task',
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'task_completed',
+      actorName: ownerName,
     });
 
     io?.to(`task_${taskId}`).emit('task:status_changed', {
@@ -2466,21 +2462,17 @@ export const rejectTaskCompletion = async (req: AuthRequest, res: Response) => {
       message: `Completion rejected: ${reason}`,
     });
 
-    const recipientsResult = await client.query(
-      `SELECT user_id FROM task_assignees WHERE task_id = $1`,
-      [taskId]
-    );
-
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'TASK_COMPLETION_REJECTED',
-      recipientIds: recipientsResult.rows.map((r: any) => r.user_id),
-      title: 'Completion rejected',
-      body: reason,
-      refId: taskId,
-      refType: 'task',
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'status_changed',
+      actorName: ownerName,
+      status: 'in_progress',
     });
 
     io?.to(`task_${taskId}`).emit('task:status_changed', {
@@ -2539,18 +2531,7 @@ export const requestTaskDelete = async (req: AuthRequest, res: Response) => {
       `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
       [taskId]
     );
-    if (conversationResult.rows.length > 0) {
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: conversationResult.rows[0].id,
-        senderId: userId,
-        content: `A member asked to delete this task: ${reason}`,
-        metadata: {
-          requestType: 'task_delete',
-          requestId: persistedRequest?.id ?? null,
-          actionChips: ['approve', 'reject'],
-        },
-      });
-    }
+    const taskConversationId = conversationResult.rows[0]?.id ?? null;
 
     await logTaskActivity(client, {
       taskId,
@@ -2561,14 +2542,21 @@ export const requestTaskDelete = async (req: AuthRequest, res: Response) => {
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'DELETE_REQUEST_RECEIVED',
-      recipientIds: [task.owner_id],
-      title: 'Task delete request',
-      body: `${reason}`,
-      refId: taskId,
-      refType: 'task',
+    const requesterResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const requesterName = requesterResult.rows[0]?.name || 'User';
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'delete_requested',
+      actorName: requesterName,
+      reason,
+      conversationId: taskConversationId,
+      metadata: {
+        requestType: 'task_delete',
+        requestId: persistedRequest?.id ?? null,
+        actionChips: ['approve', 'reject'],
+      },
     });
     res.json({
       success: true,
@@ -2645,26 +2633,21 @@ export const approveTaskDeleteRequest = async (req: AuthRequest, res: Response) 
         requestId: request?.id || null,
         decision: 'approved',
       });
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: convApprove.rows[0].id,
-        senderId: userId,
-        content: 'The task owner approved deleting this task. The task has been removed.',
-        metadata: { requestType: 'task_delete_decision', decision: 'approved' },
-      });
     }
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    const notifyRequester = request?.requested_by ? [request.requested_by] : [];
-    if (notifyRequester.length > 0) {
-      await dispatchNotification({
-        type: 'TASK_DELETED',
-        recipientIds: notifyRequester,
-        title: 'Delete request approved',
-        body: `${task.title} has been deleted.`,
-        refId: taskId,
-        refType: 'task',
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    if (convApprove.rows.length > 0) {
+      await postTaskUserActionMessage({
         io,
+        taskId,
+        actorUserId: userId,
+        action: 'delete_approved',
+        actorName: ownerName,
+        conversationId: convApprove.rows[0].id,
+        metadata: { requestType: 'task_delete_decision', decision: 'approved' },
       });
     }
     res.json({ success: true, deleteRequestsPersisted: deleteRequestsTable });
@@ -2736,25 +2719,21 @@ export const denyTaskDeleteRequest = async (req: AuthRequest, res: Response) => 
         requestId: request?.id || null,
         decision: 'denied',
       });
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: convDeny.rows[0].id,
-        senderId: userId,
-        content: 'The task owner declined the request to delete this task.',
-        metadata: { requestType: 'task_delete_decision', decision: 'denied' },
-      });
     }
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    if (request?.requested_by) {
-      await dispatchNotification({
-        type: 'DELETE_REQUEST_RECEIVED',
-        recipientIds: [request.requested_by],
-        title: 'Delete request denied',
-        body: `${task.title} delete request was denied.`,
-        refId: taskId,
-        refType: 'task',
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    if (convDeny.rows.length > 0) {
+      await postTaskUserActionMessage({
         io,
+        taskId,
+        actorUserId: userId,
+        action: 'delete_denied',
+        actorName: ownerName,
+        conversationId: convDeny.rows[0].id,
+        metadata: { requestType: 'task_delete_decision', decision: 'denied' },
       });
     }
     res.json({ success: true, deleteRequestsPersisted: deleteRequestsTableDeny });
@@ -2809,19 +2788,8 @@ export const createExitRequest = async (req: AuthRequest, res: Response) => {
       `SELECT id FROM conversations WHERE task_id = $1 AND is_task_group = TRUE LIMIT 1`,
       [taskId]
     );
-    if (conversationResult.rows.length > 0) {
-      const taskConversationId = conversationResult.rows[0].id;
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: taskConversationId,
-        senderId: userId,
-        content: `${requesterName} requested task exit`,
-        metadata: {
-          requestType: 'task_exit',
-          requestId: requestResult.rows[0].id,
-          actionChips: ['approve', 'reject'],
-        },
-      });
-
+    const taskConversationId = conversationResult.rows[0]?.id ?? null;
+    if (taskConversationId) {
       // Keep user's comment as a regular chat bubble below the centered system request.
       await client.query(
         `INSERT INTO messages (conversation_id, sender_id, content, message_type)
@@ -2839,14 +2807,18 @@ export const createExitRequest = async (req: AuthRequest, res: Response) => {
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'EXIT_REQUEST_RECEIVED',
-      recipientIds: [task.owner_id],
-      title: 'Task exit request',
-      body: comment,
-      refId: taskId,
-      refType: 'task',
+    await postTaskUserActionMessage({
       io,
+      taskId,
+      actorUserId: userId,
+      action: 'exit_requested',
+      actorName: requesterName,
+      conversationId: taskConversationId,
+      metadata: {
+        requestType: 'task_exit',
+        requestId: requestResult.rows[0].id,
+        actionChips: ['approve', 'reject'],
+      },
     });
     res.json({ success: true, request: requestResult.rows[0] });
   } catch (error: any) {
@@ -2923,25 +2895,25 @@ export const approveExitRequest = async (req: AuthRequest, res: Response) => {
         requestId,
         decision: 'approved',
       });
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: convApproveExit.rows[0].id,
-        senderId: userId,
-        content: `${assigneeName} exited this task group.`,
-        metadata: { requestType: 'task_exit_decision', requestId, decision: 'approved' },
-      });
     }
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'EXIT_APPROVED',
-      recipientIds: [request.assignee_id],
-      title: 'Exit approved',
-      body: `You have been released from ${task.title}.`,
-      refId: taskId,
-      refType: 'task',
-      io,
-    });
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    if (convApproveExit.rows.length > 0) {
+      await postTaskUserActionMessage({
+        io,
+        taskId,
+        actorUserId: userId,
+        action: 'exit_approved',
+        actorName: ownerName,
+        targetName: assigneeName,
+        targetUserId: request.assignee_id,
+        conversationId: convApproveExit.rows[0].id,
+        metadata: { requestType: 'task_exit_decision', requestId, decision: 'approved' },
+      });
+    }
     res.json({ success: true });
   } catch (error: any) {
     await client.query('ROLLBACK');
@@ -3010,25 +2982,25 @@ export const rejectExitRequest = async (req: AuthRequest, res: Response) => {
         requestId,
         decision: 'rejected',
       });
-      await insertSystemMessageOptionalMetadata(client, {
-        conversationId: convRejectExit.rows[0].id,
-        senderId: userId,
-        content: `Exit request from ${assigneeName} was rejected.`,
-        metadata: { requestType: 'task_exit_decision', requestId, decision: 'rejected' },
-      });
     }
 
     await client.query('COMMIT');
     const io = (req.app as any).get('io');
-    await dispatchNotification({
-      type: 'EXIT_REJECTED',
-      recipientIds: [request.assignee_id],
-      title: 'Exit rejected',
-      body: `Exit request for ${task.title} was rejected.`,
-      refId: taskId,
-      refType: 'task',
-      io,
-    });
+    const ownerResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+    const ownerName = ownerResult.rows[0]?.name || 'User';
+    if (convRejectExit.rows.length > 0) {
+      await postTaskUserActionMessage({
+        io,
+        taskId,
+        actorUserId: userId,
+        action: 'exit_rejected',
+        actorName: ownerName,
+        targetName: assigneeName,
+        targetUserId: request.assignee_id,
+        conversationId: convRejectExit.rows[0].id,
+        metadata: { requestType: 'task_exit_decision', requestId, decision: 'rejected' },
+      });
+    }
     res.json({ success: true });
   } catch (error: any) {
     await client.query('ROLLBACK');
@@ -3127,6 +3099,19 @@ export const markMemberComplete = async (req: AuthRequest, res: Response) => {
       });
 
       await client.query('COMMIT');
+      const io = (req.app as any).get('io');
+      await postTaskUserActionMessage({
+        io,
+        taskId,
+        actorUserId: userId,
+        action: 'task_completed',
+        actorName: userName,
+      });
+      io?.to(`task_${taskId}`).emit('task:status_changed', {
+        taskId,
+        toStatus: 'completed',
+        computedAt: new Date().toISOString(),
+      });
       res.json({ message: 'Task completed. The entire task has been marked as completed.', taskCompleted: true });
     } else {
       // Regular assignee - mark as complete (pending verification)
@@ -3146,6 +3131,14 @@ export const markMemberComplete = async (req: AuthRequest, res: Response) => {
       });
 
       await client.query('COMMIT');
+      const io = (req.app as any).get('io');
+      await postTaskUserActionMessage({
+        io,
+        taskId,
+        actorUserId: userId,
+        action: 'member_completion_pending',
+        actorName: userName,
+      });
       res.json({ message: 'Task marked as complete. Waiting for verification.' });
     }
   } catch (error: any) {
@@ -3311,6 +3304,29 @@ export const verifyMemberCompletion = async (req: AuthRequest, res: Response) =>
     }
 
     await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await postTaskUserActionMessage({
+      io,
+      taskId,
+      actorUserId: userId,
+      action: 'completion_verified',
+      actorName: verifierName,
+      targetName: userName,
+      targetUserId,
+    });
+    if (allCompletedAndVerified) {
+      await postTaskUserActionMessage({
+        io,
+        taskId,
+        actorUserId: userId,
+        action: 'task_completed',
+      });
+      io?.to(`task_${taskId}`).emit('task:status_changed', {
+        taskId,
+        toStatus: 'completed',
+        computedAt: new Date().toISOString(),
+      });
+    }
     res.json({ message: 'Completion verified successfully', allCompleted: allCompletedAndVerified });
   } catch (error: any) {
     await client.query('ROLLBACK');
@@ -3436,6 +3452,16 @@ export const reassignMember = async (req: AuthRequest, res: Response) => {
     });
 
     await client.query('COMMIT');
+    const io = (req.app as any).get('io');
+    await postTaskUserActionMessage({
+      io,
+      taskId,
+      actorUserId: userId,
+      action: 'member_reassigned',
+      actorName,
+      targetName,
+      targetUserId,
+    });
     res.json({ message: 'Task reassigned successfully' });
   } catch (error: any) {
     await client.query('ROLLBACK');
@@ -3549,6 +3575,8 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
 
     try {
       const io = (req.app as any).get('io');
+      const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+      const actorName = actorResult.rows[0]?.name || 'User';
       await notifyNewTaskAssignees({
         io,
         taskId: id,
@@ -3556,6 +3584,7 @@ export const addTaskAssignees = async (req: AuthRequest, res: Response) => {
         newAssigneeIds,
         addedByUserId: userId,
         taskTitle: task.title,
+        actorName,
       });
     } catch (notifyError: any) {
       console.warn('[addTaskAssignees] notify failed:', notifyError?.message || notifyError);
@@ -3727,6 +3756,8 @@ export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
 
       try {
         const io = (req.app as any).get('io');
+        const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [userId]);
+        const actorName = actorResult.rows[0]?.name || 'User';
         await notifyNewTaskAssignees({
           io,
           taskId,
@@ -3734,6 +3765,7 @@ export const bulkAddTaskAssignees = async (req: AuthRequest, res: Response) => {
           newAssigneeIds,
           addedByUserId: userId,
           taskTitle: task.title,
+          actorName,
         });
       } catch (notifyError: any) {
         console.warn('[bulkAddTaskAssignees] notify failed:', notifyError?.message || notifyError);

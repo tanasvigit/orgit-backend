@@ -1,5 +1,6 @@
 import { query } from '../config/database';
 import { dispatchNotification } from './notification-bus.service';
+import { postTaskUserActionMessage } from './taskActionMessage.service';
 
 export type NotifyNewTaskAssigneesInput = {
   io?: any;
@@ -8,6 +9,7 @@ export type NotifyNewTaskAssigneesInput = {
   newAssigneeIds: string[];
   addedByUserId?: string | null;
   taskTitle?: string | null;
+  actorName?: string | null;
 };
 
 /**
@@ -22,6 +24,13 @@ export async function notifyNewTaskAssignees(
   );
 
   if (recipients.length === 0) return;
+
+  let actorName = String(input.actorName || '').trim();
+  if (!actorName && input.addedByUserId) {
+    const actorResult = await query(`SELECT name FROM users WHERE id = $1`, [input.addedByUserId]);
+    actorName = actorResult.rows[0]?.name || 'User';
+  }
+  if (!actorName) actorName = 'User';
 
   let taskTitle = String(input.taskTitle || '').trim();
   if (!taskTitle) {
@@ -54,21 +63,19 @@ export async function notifyNewTaskAssignees(
     console.warn('[notifyNewTaskAssignees] TASK_ASSIGNED failed:', error?.message || error);
   }
 
-  if (conversationId) {
+  if (conversationId && input.addedByUserId) {
     try {
-      await dispatchNotification({
-        type: 'MESSAGE_RECEIVED',
-        recipientIds: recipients,
-        title: 'New task message',
-        body: `You were added to the task group: ${taskTitle}`,
-        refId: conversationId,
-        refType: 'conversation',
-        isTaskGroup: true,
-        conversationId,
+      await postTaskUserActionMessage({
         io,
+        taskId: input.taskId,
+        actorUserId: input.addedByUserId,
+        action: 'assignees_added',
+        actorName,
+        count: input.newAssigneeIds.length,
+        conversationId,
       });
     } catch (error: any) {
-      console.warn('[notifyNewTaskAssignees] MESSAGE_RECEIVED failed:', error?.message || error);
+      console.warn('[notifyNewTaskAssignees] task chat message failed:', error?.message || error);
     }
   }
 
