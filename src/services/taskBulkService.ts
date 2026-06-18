@@ -730,10 +730,11 @@ export async function createTaskFromPayload(
         : 'member';
 
     await client.query(
-      `INSERT INTO task_assignees (task_id, user_id, status, role)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
        ON CONFLICT (task_id, user_id) DO UPDATE
-       SET status = EXCLUDED.status`,
+       SET status = EXCLUDED.status,
+           accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
       [task.id, assigneeId, initialAssigneeStatus, role]
     );
   }
@@ -840,9 +841,11 @@ export async function createTaskFromPayload(
     const uniqueEscalationContacts = Array.from(new Set(escalationContactIds.filter(Boolean)));
     for (const escalationUserId of uniqueEscalationContacts) {
       await client.query(
-        `INSERT INTO task_assignees (task_id, user_id, status, role)
-         VALUES ($1, $2, $3, 'escalation_contact')
-         ON CONFLICT (task_id, user_id) DO NOTHING`,
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, $3, 'escalation_contact', CURRENT_TIMESTAMP)
+         ON CONFLICT (task_id, user_id) DO UPDATE
+         SET status = EXCLUDED.status,
+             accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
         [task.id, escalationUserId, initialAssigneeStatus]
       );
       if (conversationId) {

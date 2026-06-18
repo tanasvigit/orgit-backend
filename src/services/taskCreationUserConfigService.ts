@@ -7,6 +7,7 @@ export const TASK_CARD_DISPLAY_FIELD_KEYS = [
   'dueDate',
   'frequency',
   'taskUnit',
+  'assigneeProfiles',
   'unreadBadge',
   'overdueBadge',
 ] as const;
@@ -22,6 +23,7 @@ export const DEFAULT_TASK_CARD_DISPLAY: TaskCardDisplayConfig = {
   dueDate: true,
   frequency: true,
   taskUnit: true,
+  assigneeProfiles: true,
   unreadBadge: true,
   overdueBadge: true,
 };

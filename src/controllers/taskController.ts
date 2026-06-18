@@ -1841,15 +1841,39 @@ export const updateTaskStatus = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Failed to update task' });
     }
 
-    // When setting task to in_progress, also set current user's task_assignees row to inprogress (and accepted_at if not set)
-    // so dashboard "In Progress" click keeps assignee status in sync with task status
+    // Shared assignee status rule:
+    // if any member sets task to in_progress/completed, all task members mirror that status,
+    // including task owner (even for legacy tasks where owner row may be missing in task_assignees).
     if (status === 'in_progress') {
+      await query(
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, 'inprogress', 'creator', CURRENT_TIMESTAMP)
+         ON CONFLICT (task_id, user_id) DO UPDATE
+         SET status = EXCLUDED.status,
+             accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+        [id, task.creator_id]
+      );
       await query(
         `UPDATE task_assignees 
          SET accepted_at = COALESCE(accepted_at, CURRENT_TIMESTAMP),
              status = 'inprogress'
-         WHERE task_id = $1 AND user_id = $2`,
-        [id, userId]
+         WHERE task_id = $1`,
+        [id]
+      );
+    } else if (status === 'completed') {
+      await query(
+        `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+         VALUES ($1, $2, 'completed', 'creator', CURRENT_TIMESTAMP)
+         ON CONFLICT (task_id, user_id) DO UPDATE
+         SET status = EXCLUDED.status,
+             accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+        [id, task.creator_id]
+      );
+      await query(
+        `UPDATE task_assignees
+         SET status = 'completed'
+         WHERE task_id = $1`,
+        [id]
       );
     }
 
@@ -2240,10 +2264,19 @@ export const verifyTaskCompletion = async (req: AuthRequest, res: Response) => {
 
     await client.query(
       `UPDATE task_assignees
-       SET verified_at = CURRENT_TIMESTAMP,
+       SET verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP),
            status = 'completed'
-       WHERE task_id = $1 AND completed_at IS NOT NULL`,
+       WHERE task_id = $1`,
       [taskId]
+    );
+    await client.query(
+      `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at, verified_at)
+       VALUES ($1, $2, 'completed', 'creator', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (task_id, user_id) DO UPDATE
+       SET status = EXCLUDED.status,
+           accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP),
+           verified_at = COALESCE(task_assignees.verified_at, CURRENT_TIMESTAMP)`,
+      [taskId, task.owner_id]
     );
 
     await logTaskActivity(client, {
@@ -2353,6 +2386,16 @@ export const ownerCompleteTask = async (req: AuthRequest, res: Response) => {
            status = 'completed'
        WHERE task_id = $1`,
       [taskId]
+    );
+    await client.query(
+      `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at, completed_at, verified_at)
+       VALUES ($1, $2, 'completed', 'creator', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (task_id, user_id) DO UPDATE
+       SET status = EXCLUDED.status,
+           accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP),
+           completed_at = COALESCE(task_assignees.completed_at, CURRENT_TIMESTAMP),
+           verified_at = COALESCE(task_assignees.verified_at, CURRENT_TIMESTAMP)`,
+      [taskId, task.owner_id]
     );
 
     const updatedTask = await client.query(
@@ -3293,6 +3336,22 @@ export const verifyMemberCompletion = async (req: AuthRequest, res: Response) =>
     if (allCompletedAndVerified) {
       await client.query(
         `UPDATE tasks SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [taskId]
+      );
+      if (creatorId) {
+        await client.query(
+          `INSERT INTO task_assignees (task_id, user_id, status, role, accepted_at)
+           VALUES ($1, $2, 'completed', 'creator', CURRENT_TIMESTAMP)
+           ON CONFLICT (task_id, user_id) DO UPDATE
+           SET status = EXCLUDED.status,
+               accepted_at = COALESCE(task_assignees.accepted_at, CURRENT_TIMESTAMP)`,
+          [taskId, creatorId]
+        );
+      }
+      await client.query(
+        `UPDATE task_assignees
+         SET status = 'completed'
+         WHERE task_id = $1`,
         [taskId]
       );
       await logTaskActivity(client, {

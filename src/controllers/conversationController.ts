@@ -149,7 +149,6 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
                 JOIN tasks t ON t.id = ta.task_id
                 WHERE ta.task_id = c.task_id
                   AND ta.user_id = $1
-                  AND ta.accepted_at IS NOT NULL
                   AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
               )
             )
@@ -219,7 +218,6 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
                 JOIN tasks t ON t.id = ta.task_id
                 WHERE ta.task_id = c.task_id
                   AND ta.user_id = $1
-                  AND ta.accepted_at IS NOT NULL
                   AND COALESCE(t.status, '') != 'deleted'${activeTaskByIdClause}
               )
             )

@@ -81,9 +81,9 @@ export const isValidTransition = (
   if (fromStatus === toStatus) return true;
 
   const allowedTransitions: Record<StoredTaskStatus, StoredTaskStatus[]> = {
-    // Allow direct start from TODO when user taps explicit "Mark as In Progress".
-    todo: ['active', 'in_progress', 'deleted'],
-    active: ['in_progress', 'deleted'],
+    // Allow assignees to mark complete directly from TODO/ACTIVE without a manual in-progress step.
+    todo: ['active', 'in_progress', 'pending_verification', 'deleted'],
+    active: ['in_progress', 'pending_verification', 'deleted'],
     in_progress: ['pending_verification', 'deleted'],
     pending_verification: ['completed', 'in_progress', 'deleted'],
     completed: ['deleted'],
