@@ -127,7 +127,7 @@ export const resolveUserLifecycleCategory = (
 
   const fromStatus = normalizeAssigneeLifecycleStatus(rawAssigneeStatus);
   if (fromStatus === 'completed') {
-    return 'completed';
+    return 'inprogress';
   }
 
   if (startMs != null && todayMs != null && todayMs < startMs) {

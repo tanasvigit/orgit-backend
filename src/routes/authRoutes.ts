@@ -6,6 +6,7 @@ import {
   setupProfile,
   syncUserContacts,
   getCurrentUser,
+  getRegisterCaptcha,
   register,
   getUserById,
   changePassword,
@@ -116,6 +117,9 @@ router.post(
   resetPasswordWithOTP
 );
 
+// Registration captcha challenge (public)
+router.get('/register-captcha', getRegisterCaptcha);
+
 // Register endpoint for mobile app (name: XSS-safe, 2-50 chars, letters/numbers/spaces/hyphens/apostrophes)
 router.post(
   '/register',
@@ -132,6 +136,16 @@ router.post(
       .trim()
       .isLength({ min: 1 })
       .withMessage('Password is required'),
+    body('captchaId')
+      .trim()
+      .isLength({ min: 1 })
+      .withMessage('Captcha is required'),
+    body('captchaAnswer')
+      .trim()
+      .isLength({ min: 5, max: 5 })
+      .withMessage('Captcha must be 5 characters')
+      .matches(/^[23456789A-Za-z]{5}$/)
+      .withMessage('Captcha must contain only letters and numbers'),
     body('role')
       .optional()
       .isIn(['admin', 'employee'])

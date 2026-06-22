@@ -391,6 +391,7 @@ async function notifyRecurrenceCreated(
         body: `You have been assigned: ${params.taskTitle}`,
         refId: params.taskId,
         refType: 'task',
+        channels: ['in_app'],
         io,
       });
     } catch (error: any) {
@@ -407,6 +408,7 @@ async function notifyRecurrenceCreated(
         body: params.welcomeMessage,
         refId: params.conversationId,
         refType: 'conversation',
+        channels: ['in_app'],
         io,
       });
     } catch (error: any) {

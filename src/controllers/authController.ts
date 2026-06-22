@@ -15,6 +15,27 @@ import {
   loadMembershipContext,
   getEffectivePermissions,
 } from '../services/employeePermissionService';
+import {
+  createRegistrationCaptcha,
+  verifyRegistrationCaptcha,
+} from '../services/registrationCaptchaService';
+
+export const getRegisterCaptcha = async (_req: Request, res: Response) => {
+  try {
+    const { captchaId, code } = createRegistrationCaptcha();
+    return res.json({
+      success: true,
+      captchaId,
+      code,
+    });
+  } catch (error: any) {
+    console.error('[getRegisterCaptcha] failed:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to generate captcha',
+    });
+  }
+};
 
 function membershipFieldsForRole(role: string, userId: string) {
   return loadMembershipContext(userId).then((ctx) => ({
@@ -692,7 +713,15 @@ export const setupProfile = async (req: Request, res: Response) => {
  */
 export const register = async (req: Request, res: Response) => {
   try {
-    const { name, phone, password } = req.body;
+    const { name, phone, password, captchaId, captchaAnswer } = req.body;
+
+    const captchaCheck = verifyRegistrationCaptcha(captchaId, captchaAnswer);
+    if (!captchaCheck.valid) {
+      return res.status(400).json({
+        success: false,
+        error: captchaCheck.error || 'Invalid captcha',
+      });
+    }
 
     const nameCheck = validateName(name);
     if (!nameCheck.valid) {

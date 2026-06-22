@@ -260,6 +260,9 @@ describe('generateNextRecurrence', () => {
     expect(String(assigneeInsert?.[0])).toContain('accepted_at');
 
     expect(dispatchNotification).toHaveBeenCalled();
+    expect(dispatchNotification).toHaveBeenCalledWith(
+      expect.objectContaining({ channels: ['in_app'] })
+    );
     expect(logTaskActivity).toHaveBeenCalled();
     expect(io.to).toHaveBeenCalled();
   });

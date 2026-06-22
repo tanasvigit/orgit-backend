@@ -3157,10 +3157,13 @@ export const markMemberComplete = async (req: AuthRequest, res: Response) => {
       });
       res.json({ message: 'Task completed. The entire task has been marked as completed.', taskCompleted: true });
     } else {
-      // Regular assignee - mark as complete (pending verification)
+      // Regular assignee - mark complete (pending approval). Keep lifecycle status unchanged;
+      // completed_at + null verified_at signals awaiting owner/reporting member approval.
       await client.query(
         `UPDATE task_assignees 
-         SET completed_at = CURRENT_TIMESTAMP, verified_at = NULL, status = 'completed'
+         SET completed_at = CURRENT_TIMESTAMP,
+             verified_at = NULL,
+             status = CASE WHEN status = 'completed' THEN 'inprogress' ELSE status END
          WHERE task_id = $1 AND user_id = $2`,
         [taskId, userId]
       );
@@ -3286,7 +3289,8 @@ export const verifyMemberCompletion = async (req: AuthRequest, res: Response) =>
     // Verify the completion
     await client.query(
       `UPDATE task_assignees 
-       SET verified_at = CURRENT_TIMESTAMP
+       SET verified_at = CURRENT_TIMESTAMP,
+           status = 'completed'
        WHERE task_id = $1 AND user_id = $2`,
       [taskId, targetUserId]
     );

@@ -128,7 +128,7 @@ async function persistLastDigestAt(userId: string, at: Date): Promise<void> {
 
 /**
  * At each user's configured local time, send a mobile push summarizing tasks created/assigned since midnight.
- * Display preference only — immediate task events may still push separately.
+ * Auto-generated recurring tasks only create in-app notifications immediately; mobile push is sent here.
  */
 export async function processTaskPushDigests(io?: any): Promise<void> {
   const usersResult = await query(

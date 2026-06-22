@@ -38,7 +38,7 @@ const toMemberStatus = (assignee: AssigneeLike): MemberStatus => {
     return 'VERIFIED';
   }
   if (assignee.completed_at) {
-    return 'COMPLETED';
+    return 'IN_PROGRESS';
   }
   // Prefer task_assignees.status (assignee_status) when present so API matches DB
   const raw = (assignee.assignee_status || '').toLowerCase();
