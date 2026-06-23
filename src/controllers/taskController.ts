@@ -14,6 +14,7 @@ import {
 } from '../services/task-status-engine.service';
 import { dispatchNotification } from '../services/notification-bus.service';
 import { notifyNewTaskAssignees } from '../services/taskAssigneeNotification.service';
+import { enrichTaskWithResolvedProfilePhotos } from '../utils/profilePhotoUtils';
 import { postTaskUserActionMessage } from '../services/taskActionMessage.service';
 import {
   extractBaseTitle,
@@ -347,10 +348,13 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
             AND m.deleted_at IS NULL
           ORDER BY m.created_at DESC
           LIMIT 1
-        ) as last_message_time
+        ) as last_message_time,
+        creator.name as creator_name,
+        creator.profile_photo_url as creator_photo
       FROM tasks t
       LEFT JOIN task_assignees ta ON t.id = ta.task_id
       LEFT JOIN users u ON ta.user_id = u.id
+      LEFT JOIN users creator ON COALESCE(t.created_by, t.creator_id) = creator.id
       LEFT JOIN conversations c ON c.task_id = t.id AND c.is_task_group = TRUE
       LEFT JOIN client_entities ce ON t.client_entity_id = ce.id
       WHERE (
@@ -411,7 +415,7 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     }
 
     querySQL += `
-      GROUP BY t.id, c.id, c.name
+      GROUP BY t.id, c.id, c.name, creator.name, creator.profile_photo_url
       ORDER BY 
         t.due_date ASC NULLS LAST,
         t.created_at DESC
@@ -425,18 +429,19 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
     res.setHeader('Pragma', 'no-cache');
 
     const rowsWithStatus = result.rows.map((row: any) => {
-      const assignees = Array.isArray(row.assignees) ? row.assignees : [];
-      const computed = computeTaskAndMemberStatuses(row, assignees, userId);
+      const enrichedRow = enrichTaskWithResolvedProfilePhotos(row);
+      const assignees = Array.isArray(enrichedRow.assignees) ? enrichedRow.assignees : [];
+      const computed = computeTaskAndMemberStatuses(enrichedRow, assignees, userId);
       const totalAssignees =
-        row.total_assignees != null
-          ? Number(row.total_assignees)
+        enrichedRow.total_assignees != null
+          ? Number(enrichedRow.total_assignees)
           : Array.isArray(assignees)
           ? assignees.length
           : 0;
       const hideUserStatus =
-        !row.start_date &&
-        !row.target_date &&
-        !row.due_date &&
+        !enrichedRow.start_date &&
+        !enrichedRow.target_date &&
+        !enrichedRow.due_date &&
         Number.isFinite(totalAssignees) &&
         totalAssignees === 0;
       const currentUserAssignee = assignees.find((a: any) => {
@@ -445,15 +450,15 @@ export const getTasks = async (req: AuthRequest, res: Response) => {
       });
       const currentUserLifecycleStatus = resolveUserLifecycleCategory({
         assigneeStatus:
-          row.current_user_status?.assignee_status ?? currentUserAssignee?.assignee_status,
+          enrichedRow.current_user_status?.assignee_status ?? currentUserAssignee?.assignee_status,
         verifiedAt: currentUserAssignee?.verified_at,
-        startDate: row.start_date,
-        targetDate: row.target_date,
-        dueDate: row.due_date,
+        startDate: enrichedRow.start_date,
+        targetDate: enrichedRow.target_date,
+        dueDate: enrichedRow.due_date,
         dueSoonDays,
       });
       return {
-        ...buildTaskWithDerivedStatus(row),
+        ...buildTaskWithDerivedStatus(enrichedRow),
         task_status: computed.taskStatus,
         member_statuses: computed.memberStatuses,
         current_user_member_status: computed.currentUserMemberStatus,
@@ -587,7 +592,7 @@ export const getTask = async (req: AuthRequest, res: Response) => {
       [id]
     );
 
-    const task = taskResult.rows[0];
+    const task = enrichTaskWithResolvedProfilePhotos(taskResult.rows[0]);
     task.activities = activitiesResult.rows;
     // Ensure creator_id is set for frontend (task owner; used for Verify button visibility)
     if (!task.creator_id && task.created_by) {
