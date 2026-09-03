@@ -54,15 +54,23 @@ export function employeeMasterUserSelectSql(hasProfile: boolean): string {
   return `u.employee_code, u.email, u.date_of_birth, u.gender, u.address, u.pan_number`;
 }
 
-export function employeeMasterMembershipSelectSql(hasProfile: boolean): string {
+export function employeeMasterMembershipSelectSql(
+  hasProfile: boolean,
+  hasDesignation = true
+): string {
+  const designationExpr = hasDesignation ? 'uo.designation' : 'NULL::text AS designation';
   if (!hasProfile) {
     return `NULL::date AS date_of_joining, NULL::text AS employment_type,
-            uo.designation AS designation_legacy,
+            ${hasDesignation ? 'uo.designation' : 'NULL::text'} AS designation,
             NULL::uuid AS work_location_node_id,
             '{}'::jsonb AS employee_permissions,
             '{}'::jsonb AS notification_settings`;
   }
-  return `uo.date_of_joining, uo.employment_type, uo.designation,
+  if (hasDesignation) {
+    return `uo.date_of_joining, uo.employment_type, uo.designation,
+            uo.work_location_node_id, uo.employee_permissions, uo.notification_settings`;
+  }
+  return `uo.date_of_joining, uo.employment_type, ${designationExpr},
           uo.work_location_node_id, uo.employee_permissions, uo.notification_settings`;
 }
 
@@ -144,8 +152,10 @@ export async function applyMembershipProfileFields(
     params.push(normalizeEmploymentType(payload.employmentType));
   }
   if (payload.designation !== undefined) {
-    sets.push(`designation = NULLIF($${i++}, '')`);
-    params.push(payload.designation);
+    if (caps.hasDesignation) {
+      sets.push(`designation = NULLIF($${i++}, '')`);
+      params.push(payload.designation);
+    }
   }
   if (payload.workLocationNodeId !== undefined) {
     sets.push(`work_location_node_id = $${i++}::uuid`);

@@ -59,6 +59,7 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
           c.name,
           COALESCE(c.is_group, FALSE) as is_group,
           COALESCE(c.is_task_group, FALSE) as is_task_group,
+          CAST(c.task_id AS TEXT) as task_id,
           c.group_photo,
           COALESCE(c.created_at, NOW()) as created_at,
           COALESCE(cm.is_pinned, FALSE) as is_pinned,
@@ -159,7 +160,7 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
           OR ($2 = 'chat' AND COALESCE(c.is_task_group, FALSE) = FALSE)
           OR ($2 = 'task' AND COALESCE(c.is_task_group, FALSE) = TRUE)
         )
-        GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.group_photo, c.created_at, cm.is_pinned, cm.role
+        GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.task_id, c.group_photo, c.created_at, cm.is_pinned, cm.role
         ORDER BY 
           COALESCE(cm.is_pinned, FALSE) DESC, 
           sort_time DESC NULLS LAST`,
@@ -178,6 +179,7 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
           c.name,
           COALESCE(c.is_group, FALSE) as is_group,
           COALESCE(c.is_task_group, FALSE) as is_task_group,
+          CAST(c.task_id AS TEXT) as task_id,
           c.group_photo,
           COALESCE(c.created_at, NOW()) as created_at,
           COALESCE(cm.is_pinned, FALSE) as is_pinned,
@@ -228,7 +230,7 @@ export const getConversations = async (req: AuthRequest, res: Response) => {
           OR ($2 = 'chat' AND COALESCE(c.is_task_group, FALSE) = FALSE)
           OR ($2 = 'task' AND COALESCE(c.is_task_group, FALSE) = TRUE)
         )
-        GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.group_photo, c.created_at, cm.is_pinned, cm.role
+        GROUP BY cm.conversation_id, c.name, c.is_group, c.is_task_group, c.task_id, c.group_photo, c.created_at, cm.is_pinned, cm.role
         ORDER BY COALESCE(cm.is_pinned, FALSE) DESC, sort_time DESC`,
           [userId, scope]
         );

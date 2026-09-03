@@ -3,19 +3,19 @@
  *
  * - Uses DB credentials from .env
  * - Applies database/schema.sql first
- * - Then applies every *.sql file in /migrations (sorted by filename)
+ * - Then applies every *.sql file in /migrations in dependency order (ORDER.json)
  * - Tracks applied files in schema_migrations so it is safe to re-run
  *
- * Usage (from orgit-api folder):
- *   node scripts/bootstrap-db.js
+ * Usage (from orgit-backend folder):
+ *   npm run db:bootstrap
  */
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const { Client } = require('pg');
+const { listMigrationFiles } = require('./lib/migrationFiles');
 
 const schemaPath = path.join(__dirname, '..', 'database', 'schema.sql');
-const migrationsDir = path.join(__dirname, '..', 'migrations');
 
 function readSql(filePath) {
   return fs.readFileSync(filePath, 'utf8');
@@ -80,20 +80,11 @@ async function run() {
 
     await ensureMigrationsTable(client);
 
-    // Apply base schema (tracked as a migration entry too)
     await applySqlFile(client, schemaPath);
 
-    // Apply all migrations in filename order
-    const migrationFiles = fs
-      .readdirSync(migrationsDir)
-      .filter((f) => f.toLowerCase().endsWith('.sql'))
-      .sort((a, b) => a.localeCompare(b))
-      .map((f) => path.join(migrationsDir, f));
-
+    const migrationFiles = listMigrationFiles({ warn: true });
     for (const file of migrationFiles) {
-      // Avoid re-applying the consolidated helper scripts if you don’t want them.
-      // They are safe to run, but they may duplicate work already covered by other migrations.
-      await applySqlFile(client, file);
+      await applySqlFile(client, file.fullPath);
     }
 
     console.log('Bootstrap complete.');
@@ -106,4 +97,3 @@ async function run() {
 }
 
 run();
-

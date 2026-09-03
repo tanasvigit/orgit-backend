@@ -644,7 +644,7 @@ export async function getOrganizationUsers(organizationId: string) {
     `SELECT 
       u.id, u.mobile, u.name, u.role, u.status, u.profile_photo_url, u.bio,
       u.created_at, u.updated_at,
-      uo.department, uo.designation, uo.reporting_to
+      uo.designation, uo.reporting_to
     FROM users u
     INNER JOIN user_organizations uo ON u.id = uo.user_id
     WHERE uo.organization_id = $1
@@ -660,7 +660,7 @@ export async function getOrganizationUsers(organizationId: string) {
     status: row.status,
     profilePhotoUrl: row.profile_photo_url,
     bio: row.bio,
-    department: row.department,
+    department: null,
     designation: row.designation,
     reportingTo: row.reporting_to,
     createdAt: row.created_at.toISOString(),

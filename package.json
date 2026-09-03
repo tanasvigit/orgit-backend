@@ -11,6 +11,8 @@
     "migrate:status": "node scripts/migrate-status.js",
     "migrate:baseline": "node scripts/migrate-baseline.js",
     "migrate:create": "node scripts/migrate-create.js",
+    "migrate:check-order": "node scripts/migrate-check-order.js",
+    "db:smoke": "node scripts/bootstrap-smoke.js",
     "migrate:fix-branches": "node scripts/run-fix-migration.js",
     "migrate:entity-master": "node scripts/run-entity-master-migration.js",
     "migrate:employee-master": "node scripts/run-employee-master-migration.js",

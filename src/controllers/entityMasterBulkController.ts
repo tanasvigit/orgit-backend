@@ -164,6 +164,11 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
         createdAt: status.createdAt,
         updatedAt: status.updatedAt,
         completedAt: status.completedAt,
+        ...(status.totalRows != null ? { totalRows: status.totalRows } : {}),
+        ...(status.uploadType ? { uploadType: status.uploadType } : {}),
+        ...(status.filename ? { filename: status.filename } : {}),
+        ...(status.phase ? { phase: status.phase } : {}),
+        ...(status.tasksProgress ? { tasksProgress: status.tasksProgress } : {}),
         ...(status.summary ? { summary: status.summary } : {}),
         ...(status.errors && status.errors.length > 0 ? { errors: status.errors } : {}),
       },
@@ -173,6 +178,47 @@ export async function getStatus(req: AuthRequest, res: Response): Promise<void> 
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to get status',
+    });
+  }
+}
+
+/**
+ * GET /api/admin/entity-master/uploads
+ * Recent bulk uploads for the admin's organization (history + analytics).
+ */
+export async function listUploads(req: AuthRequest, res: Response): Promise<void> {
+  try {
+    if (!req.user) {
+      return void res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    let organizationId = req.user.organizationId || null;
+    if (!organizationId) {
+      const orgResult = await query(
+        'SELECT organization_id FROM user_organizations WHERE user_id = $1 LIMIT 1',
+        [req.user.userId]
+      );
+      organizationId = orgResult.rows[0]?.organization_id || null;
+    }
+    if (!organizationId) {
+      return void res.status(400).json({
+        success: false,
+        error: 'Organization ID is required.',
+      });
+    }
+
+    const limitRaw = req.query?.limit;
+    const limit = typeof limitRaw === 'string' ? parseInt(limitRaw, 10) : 20;
+    const uploads = await entityMasterBulkQueueService.listUploads(organizationId, limit);
+
+    res.json({
+      success: true,
+      data: { uploads },
+    });
+  } catch (error: any) {
+    console.error('Error listing entity master bulk uploads:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to list uploads',
     });
   }
 }

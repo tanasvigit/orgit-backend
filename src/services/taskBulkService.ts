@@ -890,7 +890,8 @@ export async function createTaskFromPayload(
 export async function parseAndApply(
   fileBuffer: Buffer,
   userId: string,
-  organizationId: string | null
+  organizationId: string | null,
+  onProgress?: (info: { scanned: number; created: number; errors: number; maxRow: number }) => void | Promise<void>
 ): Promise<TaskBulkUploadResult> {
   const result: TaskBulkUploadResult = {
     updated: { tasks: 0 },
@@ -917,13 +918,16 @@ export async function parseAndApply(
     }
   };
   const tasksSheet = workbook.getWorksheet('Tasks') || workbook.worksheets[0];
+  const sheetRowCount =
+    ((tasksSheet as any)?.actualRowCount as number | undefined) ?? (tasksSheet?.rowCount ?? 0);
   console.log('[TaskBulk] parseAndApply start', {
     userId,
     organizationId,
     sheetName: tasksSheet?.name,
     rowCount: tasksSheet?.rowCount,
+    actualRowCount: (tasksSheet as any)?.actualRowCount,
   });
-  if (!tasksSheet || (tasksSheet.rowCount ?? 0) < 2) {
+  if (!tasksSheet || sheetRowCount < 2) {
     result.errors.push({ message: 'No "Tasks" sheet found or sheet has no data rows.' });
     return result;
   }
@@ -978,8 +982,8 @@ export async function parseAndApply(
       return result;
     }
 
-    const maxRow = Math.min(tasksSheet.rowCount ?? 0, MAX_ROWS_PER_SHEET + 1);
-    if ((tasksSheet.rowCount ?? 0) > MAX_ROWS_PER_SHEET + 1) {
+    const maxRow = Math.min(sheetRowCount, MAX_ROWS_PER_SHEET + 1);
+    if (sheetRowCount > MAX_ROWS_PER_SHEET + 1) {
       pushError({
         sheet: tasksSheet.name,
         message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.`,
@@ -987,11 +991,22 @@ export async function parseAndApply(
     }
 
     let accountingYearStartForOrg: string | null | undefined = undefined;
+    let scannedDataRows = 0;
+
+    if (onProgress) {
+      await onProgress({
+        scanned: 0,
+        created: 0,
+        errors: result.errors.length,
+        maxRow: Math.max(0, maxRow - 1),
+      });
+    }
 
     for (let r = 2; r <= maxRow; r++) {
     try {
       const row = tasksSheet.getRow(r);
       if (isRowEmpty(row, [titleCol, dueDateCol])) continue;
+      scannedDataRows += 1;
 
       const title = getCellStrMax(row, titleCol, TITLE_MAX);
       if (!title) {
@@ -1265,6 +1280,14 @@ export async function parseAndApply(
 
       const { inserted } = await createTaskFromPayload(client, payload, organizationId, userId);
       if (inserted) result.updated.tasks += 1;
+      if (onProgress && (scannedDataRows % 10 === 0 || r === maxRow)) {
+        await onProgress({
+          scanned: scannedDataRows,
+          created: result.updated.tasks,
+          errors: result.errors.length,
+          maxRow: Math.max(0, maxRow - 1),
+        });
+      }
     } catch (err: any) {
       console.log('[TaskBulk] row error', r, err?.message);
       pushError({
@@ -1272,7 +1295,24 @@ export async function parseAndApply(
         row: r,
         message: err?.message || 'Failed to create task',
       });
+      if (onProgress && scannedDataRows % 10 === 0) {
+        await onProgress({
+          scanned: scannedDataRows,
+          created: result.updated.tasks,
+          errors: result.errors.length,
+          maxRow: Math.max(0, maxRow - 1),
+        });
+      }
     }
+  }
+
+  if (onProgress) {
+    await onProgress({
+      scanned: scannedDataRows,
+      created: result.updated.tasks,
+      errors: result.errors.length,
+      maxRow: Math.max(0, maxRow - 1),
+    });
   }
 
   console.log('[TaskBulk] parseAndApply done', {

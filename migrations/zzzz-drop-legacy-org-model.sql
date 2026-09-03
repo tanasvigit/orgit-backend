@@ -36,8 +36,9 @@ ALTER TABLE IF EXISTS client_entities
 
 ALTER TABLE IF EXISTS user_organizations
   DROP COLUMN IF EXISTS department,
-  DROP COLUMN IF EXISTS designation,
   DROP COLUMN IF EXISTS level;
+-- Keep user_organizations.designation — it is the employee job-title string
+-- used by employee master APIs (not the legacy designations master table).
 
 ALTER TABLE IF EXISTS tasks
   DROP COLUMN IF EXISTS task_unit,

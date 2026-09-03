@@ -1,5 +1,5 @@
 /**
- * Apply pending SQL migrations in migrations/ (filename order).
+ * Apply pending SQL migrations in dependency order (migrations/ORDER.json).
  * Tracks applied files in schema_migrations — safe to re-run (skips applied).
  *
  * Usage (from orgit-backend root):
@@ -9,8 +9,7 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const { Client } = require('pg');
-
-const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const { listMigrationFiles } = require('./lib/migrationFiles');
 
 async function ensureMigrationsTable(client) {
   await client.query(`
@@ -39,19 +38,8 @@ async function markApplied(client, filename) {
   );
 }
 
-function listMigrationFiles() {
-  if (!fs.existsSync(MIGRATIONS_DIR)) {
-    return [];
-  }
-  return fs
-    .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.toLowerCase().endsWith('.sql'))
-    .sort((a, b) => a.localeCompare(b))
-    .map((f) => ({ filename: f, fullPath: path.join(MIGRATIONS_DIR, f) }));
-}
-
 async function run() {
-  const files = listMigrationFiles();
+  const files = listMigrationFiles({ warn: true });
   if (files.length === 0) {
     console.log('No .sql files in migrations/');
     return;

@@ -3,11 +3,13 @@ import { query } from '../config/database';
 let cached: {
   userProfile: boolean;
   membershipProfile: boolean;
+  hasDesignation: boolean;
 } | null = null;
 
 export async function getEmployeeMasterColumnCaps(): Promise<{
   userProfile: boolean;
   membershipProfile: boolean;
+  hasDesignation: boolean;
 }> {
   if (cached) return cached;
 
@@ -31,6 +33,7 @@ export async function getEmployeeMasterColumnCaps(): Promise<{
   cached = {
     userProfile: userSet.has('employee_code'),
     membershipProfile: uoSet.has('employee_permissions'),
+    hasDesignation: uoSet.has('designation'),
   };
   return cached;
 }

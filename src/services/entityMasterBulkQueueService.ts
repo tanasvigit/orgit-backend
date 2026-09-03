@@ -17,6 +17,15 @@ export interface EntityMasterBulkUploadStatus {
   processedCount: number;
   failedCount: number;
   totalRows?: number;
+  uploadType?: string;
+  filename?: string;
+  phase?: string;
+  tasksProgress?: {
+    scanned: number;
+    created: number;
+    errors: number;
+    maxRow: number;
+  };
   createdAt: Date;
   updatedAt: Date;
   completedAt: Date | null;
@@ -31,6 +40,22 @@ export interface EntityMasterBulkUploadStatus {
     tasks?: number;
     totalErrors?: number;
   };
+}
+
+export interface EntityMasterBulkUploadListItem {
+  id: string;
+  filename: string;
+  status: string;
+  uploadType: string;
+  totalRows: number;
+  processedCount: number;
+  failedCount: number;
+  errorCount: number;
+  phase?: string;
+  summary?: EntityMasterBulkUploadStatus['summary'];
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt: Date | null;
 }
 
 const ROW_LEVEL_SHEET_NAMES = ['Employees', 'Service List', 'Client List', 'Entity List', 'Client Entities'];
@@ -116,7 +141,7 @@ export async function enqueueEntityMasterBulkUpload(
         userId,
         filename.slice(0, 255),
         fileContent,
-        JSON.stringify({ ...metadata, fileHash }),
+        JSON.stringify({ ...metadata, fileHash, phase: 'queued' }),
         uploadType,
         totalRows,
       ]
@@ -155,7 +180,8 @@ export async function getUploadStatus(
   const client = await getClient();
   try {
     const result = await client.query(
-      `SELECT status, processed_count, failed_count, total_rows, upload_type, created_at, updated_at, completed_at, error_summary, metadata
+      `SELECT filename, status, processed_count, failed_count, total_rows, upload_type,
+              created_at, updated_at, completed_at, error_summary, metadata
        FROM entity_master_bulk_uploads
        WHERE id = $1 AND organization_id = $2`,
       [uploadId, organizationId]
@@ -176,23 +202,117 @@ export async function getUploadStatus(
       }
     }
 
+    const meta = row?.metadata && typeof row.metadata === 'object' ? row.metadata : {};
     const status: EntityMasterBulkUploadStatus = {
       status: row.status,
       processedCount: row.processed_count ?? 0,
       failedCount: row.failed_count ?? 0,
+      uploadType: row.upload_type ?? 'file',
+      filename: row.filename || undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       completedAt: row.completed_at,
       errors,
     };
-    const summary = row?.metadata?.summary;
+    const summary = meta?.summary;
     if (summary && typeof summary === 'object') {
       status.summary = summary;
+    }
+    if (typeof meta?.phase === 'string' && meta.phase) {
+      status.phase = meta.phase;
+    } else if (row.status === 'queued' || row.status === 'queued_v2') {
+      status.phase = 'queued';
+    } else if (row.status === 'processing' || row.status === 'processing_v2') {
+      status.phase = 'processing';
+    } else if (row.status === 'completed') {
+      status.phase = 'completed';
+    } else if (row.status === 'failed') {
+      status.phase = 'failed';
+    }
+    if (meta?.tasksProgress && typeof meta.tasksProgress === 'object') {
+      status.tasksProgress = meta.tasksProgress;
     }
     if (row.total_rows != null && row.total_rows > 0) {
       status.totalRows = row.total_rows;
     }
     return status;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * List recent entity master bulk uploads for an organization (newest first).
+ */
+export async function listUploads(
+  organizationId: string,
+  limit = 20
+): Promise<EntityMasterBulkUploadListItem[]> {
+  const client = await getClient();
+  try {
+    const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 50);
+    const result = await client.query(
+      `SELECT id, filename, status, upload_type, total_rows, processed_count, failed_count,
+              created_at, updated_at, completed_at, error_summary, metadata
+       FROM entity_master_bulk_uploads
+       WHERE organization_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [organizationId, safeLimit]
+    );
+
+    return result.rows.map((row: any) => {
+      const meta = row?.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+      const errorSummary = Array.isArray(row.error_summary) ? row.error_summary : [];
+      const summary =
+        meta?.summary && typeof meta.summary === 'object' ? meta.summary : undefined;
+      let phase: string | undefined =
+        typeof meta?.phase === 'string' && meta.phase ? meta.phase : undefined;
+      if (!phase) {
+        if (row.status === 'queued' || row.status === 'queued_v2') phase = 'queued';
+        else if (row.status === 'processing' || row.status === 'processing_v2') phase = 'processing';
+        else if (row.status === 'completed') phase = 'completed';
+        else if (row.status === 'failed') phase = 'failed';
+      }
+      return {
+        id: row.id,
+        filename: row.filename || 'upload.xlsx',
+        status: row.status,
+        uploadType: row.upload_type ?? 'file',
+        totalRows: row.total_rows ?? 0,
+        processedCount: row.processed_count ?? 0,
+        failedCount: row.failed_count ?? 0,
+        errorCount:
+          typeof summary?.totalErrors === 'number'
+            ? summary.totalErrors
+            : errorSummary.length || (row.failed_count ?? 0),
+        phase,
+        summary,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        completedAt: row.completed_at,
+      } as EntityMasterBulkUploadListItem;
+    });
+  } finally {
+    client.release();
+  }
+}
+
+/** Merge metadata.phase (and optional extra keys) onto an upload row. */
+export async function setUploadPhase(
+  uploadId: string,
+  phase: string,
+  extra: Record<string, unknown> = {}
+): Promise<void> {
+  const client = await getClient();
+  try {
+    await client.query(
+      `UPDATE entity_master_bulk_uploads
+       SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb,
+           updated_at = NOW()
+       WHERE id = $2`,
+      [JSON.stringify({ phase, ...extra }), uploadId]
+    );
   } finally {
     client.release();
   }

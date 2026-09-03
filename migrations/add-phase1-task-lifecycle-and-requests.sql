@@ -1,5 +1,9 @@
 -- Phase 1 task lifecycle and workflow tables
 
+-- Ensure tasks.status exists (base schema normally has it)
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending';
+
 ALTER TABLE tasks
   ADD COLUMN IF NOT EXISTS verification_status VARCHAR(20) DEFAULT NULL,
   ADD COLUMN IF NOT EXISTS completed_by_assignee_at TIMESTAMPTZ DEFAULT NULL,
@@ -8,15 +12,22 @@ ALTER TABLE tasks
   ADD COLUMN IF NOT EXISTS deleted_by UUID REFERENCES users(id) DEFAULT NULL;
 
 DO $$
+DECLARE
+  conname text;
 BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM information_schema.table_constraints
-    WHERE constraint_name = 'tasks_status_check'
-      AND table_name = 'tasks'
-  ) THEN
-    ALTER TABLE tasks DROP CONSTRAINT tasks_status_check;
-  END IF;
+  FOR conname IN
+    SELECT c.conname
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE n.nspname = 'public'
+      AND t.relname = 'tasks'
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) ILIKE '%status%'
+      AND pg_get_constraintdef(c.oid) NOT ILIKE '%verification_status%'
+  LOOP
+    EXECUTE format('ALTER TABLE tasks DROP CONSTRAINT %I', conname);
+  END LOOP;
 END $$;
 
 ALTER TABLE tasks
@@ -63,15 +74,21 @@ CREATE INDEX IF NOT EXISTS idx_task_exit_requests_task_id ON task_exit_requests(
 CREATE INDEX IF NOT EXISTS idx_task_exit_requests_status ON task_exit_requests(status);
 
 DO $$
+DECLARE
+  conname text;
 BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM information_schema.table_constraints
-    WHERE constraint_name = 'notifications_type_check'
-      AND table_name = 'notifications'
-  ) THEN
-    ALTER TABLE notifications DROP CONSTRAINT notifications_type_check;
-  END IF;
+  FOR conname IN
+    SELECT c.conname
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE n.nspname = 'public'
+      AND t.relname = 'notifications'
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) ILIKE '%type%'
+  LOOP
+    EXECUTE format('ALTER TABLE notifications DROP CONSTRAINT %I', conname);
+  END LOOP;
 END $$;
 
 ALTER TABLE notifications
@@ -98,19 +115,29 @@ ALTER TABLE notifications
     'MEMBER_ADDED'
   ));
 
+-- status column is normally added by add-task-assignees-status-column.sql,
+-- which sorts AFTER this file — ensure it exists before updating the check.
+ALTER TABLE task_assignees
+  ADD COLUMN IF NOT EXISTS status VARCHAR(50);
+
 DO $$
+DECLARE
+  conname text;
 BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM information_schema.table_constraints
-    WHERE constraint_name = 'task_assignees_status_check'
-      AND table_name = 'task_assignees'
-  ) THEN
-    ALTER TABLE task_assignees DROP CONSTRAINT task_assignees_status_check;
-  END IF;
+  FOR conname IN
+    SELECT c.conname
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE n.nspname = 'public'
+      AND t.relname = 'task_assignees'
+      AND c.contype = 'c'
+      AND pg_get_constraintdef(c.oid) ILIKE '%status%'
+  LOOP
+    EXECUTE format('ALTER TABLE task_assignees DROP CONSTRAINT %I', conname);
+  END LOOP;
 END $$;
 
 ALTER TABLE task_assignees
   ADD CONSTRAINT task_assignees_status_check
   CHECK (status IS NULL OR status IN ('todo', 'inprogress', 'duesoon', 'overdue', 'completed', 'scheduled', 'exited'));
-

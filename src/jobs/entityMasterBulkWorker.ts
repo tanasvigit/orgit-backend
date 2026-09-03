@@ -1,8 +1,11 @@
 import { getClient } from '../config/database';
 import * as entityMasterBulkService from '../services/entityMasterBulkService';
 import * as taskBulkService from '../services/taskBulkService';
+import * as entityMasterBulkQueueService from '../services/entityMasterBulkQueueService';
 
 const ROW_LEVEL_BATCH_SIZE = 10;
+/** Re-queue file/row uploads left in processing after a crash or hung worker. */
+const STALE_PROCESSING_MINUTES = 10;
 
 /**
  * Process one entity master bulk upload from the queue. Runs on a schedule (cron).
@@ -18,8 +21,28 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
   let metadata: { userId: string; userOrganizationId: string | null; isSuperAdmin: boolean };
 
   try {
+    // Recover uploads stuck in processing (server restart / hung parse).
+    const stale = await client.query(
+      `UPDATE entity_master_bulk_uploads
+       SET status = 'queued_v2',
+           updated_at = NOW(),
+           metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+             'phase', 'queued',
+             'requeuedReason', 'stale_processing'
+           )
+       WHERE status IN ('processing_v2', 'processing')
+         AND updated_at < NOW() - make_interval(mins => $1::int)
+       RETURNING id, filename, updated_at`,
+      [STALE_PROCESSING_MINUTES]
+    );
+    if (stale.rows.length > 0) {
+      console.warn(
+        '[EntityMasterBulkWorker] Requeued stale processing upload(s):',
+        stale.rows.map((r: { id: string; filename: string }) => `${r.id} (${r.filename})`).join(', ')
+      );
+    }
+
     // Claim atomically and use v2 statuses so legacy workers do not re-pick uploads.
-    // do not re-pick the same upload.
     const claimResult = await client.query(
       `WITH picked AS (
          SELECT id
@@ -30,7 +53,9 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
          FOR UPDATE SKIP LOCKED
        )
        UPDATE entity_master_bulk_uploads e
-       SET status = 'processing_v2', updated_at = NOW()
+       SET status = 'processing_v2',
+           updated_at = NOW(),
+           metadata = COALESCE(e.metadata, '{}'::jsonb) || jsonb_build_object('phase', 'processing')
        FROM picked
        WHERE e.id = picked.id
        RETURNING e.id, e.file_content, e.upload_type, e.total_rows, e.organization_id, e.metadata`
@@ -44,6 +69,12 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
     totalRows = row.total_rows ?? 0;
     organizationId = row.organization_id;
     metadata = row.metadata as { userId: string; userOrganizationId: string | null; isSuperAdmin: boolean };
+    console.log('[EntityMasterBulkWorker] Claimed upload', {
+      uploadId,
+      uploadType,
+      totalRows,
+      fileBytes: fileContent ? (fileContent as Buffer).length : 0,
+    });
   } finally {
     client.release();
   }
@@ -54,6 +85,9 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
   if (fileContent != null) {
     // File-level: full parseAndApply for settings + Tasks sheet (tasks bulk)
     try {
+      await entityMasterBulkQueueService.setUploadPhase(uploadId, 'parsing');
+      console.log('[EntityMasterBulkWorker] Parsing master sheets…', { uploadId });
+
       const parseResult = await entityMasterBulkService.parseAndApply(
         fileContent,
         userId,
@@ -61,13 +95,58 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
         metadata?.isSuperAdmin === true
       );
 
+      await entityMasterBulkQueueService.setUploadPhase(uploadId, 'applying');
+      console.log('[EntityMasterBulkWorker] Applying Tasks sheet…', {
+        uploadId,
+        masterUpdated: parseResult.updated,
+        masterErrors: parseResult.errors?.length ?? 0,
+      });
+
       // Also process Tasks sheet using the same Task bulk parser so a single
       // OrgIt Settings workbook upload can create/update tasks.
-      const taskResult = await taskBulkService.parseAndApply(
-        fileContent,
-        userId,
-        organizationId
-      );
+      let taskResult: { updated?: { tasks?: number }; errors?: Array<{ sheet?: string; row?: number; message: string }> };
+      try {
+        taskResult = await taskBulkService.parseAndApply(
+          fileContent,
+          userId,
+          organizationId,
+          async (info) => {
+            const total = Math.max(info.maxRow, info.scanned, 1);
+            const clientProgress = await getClient();
+            try {
+              await clientProgress.query(
+                `UPDATE entity_master_bulk_uploads
+                 SET total_rows = GREATEST(COALESCE(total_rows, 0), $1),
+                     processed_count = $2,
+                     failed_count = $3,
+                     updated_at = NOW(),
+                     metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                       'phase', 'applying',
+                       'tasksProgress', jsonb_build_object(
+                         'scanned', $2::int,
+                         'created', $4::int,
+                         'errors', $3::int,
+                         'maxRow', $1::int
+                       )
+                     )
+                 WHERE id = $5`,
+                [total, info.scanned, info.errors, info.created, uploadId]
+              );
+            } finally {
+              clientProgress.release();
+            }
+          }
+        );
+      } catch (taskErr: any) {
+        console.error('[EntityMasterBulkWorker] Tasks sheet failed; keeping master result', {
+          uploadId,
+          error: taskErr?.message || String(taskErr),
+        });
+        taskResult = {
+          updated: { tasks: 0 },
+          errors: [{ sheet: 'Tasks', message: taskErr?.message || String(taskErr) }],
+        };
+      }
 
       const combinedErrors = [
         ...(parseResult.errors || []),
@@ -85,7 +164,10 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
            SET status = 'completed', processed_count = 1, failed_count = 0,
                completed_at = NOW(), updated_at = NOW(),
                error_summary = $1,
-               metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('summary', $2::jsonb)
+               metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                 'summary', $2::jsonb,
+                 'phase', 'completed'
+               )
            WHERE id = $3`,
           [
             combinedErrors.length > 0 ? JSON.stringify(combinedErrors.slice(0, 500)) : null,
@@ -96,6 +178,11 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
       } finally {
         client2.release();
       }
+      console.log('[EntityMasterBulkWorker] Upload completed', {
+        uploadId,
+        summary: uploadSummary,
+        errorCount: combinedErrors.length,
+      });
     } catch (err: any) {
       const errorMessage = err?.message || String(err);
       console.error('[EntityMasterBulkWorker] Upload failed', { uploadId, error: errorMessage });
@@ -104,7 +191,8 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
         await client2.query(
           `UPDATE entity_master_bulk_uploads
            SET status = 'failed', failed_count = 1, completed_at = NOW(), updated_at = NOW(),
-               error_summary = $1
+               error_summary = $1,
+               metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('phase', 'failed')
            WHERE id = $2`,
           [JSON.stringify([{ message: errorMessage }]), uploadId]
         );

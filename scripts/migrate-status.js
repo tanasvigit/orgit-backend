@@ -1,19 +1,27 @@
 /**
- * Show which migrations are applied vs pending.
+ * Show which migrations are applied vs pending (ORDER.json order).
  * Usage: npm run migrate:status
  */
-const fs = require('fs');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const { Client } = require('pg');
-
-const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const { listMigrationFiles, assertOrderComplete } = require('./lib/migrationFiles');
 
 async function run() {
-  const files = fs
-    .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.toLowerCase().endsWith('.sql'))
-    .sort();
+  const check = assertOrderComplete();
+  if (!check.ok) {
+    if (check.missingFromOrder.length) {
+      console.warn('Migrations missing from ORDER.json:');
+      check.missingFromOrder.forEach((f) => console.warn('  -', f));
+    }
+    if (check.missingFromDisk.length) {
+      console.warn('ORDER.json entries missing on disk:');
+      check.missingFromDisk.forEach((f) => console.warn('  -', f));
+    }
+    console.warn('');
+  }
+
+  const files = listMigrationFiles({ warn: false });
 
   const client = new Client({
     host: process.env.DB_HOST || 'localhost',
@@ -29,14 +37,14 @@ async function run() {
     const res = await client.query('SELECT filename FROM schema_migrations ORDER BY filename');
     const applied = new Set(res.rows.map((r) => r.filename));
 
-    const pending = files.filter((f) => !applied.has(f));
+    const pending = files.filter((f) => !applied.has(f.filename));
     console.log(`Total migration files: ${files.length}`);
-    console.log(`Applied: ${applied.size}`);
+    console.log(`Applied: ${[...applied].filter((f) => f.endsWith('.sql')).length}`);
     console.log(`Pending: ${pending.length}\n`);
 
     if (pending.length > 0) {
-      console.log('Pending files:');
-      pending.forEach((f) => console.log('  -', f));
+      console.log('Pending files (dependency order):');
+      pending.forEach((f) => console.log('  -', f.filename));
       console.log('\nIf the DB already has this schema, run once: npm run migrate:baseline');
       console.log('Then run: npm run migrate');
     } else {
@@ -47,7 +55,7 @@ async function run() {
       console.log('schema_migrations table does not exist yet.');
       console.log('All', files.length, 'files are pending.');
       console.log('\nIf DB already has schema, run: npm run migrate:baseline');
-      console.log('If fresh DB, run: npm run migrate');
+      console.log('If fresh DB, run: npm run db:bootstrap');
     } else {
       console.error('Error:', err.message);
       process.exit(1);

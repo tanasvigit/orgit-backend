@@ -6,12 +6,10 @@
  * Usage:
  *   npm run migrate:baseline
  */
-const fs = require('fs');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const { Client } = require('pg');
-
-const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const { listMigrationFiles } = require('./lib/migrationFiles');
 
 async function ensureMigrationsTable(client) {
   await client.query(`
@@ -31,10 +29,7 @@ async function run() {
       .filter(Boolean)
   );
 
-  const files = fs
-    .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.toLowerCase().endsWith('.sql'))
-    .sort();
+  const files = listMigrationFiles({ warn: true });
 
   const client = new Client({
     host: process.env.DB_HOST || 'localhost',
@@ -49,7 +44,7 @@ async function run() {
     await ensureMigrationsTable(client);
 
     let marked = 0;
-    for (const filename of files) {
+    for (const { filename } of files) {
       if (exclude.has(filename)) {
         console.log('[skip]', filename, '(excluded — will run on next migrate)');
         continue;

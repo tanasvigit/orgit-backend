@@ -25,6 +25,7 @@ router.use(isAdminOrSuperAdmin);
 router.use(requireOrganization);
 
 router.get('/template', entityMasterBulkController.getTemplate);
+router.get('/uploads', entityMasterBulkController.listUploads);
 router.get('/status/:uploadId', entityMasterBulkController.getStatus);
 router.post('/upload', upload.single('file'), entityMasterBulkController.upload);
 

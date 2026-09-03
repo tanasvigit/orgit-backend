@@ -133,7 +133,7 @@ export const setupTaskJobs = (io?: any): void => {
     }
   });
 
-  cron.schedule('*/2 * * * *', async () => {
+  cron.schedule('* * * * *', async () => {
     try {
       await processTaskBulkQueue();
       await processEntityMasterBulkQueue();

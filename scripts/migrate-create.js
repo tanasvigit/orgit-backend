@@ -1,5 +1,5 @@
 /**
- * Create a new timestamped migration file (sorts correctly on npm run migrate).
+ * Create a new timestamped migration file and append it to migrations/ORDER.json.
  *
  * Usage:
  *   npm run migrate:create -- add-my-feature
@@ -7,8 +7,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-
-const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
+const { MIGRATIONS_DIR, appendToOrder } = require('./lib/migrationFiles');
 
 function slugify(name) {
   return String(name || 'migration')
@@ -45,5 +44,8 @@ if (!fs.existsSync(MIGRATIONS_DIR)) {
 const template = `-- ${slug}\n\n`;
 
 fs.writeFileSync(fullPath, template, 'utf8');
+appendToOrder(filename);
+
 console.log('Created:', fullPath);
+console.log('Appended to migrations/ORDER.json');
 console.log('Edit the file, then run: npm run migrate');

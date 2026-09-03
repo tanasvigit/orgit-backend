@@ -313,7 +313,7 @@ export const addEmployee = async (req: AuthRequest, res: Response) => {
          ${employeeMasterUserSelectSql(caps.userProfile)},
          uo.reporting_to, uo.primary_org_node_id, uo.secondary_org_node_ids,
          ${orgFvSelect},
-         ${employeeMasterMembershipSelectSql(caps.membershipProfile)},
+         ${employeeMasterMembershipSelectSql(caps.membershipProfile, caps.hasDesignation)},
          reporter.name AS reporting_to_name, u.created_at
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
@@ -378,7 +378,7 @@ export const getEmployees = async (req: AuthRequest, res: Response) => {
         uo.primary_org_node_id,
         uo.secondary_org_node_ids,
         ${orgFvSelect},
-        ${employeeMasterMembershipSelectSql(caps.membershipProfile)},
+        ${employeeMasterMembershipSelectSql(caps.membershipProfile, caps.hasDesignation)},
         reporter.name as reporting_to_name,
         u.created_at
        FROM users u
@@ -566,7 +566,7 @@ export const updateEmployee = async (req: AuthRequest, res: Response) => {
          ${employeeMasterUserSelectSql(caps.userProfile)},
          uo.reporting_to, uo.primary_org_node_id, uo.secondary_org_node_ids,
          ${orgFvSelect},
-         ${employeeMasterMembershipSelectSql(caps.membershipProfile)}
+         ${employeeMasterMembershipSelectSql(caps.membershipProfile, caps.hasDesignation)}
        FROM users u
        JOIN user_organizations uo ON u.id = uo.user_id
        WHERE u.id = $1 AND uo.organization_id = $2`,

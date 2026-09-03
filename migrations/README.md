@@ -24,13 +24,32 @@ All migration commands read **only** these variables.
 
 | Command | Purpose |
 |---------|---------|
-| `npm run db:bootstrap` | **New empty database** — applies `database/schema.sql` + all `migrations/*.sql` |
-| `npm run migrate` | **Existing database** — applies only **pending** migration files |
+| `npm run db:bootstrap` | **New empty database** — applies `database/schema.sql` + all `migrations/*.sql` in **dependency order** |
+| `npm run migrate` | **Existing database** — applies only **pending** migration files (same order) |
 | `npm run migrate:status` | List applied vs pending migrations |
 | `npm run migrate:baseline` | **Existing DB, empty tracking** — mark all current files as applied **without** running SQL |
-| `npm run migrate:create -- <name>` | Create a new timestamped `.sql` file in `migrations/` |
+| `npm run migrate:create -- <name>` | Create a new timestamped `.sql` file and append it to `ORDER.json` |
+| `npm run migrate:check-order` | Verify every `migrations/*.sql` is listed in `ORDER.json` |
+| `npm run db:smoke` | Create a temp DB, run full bootstrap, drop it (needs CREATEDB) |
 
 Aliases: `npm run db:all-in-one` = `npm run db:bootstrap`.
+
+---
+
+## Migration order (important)
+
+Migrations are **not** applied by raw filename sort alone.
+
+Order is defined in **`migrations/ORDER.json`**.
+
+That prevents failures like “column X does not exist” when a dated file (`2026…`) would otherwise run before an older `add-…` file that creates column X.
+
+Rules:
+
+1. Always create migrations with `npm run migrate:create -- <name>` (auto-appends to `ORDER.json`).
+2. If you add a `.sql` file by hand, also append its filename to `ORDER.json` in the correct dependency position.
+3. Run `npm run migrate:check-order` before production bootstrap.
+4. Prefer idempotent SQL (`IF NOT EXISTS`, safe constraint drops).
 
 ---
 
@@ -52,6 +71,7 @@ Point `DB_NAME` (and host/user/password) at that database.
 
 ```bash
 cd orgit-backend
+npm run migrate:check-order
 npm run db:bootstrap
 ```
 
@@ -59,7 +79,7 @@ This will:
 
 1. Create `schema_migrations` if missing  
 2. Apply `database/schema.sql` (core tables)  
-3. Apply every `migrations/*.sql` file in **filename sort order**  
+3. Apply every `migrations/*.sql` file in **`ORDER.json` dependency order**  
 4. Record each file in `schema_migrations` (skipped on later runs)
 
 ### 4. Verify
@@ -129,12 +149,14 @@ npm run migrate
 
 ```
 migrations/
+  ├── ORDER.json              # dependency-safe apply order (source of truth)
   ├── add-task-assignees-status-column.sql
   ├── 20260515120000_add-org-field-values-to-memberships.sql
   └── ...
 ```
 
-- Files are sorted by **filename** (lexicographic). Prefer timestamp prefixes for new files: `npm run migrate:create`.  
+- Apply order comes from **`ORDER.json`**, not bare alphabetical sort.
+- Files missing from `ORDER.json` are appended at the end (with a warning).
 - Each file runs inside a **transaction** (rollback on error).  
 - Applied filenames are stored in:
 
@@ -163,9 +185,12 @@ Creates something like:
 
 `migrations/20260519120000_add-my-feature.sql`
 
+and appends that filename to `migrations/ORDER.json`.
+
 Edit the file, then on each environment:
 
 ```bash
+npm run migrate:check-order
 npm run migrate
 ```
 
