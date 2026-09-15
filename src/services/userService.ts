@@ -1,5 +1,6 @@
 import { query } from '../config/database';
 import pool from '../config/database';
+import { cleanupUserDependentRows } from '../utils/userDeleteCleanup';
 
 /**
  * Get all users (for super admin)
@@ -111,80 +112,17 @@ export async function getUserById(id: string) {
 }
 
 /**
- * Delete user and all related data
+ * Delete user and related data using the connected database catalog.
+ * Column names and extra user FKs are discovered at runtime so a new
+ * database schema cannot recreate "column does not exist" failures.
  */
 export async function deleteUser(id: string): Promise<boolean> {
   const client = await pool.connect();
-  
+
   try {
     await client.query('BEGIN');
-    
-    // Delete user_organizations relationships
-    await client.query(
-      'DELETE FROM user_organizations WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete group memberships
-    await client.query(
-      'DELETE FROM group_members WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete messages sent by user
-    await client.query(
-      'DELETE FROM messages WHERE sender_id = $1',
-      [id]
-    );
-    
-    // Delete message status records
-    await client.query(
-      'DELETE FROM message_status WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete task assignments
-    await client.query(
-      'DELETE FROM task_assignments WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete tasks created by user (or reassign - for now we'll delete)
-    await client.query(
-      'DELETE FROM tasks WHERE creator_id = $1',
-      [id]
-    );
-    
-    // Delete notifications
-    await client.query(
-      'DELETE FROM notifications WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete contacts
-    await client.query(
-      'DELETE FROM contacts WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete sessions
-    await client.query(
-      'DELETE FROM sessions WHERE user_id = $1',
-      [id]
-    );
-    
-    // Delete OTP verifications
-    await client.query(
-      'DELETE FROM otp_verifications WHERE mobile = (SELECT mobile FROM users WHERE id = $1)',
-      [id]
-    );
-    
-    // Finally delete the user
-    await client.query(
-      'DELETE FROM users WHERE id = $1',
-      [id]
-    );
-    
+    await cleanupUserDependentRows(client, id);
+    await client.query('DELETE FROM users WHERE id = $1', [id]);
     await client.query('COMMIT');
     return true;
   } catch (error) {
