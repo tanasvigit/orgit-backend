@@ -13,15 +13,22 @@ import {
 } from './recurringTemplateSetup';
 import { resolveNodeReference } from './organizationStructureService';
 
-/** Bulk upload limits and safety */
-const MAX_ROWS_PER_SHEET = 500;
+/** Bulk upload safety (no per-sheet row cap — process entire sheet) */
 const MAX_ERRORS_REPORTED = 100;
 const TITLE_MAX = 500;
 const STRING_MAX = 500;
 
+export interface SheetRowStats {
+  sheet: string;
+  totalRows: number;
+  success: number;
+  failed: number;
+}
+
 export interface TaskBulkUploadResult {
   updated: { tasks: number };
   errors: Array<{ sheet?: string; row?: number; message: string }>;
+  sheetStats: SheetRowStats[];
 }
 
 /** Resolve user ID by mobile (same logic as entityMasterBulkService) */
@@ -896,6 +903,7 @@ export async function parseAndApply(
   const result: TaskBulkUploadResult = {
     updated: { tasks: 0 },
     errors: [],
+    sheetStats: [],
   };
 
   if (!organizationId) {
@@ -982,16 +990,12 @@ export async function parseAndApply(
       return result;
     }
 
-    const maxRow = Math.min(sheetRowCount, MAX_ROWS_PER_SHEET + 1);
-    if (sheetRowCount > MAX_ROWS_PER_SHEET + 1) {
-      pushError({
-        sheet: tasksSheet.name,
-        message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.`,
-      });
-    }
+    const maxRow = sheetRowCount;
 
     let accountingYearStartForOrg: string | null | undefined = undefined;
     let scannedDataRows = 0;
+    let failedDataRows = 0;
+    const tasksSheetName = tasksSheet.name || 'Tasks';
 
     if (onProgress) {
       await onProgress({
@@ -1010,6 +1014,7 @@ export async function parseAndApply(
 
       const title = getCellStrMax(row, titleCol, TITLE_MAX);
       if (!title) {
+        failedDataRows += 1;
         pushError({ sheet: tasksSheet.name, row: r, message: 'Title is required' });
         continue;
       }
@@ -1030,6 +1035,7 @@ export async function parseAndApply(
         const msg = !dueDateVal || !dueDateVal.trim()
           ? 'Due date is required'
           : `Invalid due date: ${dueDateVal} (use YYYY-MM-DD or DD/MM/YYYY)`;
+        failedDataRows += 1;
         pushError({ sheet: tasksSheet.name, row: r, message: msg });
         continue;
       }
@@ -1076,6 +1082,7 @@ export async function parseAndApply(
         assigneeCache
       );
       if (assigneeErrors.length > 0) {
+        failedDataRows += 1;
         pushError({ sheet: tasksSheet.name, row: r, message: assigneeErrors.join('; ') });
         continue;
       }
@@ -1085,6 +1092,7 @@ export async function parseAndApply(
       if (taskOwnerStr) {
         const resolvedOwnerId = await resolveUserIdByMobileOrName(client, organizationId, taskOwnerStr);
         if (!resolvedOwnerId) {
+          failedDataRows += 1;
           pushError({ sheet: tasksSheet.name, row: r, message: `Task owner not found: ${taskOwnerStr}` });
           continue;
         }
@@ -1096,6 +1104,7 @@ export async function parseAndApply(
       if (reportingMemberStr) {
         reportingMemberId = await resolveUserIdByMobileOrName(client, organizationId, reportingMemberStr);
         if (!reportingMemberId) {
+          failedDataRows += 1;
           pushError({ sheet: tasksSheet.name, row: r, message: `Reporting member not found: ${reportingMemberStr}` });
           continue;
         }
@@ -1111,6 +1120,7 @@ export async function parseAndApply(
           assigneeCache
         );
         if (errors.length > 0) {
+          failedDataRows += 1;
           pushError({ sheet: tasksSheet.name, row: r, message: errors.join('; ') });
           continue;
         }
@@ -1129,6 +1139,7 @@ export async function parseAndApply(
       );
       clientEntityId = ce.rows?.[0]?.id ?? null;
       if (!clientEntityId) {
+        failedDataRows += 1;
         pushError({ sheet: tasksSheet.name, row: r, message: `Client not found: ${clientName}` });
         continue;
       }
@@ -1142,6 +1153,7 @@ export async function parseAndApply(
       const recurrenceRaw = getCellStr(row, recurrenceCol).toLowerCase();
       if (taskType === 'recurring') {
         if (!recurrenceRaw) {
+          failedDataRows += 1;
           pushError({ sheet: tasksSheet.name, row: r, message: 'Recurrence is required for recurring tasks' });
           continue;
         }
@@ -1158,6 +1170,7 @@ export async function parseAndApply(
           accountingYearStart: accountingYearStartForOrg,
         });
         if (!schedule) {
+          failedDataRows += 1;
           pushError({
             sheet: tasksSheet.name,
             row: r,
@@ -1290,6 +1303,7 @@ export async function parseAndApply(
       }
     } catch (err: any) {
       console.log('[TaskBulk] row error', r, err?.message);
+      failedDataRows += 1;
       pushError({
         sheet: tasksSheet.name,
         row: r,
@@ -1315,9 +1329,20 @@ export async function parseAndApply(
     });
   }
 
+  const successRows = Math.max(0, scannedDataRows - failedDataRows);
+  result.sheetStats = [
+    {
+      sheet: tasksSheetName,
+      totalRows: scannedDataRows,
+      success: successRows,
+      failed: failedDataRows,
+    },
+  ];
+
   console.log('[TaskBulk] parseAndApply done', {
     tasksCreated: result.updated.tasks,
     errorCount: result.errors.length,
+    sheetStats: result.sheetStats,
     firstErrors: result.errors.slice(0, 5),
   });
   return result;

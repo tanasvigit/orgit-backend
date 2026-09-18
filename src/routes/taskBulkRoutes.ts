@@ -9,7 +9,7 @@ const router = Router();
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB — large bulk workbooks
   fileFilter: (_req, file, cb) => {
     const name = (file.originalname || '').toLowerCase();
     if (name.endsWith('.xlsx') || name.endsWith('.xls')) {

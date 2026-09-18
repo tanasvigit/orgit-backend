@@ -501,14 +501,22 @@ async function processBulkRowsInParentOrder(
   return updated;
 }
 
+export interface StructureSheetParseResult {
+  applied: number;
+  totalRows: number;
+  failed: number;
+}
+
 export async function parseOrganizationStructureSheet(
   sheet: ExcelJS.Worksheet,
   client: PoolClient,
   organizationId: string,
   actorUserId: string,
   pushError: (err: { sheet?: string; row?: number; message: string }) => void
-): Promise<number> {
-  if (!sheet || (sheet.rowCount ?? 0) < 2) return 0;
+): Promise<StructureSheetParseResult> {
+  if (!sheet || (sheet.rowCount ?? 0) < 2) {
+    return { applied: 0, totalRows: 0, failed: 0 };
+  }
 
   const tree = await getOrganizationStructureTree(organizationId, {
     includeArchived: false,
@@ -560,14 +568,14 @@ export async function parseOrganizationStructureSheet(
 
   if (sectionIdx < 0) {
     pushError({ sheet: sheet.name, message: 'Missing required column: Section (or legacy SECTION / LEVEL)' });
-    return 0;
+    return { applied: 0, totalRows: 0, failed: 0 };
   }
   if (!fieldColByKey.has('name')) {
     pushError({
       sheet: sheet.name,
       message: 'Missing required column: Field Name (or legacy Name / Registered Name)',
     });
-    return 0;
+    return { applied: 0, totalRows: 0, failed: 0 };
   }
 
   const getCell = (row: ExcelJS.Row, idx: number): string => {
@@ -579,8 +587,10 @@ export async function parseOrganizationStructureSheet(
     }
   };
 
-  const maxRow = Math.min(sheet.rowCount ?? 0, 50001);
+  const maxRow = sheet.rowCount ?? 0;
   const parsed: StructureBulkRow[] = [];
+  let totalRows = 0;
+  let parseFailed = 0;
 
   for (let r = 2; r <= maxRow; r++) {
     const row = sheet.getRow(r);
@@ -593,13 +603,16 @@ export async function parseOrganizationStructureSheet(
       if (v) fieldValues[key] = v;
     }
     const { name } = deriveNameAndCodeFromFieldValues(fieldValues);
-    if (!sectionRaw && !name) continue;
+    if (!sectionRaw && !name) continue; // empty row — skip, do not count
+    totalRows += 1;
     if (!sectionRaw) {
       pushError({ sheet: sheet.name, row: r, message: 'SECTION is required' });
+      parseFailed += 1;
       continue;
     }
     if (!name) {
       pushError({ sheet: sheet.name, row: r, message: 'Name is required (same as web node form)' });
+      parseFailed += 1;
       continue;
     }
 
@@ -613,6 +626,7 @@ export async function parseOrganizationStructureSheet(
         row: r,
         message: `Invalid Field Type for section ${sectionRaw}. Examples: ${allowedTypes.slice(0, 5).join(', ')}…`,
       });
+      parseFailed += 1;
       continue;
     }
 
@@ -626,7 +640,7 @@ export async function parseOrganizationStructureSheet(
     });
   }
 
-  return processBulkRowsInParentOrder(
+  const applied = await processBulkRowsInParentOrder(
     parsed,
     client,
     organizationId,
@@ -636,6 +650,8 @@ export async function parseOrganizationStructureSheet(
     sheet.name,
     pushError
   );
+  const failed = Math.max(0, totalRows - applied);
+  return { applied, totalRows, failed: Math.max(failed, parseFailed) };
 }
 
 export async function parseOrgNodeByLevelFromRow(

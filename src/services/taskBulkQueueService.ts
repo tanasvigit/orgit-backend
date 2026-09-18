@@ -9,7 +9,6 @@ import {
   serializeBulkRecurrenceCursor,
 } from './recurringTemplateSetup';
 
-const MAX_ROWS_PER_SHEET = 500;
 const MAX_ERRORS_REPORTED = 100;
 const TITLE_MAX = 500;
 const STRING_MAX = 500;
@@ -276,7 +275,7 @@ export async function enqueueTaskBulkUpload(
       throw new Error('Missing required columns: Title and Due Date');
     }
 
-    const maxRow = Math.min(tasksSheet.rowCount ?? 0, MAX_ROWS_PER_SHEET + 1);
+    const maxRow = tasksSheet.rowCount ?? 0;
     const jobs: { row_index: number; payload: TaskBulkJobPayload }[] = [];
     let accountingYearStartForOrg: string | null | undefined = undefined;
 

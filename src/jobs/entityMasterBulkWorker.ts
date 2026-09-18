@@ -152,24 +152,45 @@ export async function processEntityMasterBulkQueue(): Promise<void> {
         ...(parseResult.errors || []),
         ...(taskResult.errors || []),
       ];
+      const sheetStats = [
+        ...((parseResult as any).sheetStats || []),
+        ...((taskResult as any).sheetStats || []),
+      ];
+      const rowTotals = sheetStats.reduce(
+        (acc: { totalRows: number; success: number; failed: number }, s: any) => {
+          acc.totalRows += Number(s.totalRows) || 0;
+          acc.success += Number(s.success) || 0;
+          acc.failed += Number(s.failed) || 0;
+          return acc;
+        },
+        { totalRows: 0, success: 0, failed: 0 }
+      );
       const uploadSummary = {
         ...(parseResult.updated || {}),
         tasks: taskResult.updated?.tasks ?? 0,
         totalErrors: combinedErrors.length,
+        sheetStats,
+        rowTotals,
       };
       const client2 = await getClient();
       try {
         await client2.query(
           `UPDATE entity_master_bulk_uploads
-           SET status = 'completed', processed_count = 1, failed_count = 0,
+           SET status = 'completed',
+               total_rows = $1,
+               processed_count = $2,
+               failed_count = $3,
                completed_at = NOW(), updated_at = NOW(),
-               error_summary = $1,
+               error_summary = $4,
                metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
-                 'summary', $2::jsonb,
+                 'summary', $5::jsonb,
                  'phase', 'completed'
                )
-           WHERE id = $3`,
+           WHERE id = $6`,
           [
+            rowTotals.totalRows,
+            rowTotals.success,
+            rowTotals.failed,
             combinedErrors.length > 0 ? JSON.stringify(combinedErrors.slice(0, 500)) : null,
             JSON.stringify(uploadSummary),
             uploadId,

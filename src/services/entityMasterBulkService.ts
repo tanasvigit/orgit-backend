@@ -115,14 +115,97 @@ const ENTITY_MASTER_LEGACY_LABELS: Record<string, string> = {
   'web site': 'website',
 };
 
-/** Bulk upload limits and safety */
-const MAX_ROWS_PER_SHEET = 50000;
+/** Bulk upload safety (no per-sheet row cap — process entire sheet) */
 const MAX_ERRORS_REPORTED = 1000;
 const STRING_MAX = 500;
 const NAME_MAX = 255;
 const TITLE_MAX = 500;
 /** DB VARCHAR(20) for phone_number and pin_code */
 const PHONE_PIN_MAX = 20;
+
+/** Per-sheet row outcome (empty Excel rows are never counted). */
+export interface SheetRowStats {
+  sheet: string;
+  totalRows: number;
+  success: number;
+  failed: number;
+}
+
+class SheetStatsCollector {
+  private readonly bySheet = new Map<
+    string,
+    { totalRows: number; success: number; failedRows: Set<number>; failedNoRow: number }
+  >();
+
+  private bucket(sheet: string) {
+    const key = sheet || 'Unknown';
+    let b = this.bySheet.get(key);
+    if (!b) {
+      b = { totalRows: 0, success: 0, failedRows: new Set(), failedNoRow: 0 };
+      this.bySheet.set(key, b);
+    }
+    return b;
+  }
+
+  /** Count a non-empty data row on this sheet. */
+  noteRow(sheet: string): void {
+    this.bucket(sheet).totalRows += 1;
+  }
+
+  noteSuccess(sheet: string): void {
+    this.bucket(sheet).success += 1;
+  }
+
+  noteFailed(sheet: string, row?: number): void {
+    const b = this.bucket(sheet);
+    if (typeof row === 'number' && Number.isFinite(row)) {
+      b.failedRows.add(row);
+    } else {
+      b.failedNoRow += 1;
+    }
+  }
+
+  /** Force-set stats when a sheet parser returns its own totals. */
+  setSheet(sheet: string, totalRows: number, success: number, failed: number): void {
+    const b = this.bucket(sheet);
+    b.totalRows = Math.max(0, totalRows);
+    b.success = Math.max(0, success);
+    b.failedRows = new Set();
+    b.failedNoRow = Math.max(0, failed);
+  }
+
+  toArray(): SheetRowStats[] {
+    const out: SheetRowStats[] = [];
+    this.bySheet.forEach((b, sheet) => {
+      const failed = b.failedRows.size + b.failedNoRow;
+      // Prefer explicit success; if only failures were tracked, derive success from total.
+      let success = b.success;
+      if (success === 0 && b.totalRows > 0 && failed > 0 && success + failed < b.totalRows) {
+        success = Math.max(0, b.totalRows - failed);
+      }
+      if (b.totalRows === 0 && success === 0 && failed === 0) return;
+      out.push({
+        sheet,
+        totalRows: b.totalRows || success + failed,
+        success,
+        failed,
+      });
+    });
+    return out;
+  }
+
+  totals(): { totalRows: number; success: number; failed: number } {
+    return this.toArray().reduce(
+      (acc, s) => {
+        acc.totalRows += s.totalRows;
+        acc.success += s.success;
+        acc.failed += s.failed;
+        return acc;
+      },
+      { totalRows: 0, success: 0, failed: 0 }
+    );
+  }
+}
 
 export interface UploadResult {
   updated: {
@@ -134,6 +217,7 @@ export interface UploadResult {
     employees: number;
   };
   errors: Array<{ sheet?: string; row?: number; message: string }>;
+  sheetStats: SheetRowStats[];
 }
 
 function buildEntityListSheetColumns(
@@ -683,8 +767,7 @@ function colAny(headers: any[], ...keys: string[]): number {
   return -1;
 }
 function lastRow(sheet: ExcelJS.Worksheet): number {
-  const effectiveRows = ((sheet as any).actualRowCount as number | undefined) ?? (sheet.rowCount ?? 0);
-  return Math.min(effectiveRows, MAX_ROWS_PER_SHEET + 1);
+  return ((sheet as any).actualRowCount as number | undefined) ?? (sheet.rowCount ?? 0);
 }
 
 /**
@@ -697,6 +780,7 @@ export async function parseAndApply(
   userOrganizationId: string | null,
   isSuperAdmin: boolean
 ): Promise<UploadResult> {
+  const sheetStatsCollector = new SheetStatsCollector();
   const result: UploadResult = {
     updated: {
       organizations: 0,
@@ -707,6 +791,7 @@ export async function parseAndApply(
       employees: 0,
     },
     errors: [],
+    sheetStats: [],
   };
 
   const workbook = new ExcelJS.Workbook();
@@ -733,6 +818,9 @@ export async function parseAndApply(
 
     // Bulk: cap reported errors and push with sheet/row context
     const pushError = (err: { sheet?: string; row?: number; message: string }) => {
+      if (err.sheet && typeof err.row === 'number') {
+        sheetStatsCollector.noteFailed(err.sheet, err.row);
+      }
       if (result.errors.length >= MAX_ERRORS_REPORTED) return;
       result.errors.push(err);
       if (result.errors.length === MAX_ERRORS_REPORTED)
@@ -799,12 +887,7 @@ export async function parseAndApply(
     };
 
     const lastRow = (sheet: ExcelJS.Worksheet) => {
-      const effectiveRows = ((sheet as any).actualRowCount as number | undefined) ?? (sheet.rowCount ?? 0);
-      return Math.min(effectiveRows, MAX_ROWS_PER_SHEET + 1);
-    };
-    const hasMoreThanMaxRows = (sheet: ExcelJS.Worksheet) => {
-      const effectiveRows = ((sheet as any).actualRowCount as number | undefined) ?? (sheet.rowCount ?? 0);
-      return effectiveRows > MAX_ROWS_PER_SHEET + 1;
+      return ((sheet as any).actualRowCount as number | undefined) ?? (sheet.rowCount ?? 0);
     };
 
     // --- Organisation profile: only when "Entity Master Data (Org)" is uploaded without structure/assignment sheets
@@ -981,8 +1064,6 @@ export async function parseAndApply(
           pushError({ sheet: orgSheet.name, message: 'Missing column: Name of the Organisation or name' });
         } else if (orgSheet.rowCount >= 2) {
           const maxRow = lastRow(orgSheet);
-          if (hasMoreThanMaxRows(orgSheet))
-            pushError({ sheet: orgSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
           const shortNameCol = colAny(headers, 'short_name', 'short name');
           const addressCol = colAny(headers, 'address', 'address of the organisation');
           const emailCol = colAny(headers, 'email', 'e mail id');
@@ -1086,18 +1167,27 @@ export async function parseAndApply(
       structureSheet ? { name: structureSheet.name, rowCount: structureSheet.rowCount } : 'NOT FOUND (optional)'
     );
     if (structureSheet && (structureSheet.rowCount ?? 0) >= 2 && defaultOrgId) {
-      result.updated.organization_structure_nodes = await parseOrganizationStructureSheet(
+      const structureResult = await parseOrganizationStructureSheet(
         structureSheet,
         client,
         defaultOrgId,
         userId,
         pushError
       );
+      result.updated.organization_structure_nodes = structureResult.applied;
+      sheetStatsCollector.setSheet(
+        structureSheet.name,
+        structureResult.totalRows,
+        structureResult.applied,
+        structureResult.failed
+      );
       if (result.updated.organization_structure_nodes > 0) {
         invalidateOrgNodesCacheForBulk(defaultOrgId);
       }
       console.log('[EntityMasterUpload] Organisation Structure processed', {
         updated: result.updated.organization_structure_nodes,
+        totalRows: structureResult.totalRows,
+        failed: structureResult.failed,
       });
     }
 
@@ -1115,13 +1205,13 @@ export async function parseAndApply(
       const taskTypeIdx = col(headers, 'task_type');
       const isActiveIdx = col(headers, 'is_active');
 
-      const processTaskRow = async (orgId: string | null, title: string, task_type: string, frequency: string, rollout_rule: string, is_active: boolean, r: number) => {
-        if (!orgId || !title || !task_type) return;
+      const processTaskRow = async (orgId: string | null, title: string, task_type: string, frequency: string, rollout_rule: string, is_active: boolean, r: number): Promise<boolean> => {
+        if (!orgId || !title || !task_type) return true;
         const freqNorm = normalizeFrequency(frequency);
         const rollNorm = normalizeRolloutRule(rollout_rule);
         if (!TASK_TYPES.includes(task_type)) {
           pushError({ sheet: 'Service List', row: r, message: `Invalid task_type: ${task_type}` });
-          return;
+          return false;
         }
         const titleSafe = title.trim().slice(0, TITLE_MAX);
         const existing = await client.query(
@@ -1140,11 +1230,10 @@ export async function parseAndApply(
           );
         }
         result.updated.task_services += 1;
+        return true;
       };
 
       const maxRow = lastRow(serviceListSheet);
-      if (hasMoreThanMaxRows(serviceListSheet))
-        pushError({ sheet: 'Service List', message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
       for (let r = 2; r <= maxRow; r++) {
         try {
           const row = serviceListSheet.getRow(r);
@@ -1161,10 +1250,17 @@ export async function parseAndApply(
             const oneTimeTitle = oneTimeTitleIdx >= 0 ? getCellStrMax(row, oneTimeTitleIdx, TITLE_MAX) : '';
             const titleIndices = [recurringTitleIdx, oneTimeTitleIdx].filter((i) => i >= 0);
             if (titleIndices.length > 0 && isRowEmpty(row, titleIndices)) continue;
+            sheetStatsCollector.noteRow('Service List');
             const frequency = freqIdx >= 0 ? getCellStr(row, freqIdx) || 'NA' : 'NA';
             const rollout_rule = rolloutIdx >= 0 ? getCellStr(row, rolloutIdx) : 'end_of_period';
-            if (recurringTitle) await processTaskRow(orgId, recurringTitle, 'recurring', frequency, rollout_rule, true, r);
-            if (oneTimeTitle) await processTaskRow(orgId, oneTimeTitle, 'one_time', 'NA', 'end_of_period', true, r);
+            let ok = true;
+            if (recurringTitle) {
+              ok = (await processTaskRow(orgId, recurringTitle, 'recurring', frequency, rollout_rule, true, r)) && ok;
+            }
+            if (oneTimeTitle) {
+              ok = (await processTaskRow(orgId, oneTimeTitle, 'one_time', 'NA', 'end_of_period', true, r)) && ok;
+            }
+            if (ok) sheetStatsCollector.noteSuccess('Service List');
             continue;
           }
 
@@ -1175,6 +1271,7 @@ export async function parseAndApply(
             const title = getCellStrMax(row, titleIdx, TITLE_MAX);
             const task_type_raw = normalizeTaskType(getCellStr(row, taskTypeIdx));
             if (!title || !task_type_raw) continue;
+            sheetStatsCollector.noteRow('Service List');
             const frequency = freqIdx >= 0 ? getCellStr(row, freqIdx) || 'NA' : 'NA';
             const rollout_rule = rolloutIdx >= 0 ? getCellStr(row, rolloutIdx) : 'end_of_period';
             let is_active = true;
@@ -1182,7 +1279,8 @@ export async function parseAndApply(
               const v = String(getCellStr(row, isActiveIdx)).toLowerCase();
               is_active = v !== 'false' && v !== '0' && v !== 'no';
             }
-            await processTaskRow(orgId, title, task_type_raw, frequency, rollout_rule, is_active, r);
+            const ok = await processTaskRow(orgId, title, task_type_raw, frequency, rollout_rule, is_active, r);
+            if (ok) sheetStatsCollector.noteSuccess('Service List');
           }
         } catch (err: any) {
           pushError({ sheet: 'Service List', row: r, message: err?.message ?? String(err) });
@@ -1235,20 +1333,22 @@ export async function parseAndApply(
         });
       } else if (nameIdx >= 0) {
         const maxRow = lastRow(clientSheet);
-        if (hasMoreThanMaxRows(clientSheet))
-          pushError({ sheet: clientSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
         for (let r = 2; r <= maxRow; r++) {
           try {
             const row = clientSheet.getRow(r);
             if (isRowEmpty(row, [nameIdx])) continue;
             const name = getCellStrMax(row, nameIdx, NAME_MAX);
             if (!name) continue;
+            sheetStatsCollector.noteRow(clientSheet.name);
             let orgId = defaultOrgId;
             if (isSuperAdmin && orgNameIdx >= 0) {
               const on = getCellStr(row, orgNameIdx);
               if (on) orgId = await resolveOrgIdCached(on);
             }
-            if (!orgId) continue;
+            if (!orgId) {
+              pushError({ sheet: clientSheet.name, row: r, message: 'Organization could not be resolved for this row' });
+              continue;
+            }
             const entity_type = entityTypeIdx >= 0 ? getCellStrMax(row, entityTypeIdx, NAME_MAX) : '';
             const statusRaw = statusIdx >= 0 ? getCellStr(row, statusIdx) : '';
             const status = normalizeClientEntityStatus(statusRaw);
@@ -1371,6 +1471,7 @@ export async function parseAndApply(
               }
             }
             result.updated.client_entities += 1;
+            sheetStatsCollector.noteSuccess(clientSheet.name);
 
             // Entity List compliance columns -> client_entity_services (same row)
             const clientEntityId = (existing.rows[0]?.id ?? (await client.query(
@@ -1411,8 +1512,6 @@ export async function parseAndApply(
       const frequencyIdx = headers.findIndex((h: any) => String(h || '').trim().toLowerCase() === 'frequency');
       if (clientNameIdx >= 0 && taskTitleIdx >= 0 && taskTypeIdx >= 0 && frequencyIdx >= 0) {
         const maxRow = lastRow(cesSheet);
-        if (hasMoreThanMaxRows(cesSheet))
-          pushError({ sheet: cesSheet.name, message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
         for (let r = 2; r <= maxRow; r++) {
           try {
             const row = cesSheet.getRow(r);
@@ -1422,8 +1521,12 @@ export async function parseAndApply(
             const task_type = normalizeTaskType(getCellStr(row, taskTypeIdx));
             const frequency = normalizeFrequency(getCellStr(row, frequencyIdx) || 'NA');
             if (!client_entity_name || !task_service_title || !task_type) continue;
+            sheetStatsCollector.noteRow(cesSheet.name);
             const orgId = defaultOrgId;
-            if (!orgId) continue;
+            if (!orgId) {
+              pushError({ sheet: cesSheet.name, row: r, message: 'Organization is required' });
+              continue;
+            }
             const clientEntityId = await resolveClientEntityCached(orgId, client_entity_name);
             if (!clientEntityId) {
               pushError({ sheet: cesSheet.name, row: r, message: `Client entity not found: ${client_entity_name}` });
@@ -1441,6 +1544,7 @@ export async function parseAndApply(
               [clientEntityId, taskServiceId, frequency]
             );
             result.updated.client_entity_services += 1;
+            sheetStatsCollector.noteSuccess(cesSheet.name);
           } catch (err: any) {
             pushError({ sheet: cesSheet.name, row: r, message: err?.message ?? String(err) });
           }
@@ -1464,8 +1568,6 @@ export async function parseAndApply(
       const employeeStructureLevels = await loadOrganizationStructureLevels(client, defaultOrgId);
       if (mobileIdx >= 0 && nameIdx >= 0) {
         const maxRow = lastRow(employeesSheet);
-        if (hasMoreThanMaxRows(employeesSheet))
-          pushError({ sheet: 'Employees', message: `Sheet has more than ${MAX_ROWS_PER_SHEET} rows; only first ${MAX_ROWS_PER_SHEET} processed.` });
         for (let r = 2; r <= maxRow; r++) {
           try {
             const row = employeesSheet.getRow(r);
@@ -1473,6 +1575,7 @@ export async function parseAndApply(
             const mobile = getCellStr(row, mobileIdx);
             const name = getCellStrMax(row, nameIdx, NAME_MAX);
             if (!mobile) continue;
+            sheetStatsCollector.noteRow('Employees');
             let mobileNorm = mobile.trim().replace(/\s/g, '');
             // Normalize: accept 10 digits, 12 digits starting with 91, or +91XXXXXXXXXX
             if (mobileNorm.startsWith('+')) {
@@ -1554,6 +1657,7 @@ export async function parseAndApply(
               );
             }
             result.updated.employees += 1;
+            sheetStatsCollector.noteSuccess('Employees');
           } catch (err: any) {
             pushError({ sheet: 'Employees', row: r, message: err?.message ?? String(err) });
           }
@@ -1565,7 +1669,12 @@ export async function parseAndApply(
     }
 
     await client.query('COMMIT');
-    console.log('[EntityMasterUpload] Commit OK', { updated: result.updated, errors: result.errors.length });
+    result.sheetStats = sheetStatsCollector.toArray();
+    console.log('[EntityMasterUpload] Commit OK', {
+      updated: result.updated,
+      errors: result.errors.length,
+      sheetStats: result.sheetStats,
+    });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     throw e;
@@ -1573,6 +1682,7 @@ export async function parseAndApply(
     client.release();
   }
 
+  result.sheetStats = result.sheetStats?.length ? result.sheetStats : sheetStatsCollector.toArray();
   return result;
 }
 

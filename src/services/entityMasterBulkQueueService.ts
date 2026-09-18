@@ -39,6 +39,17 @@ export interface EntityMasterBulkUploadStatus {
     employees?: number;
     tasks?: number;
     totalErrors?: number;
+    sheetStats?: Array<{
+      sheet: string;
+      totalRows: number;
+      success: number;
+      failed: number;
+    }>;
+    rowTotals?: {
+      totalRows: number;
+      success: number;
+      failed: number;
+    };
   };
 }
 
